@@ -85,7 +85,7 @@ seed : int, optional
 maximum_num_units_on_support_first_filter : int, optional
     The maximum number of units allowed in the on-support group during the first pruning step,
     used to penalize trivial solutions. Defaults to 50.
-maximum_error_pre_treatment : float, optional
+maximum_error_pre_intervention : float, optional
     The maximum acceptable error (e.g., RMSE or MAE) on the pre-treatment outcomes for a
     candidate donor pool to be saved. Defaults to 0.15.
 maximum_error_covariates : float, optional
@@ -133,13 +133,13 @@ def search(
     tname_covariate = 'covariate',
     seed = 111,
     maximum_num_units_on_support_first_filter = 50,
-    maximum_error_pre_treatment = 0.15,
+    maximum_error_pre_intervention = 0.15,
     maximum_error_covariates = 0.15,
     proportion_pre_intervention_period_outcomes_donor = 10,
     inferior_limit_maximum_donor_pool_size = 2,
     on_support_first_filter = 'max_weight',
     on_support_second_filter = 'randomN',
-    hyperparameter_search_extra_criteria = [],
+    include_error_post_intervention_in_optuna_objective = False,
     number_optuna_trials = 300,
     timeout_optuna_cycle = 900,
     time_serie_covariate_metric = 'rmse'
@@ -242,13 +242,6 @@ def search(
         import sys
         sys.exit()
 
-    # CHECK IF THE hyperparameter_search_extra_criteria IS AN EMPTY LIST OR HAS ONLY THE VALUES: 'covariate' AND/OR 'all'
-    if not (len(hyperparameter_search_extra_criteria) == 0 or all(x in ['covariate', 'post_intervention_period'] for x in hyperparameter_search_extra_criteria)):
-        print("ERROR: hyperparameter_search_extra_criteria MUST BE AN EMPTY LIST OR HAVE ONLY THE VALUES: 'covariate' AND/OR 'post_intervention_period'")
-        print(f"hyperparameter_search_extra_criteria: {hyperparameter_search_extra_criteria}")
-        import sys
-        sys.exit()
-
     treatment_unitid = all_units[all_units['treatment'] == 1]['unitid'].iloc[0]
     outcomes = all_units[all_units['timeid'] != tname_covariate]['variable'].sort_values().unique().tolist()
     covariates = all_units[all_units['timeid'] == tname_covariate]['variable'].sort_values().unique().tolist()
@@ -257,15 +250,19 @@ def search(
     num_pre_intervention_periods_per_outcome = all_units[(all_units['pre_intervention'] == 1) & (all_units['timeid'] != tname_covariate)].groupby('variable').agg({'timeid': 'nunique' }).reset_index()
     # timeid_post_intervention = all_units[all_units['pre_intervention'] == 0]['timeid'].sort_values().unique().tolist()
 
+    hyperparameter_search_extra_criteria = []
+    if len(covariates) > 0 and not 'covariate' in hyperparameter_search_extra_criteria:
+        hyperparameter_search_extra_criteria.append('covariate')
+        
+    if include_error_post_intervention_in_optuna_objective:
+        hyperparameter_search_extra_criteria.append('post_intervention_period')
+
     # STANDARDIZATION
     # Make the values between outcomes and covariates comparible so their evaluation metrics can be aggregated
     # Calculate mean and standard deviation for each outcome and covariate
     mean_std = all_units.groupby('variable').agg({'value': ['mean', 'std']}).reset_index()
     mean_std.columns = [f'{col[0]}_{col[1]}' if col[1] else col[0] for col in mean_std.columns.values]
     mean_std.to_parquet(workspace_folder + 'all_units_mean_std.parquet', index=False)
-
-    if len(covariates) > 0 and not 'covariate' in hyperparameter_search_extra_criteria:
-        hyperparameter_search_extra_criteria.append('covariate')
 
     # Apply the standardization to the 'value' column.
     all_units = pd.merge(all_units, mean_std, on='variable', how='left')
@@ -306,7 +303,7 @@ def search(
 
     all_units.drop('pre_intervention', axis=1, inplace=True)
 
-    def pre_treatment_scaling(data, period):
+    def pre_intervention_scaling(data, period):
         """
         APPLY TRANSFORMATIONS TO THE CONTROL TIME SERIE TO GUARRANTEE EXCLUSIVE SHAPE COMPARISON TO THE TREATMENT ONE
         This function transforms the aggregated control group data using the mean and standard 
@@ -356,8 +353,8 @@ def search(
     scm_donor_selection_candidate_units_data['trial'] = None
     scm_donor_selection_candidate_units_data['error_train'] = None
     scm_donor_selection_candidate_units_data['error_valid'] = None
-    scm_donor_selection_candidate_units_data['error_pre_treatment'] = None
-    scm_donor_selection_candidate_units_data['error_post_treatment'] = None
+    scm_donor_selection_candidate_units_data['error_pre_intervention'] = None
+    scm_donor_selection_candidate_units_data['error_post_intervention'] = None
     scm_donor_selection_candidate_units_data['error_covariates'] = None
     scm_donor_selection_candidate_units_data['num_units_bigger_min_weight'] = None
     scm_donor_selection_candidate_units_data['num_units_max_weight'] = None
@@ -370,8 +367,8 @@ def search(
     scm_donor_selection_candidate_performance['trial'] = None
     scm_donor_selection_candidate_performance['error_train'] = None
     scm_donor_selection_candidate_performance['error_valid'] = None
-    scm_donor_selection_candidate_performance['error_pre_treatment'] = None
-    scm_donor_selection_candidate_performance['error_post_treatment'] = None
+    scm_donor_selection_candidate_performance['error_pre_intervention'] = None
+    scm_donor_selection_candidate_performance['error_post_intervention'] = None
     scm_donor_selection_candidate_performance['error_covariates'] = None
     scm_donor_selection_candidate_performance['num_units_bigger_min_weight'] = None
     scm_donor_selection_candidate_performance['num_units_max_weight'] = None
@@ -386,7 +383,7 @@ def search(
         def __init__(self, data, timeid_train, timeid_valid, timeid_post_intervention):
             self.timeid_train = timeid_train
             self.timeid_valid = timeid_valid
-            self.timeid_post_treatment = timeid_post_intervention
+            self.timeid_post_intervention = timeid_post_intervention
 
             # The article explains that the data is transposed so that units are rows and time periods are features.
             # This is the ideal format for machine learning models like XGBoost.
@@ -418,7 +415,7 @@ def search(
             full_data = self.full_data.copy()
             depara = pd.merge(weights, self.from_to, on='id', how='inner')
             full_data_depara = pd.merge(full_data, depara, on='unitid', how='left').reset_index()
-            data = pre_treatment_scaling(data=full_data_depara, period=self.timeid_train + self.timeid_valid + [tname_covariate])
+            data = pre_intervention_scaling(data=full_data_depara, period=self.timeid_train + self.timeid_valid + [tname_covariate])
             aggregated3 = data.groupby(['variable', 'timeid', 'treatment'], dropna=False).apply(
                 lambda x : pd.Series({
                     'value' : np.ma.filled(np.ma.average(np.ma.masked_invalid(x['value']), weights=x['weight']), fill_value=np.nan)
@@ -460,22 +457,22 @@ def search(
             aggregated3_diff_normalized['value'] = aggregated3_diff_normalized['value'] / aggregated3_diff_normalized['amplitude']
 
             if metric == 'mae':
-                error_pre_treatment = aggregated3_diff_normalized['value'].abs().mean()
+                error_pre_intervention = aggregated3_diff_normalized['value'].abs().mean()
             elif metric == 'rmse':
-                error_pre_treatment = ((aggregated3_diff_normalized['value'] ** 2).mean()) ** 0.5
+                error_pre_intervention = ((aggregated3_diff_normalized['value'] ** 2).mean()) ** 0.5
 
             # Calculate error for the entire post-treatment period.
             # --- Diagnostic tool, not a core component, and it is disabled by default ---
             # To validate against bias from using post-treatment data, run this script twice:
-            #  - Run A (Unbiased): Without `error_post_treatment` in the Optuna objective.
-            #  - Run B (Biased):   With `error_post_treatment` included.
+            #  - Run A (Unbiased): Without `error_post_intervention` in the Optuna objective.
+            #  - Run B (Biased):   With `error_post_intervention` included.
             # --- How to Interpret the Results ---
             # * If both runs agree on the donor pool -> The result is likely robust.
             # * If both runs find good fits but disagree -> Bias is likely. Trust Run A.
             # * If Run A fails but Run B succeeds -> Run B's result is suspect. Rerun Run A with more Optuna trials.
             # * If both runs fail -> This indicates a more fundamental problem, such as no suitable donors in the pool
             # or an insufficient Optuna trials, reduce the number of selected outcomes and covariates and rerun.
-            aggregated3_diff = aggregated3[aggregated3['timeid'].isin(self.timeid_post_treatment)].sort_values(['variable', 'timeid', 'treatment'], ascending=True).groupby(['variable', 'timeid']).agg({
+            aggregated3_diff = aggregated3[aggregated3['timeid'].isin(self.timeid_post_intervention)].sort_values(['variable', 'timeid', 'treatment'], ascending=True).groupby(['variable', 'timeid']).agg({
                 'value' : lambda x: x.iloc[0] - x.iloc[1]
             }).reset_index(level=['variable', 'timeid'])
 
@@ -483,9 +480,9 @@ def search(
             aggregated3_diff_normalized['value'] = aggregated3_diff_normalized['value'] / aggregated3_diff_normalized['amplitude']
 
             if metric == 'mae':
-                error_post_treatment = aggregated3_diff_normalized['value'].abs().mean()
+                error_post_intervention = aggregated3_diff_normalized['value'].abs().mean()
             elif metric == 'rmse':
-                error_post_treatment = ((aggregated3_diff_normalized['value'] ** 2).mean()) ** 0.5
+                error_post_intervention = ((aggregated3_diff_normalized['value'] ** 2).mean()) ** 0.5
 
             # Evaluate covariate balance.
             aggregated3_diff = aggregated3[aggregated3['timeid'].isin([tname_covariate])].sort_values(['variable', 'timeid', 'treatment'], ascending=True).groupby(['variable', 'timeid']).agg({
@@ -497,7 +494,7 @@ def search(
             elif metric == 'rmse':
                 error_covariates = ((aggregated3_diff['value'] ** 2).mean()) ** 0.5
 
-            return error_train, error_valid, error_pre_treatment, error_post_treatment, error_covariates
+            return error_train, error_valid, error_pre_intervention, error_post_intervention, error_covariates
 
         def eval_metric_ipw(self, preds, metric):
             """
@@ -545,10 +542,10 @@ def search(
                 if num_units_max_weight > maximum_num_units_on_support_first_filter:
                     error_train = float('inf')
                     error_valid = float('inf')
-                    error_pre_treatment = float('inf')
-                    error_post_treatment = float('inf')
+                    error_pre_intervention = float('inf')
+                    error_post_intervention = float('inf')
                     error_covariates = float('inf')
-                    return error_train, error_valid, error_pre_treatment, error_post_treatment, error_covariates, ipw, num_units_bigger_min_weight, num_units_max_weight
+                    return error_train, error_valid, error_pre_intervention, error_post_intervention, error_covariates, ipw, num_units_bigger_min_weight, num_units_max_weight
                 
                 # If the number of units sharing the max weight is larger than the desired pool size,
                 # randomly sample from this top tier to select the final donors.
@@ -586,10 +583,10 @@ def search(
                 if num_units_bigger_min_weight > maximum_num_units_on_support_first_filter:
                     error_train = float('inf')
                     error_valid = float('inf')
-                    error_pre_treatment = float('inf')
-                    error_post_treatment = float('inf')
+                    error_pre_intervention = float('inf')
+                    error_post_intervention = float('inf')
                     error_covariates = float('inf')
-                    return error_train, error_valid, error_pre_treatment, error_post_treatment, error_covariates, ipw, num_units_bigger_min_weight, num_units_max_weight
+                    return error_train, error_valid, error_pre_intervention, error_post_intervention, error_covariates, ipw, num_units_bigger_min_weight, num_units_max_weight
 
                 # If the number of on-support units exceeds the desired pool size,
                 # randomly sample from them.
@@ -620,15 +617,15 @@ def search(
             ipw.drop('treatment', axis=1, inplace=True)
             
             # Evaluate the performance of this candidate donor pool.
-            error_train, error_valid, error_pre_treatment, error_post_treatment, error_covariates = self.evaluate_outcomes_metric(metric=metric, weights=ipw)
+            error_train, error_valid, error_pre_intervention, error_post_intervention, error_covariates = self.evaluate_outcomes_metric(metric=metric, weights=ipw)
 
-            return error_train, error_valid, error_pre_treatment, error_post_treatment, error_covariates, ipw, num_units_bigger_min_weight, num_units_max_weight
+            return error_train, error_valid, error_pre_intervention, error_post_intervention, error_covariates, ipw, num_units_bigger_min_weight, num_units_max_weight
 
         def full_data_treatment_control_scaling(self, weight):
             """Prepares the full dataset with the final weights for saving if it is good enough."""
             temp = pd.merge(weight, self.from_to, on='id', how='inner')
             temp = pd.merge(self.full_data, temp, on='unitid', how='left').reset_index()
-            data = pre_treatment_scaling(data=temp, period=self.timeid_train + self.timeid_valid + [tname_covariate])
+            data = pre_intervention_scaling(data=temp, period=self.timeid_train + self.timeid_valid + [tname_covariate])
             aggregated3 = data.groupby(['variable', 'timeid', 'treatment'], dropna=False).apply(
                 lambda x : pd.Series({
                     'value' : np.ma.filled(np.ma.average(np.ma.masked_invalid(x['value']), weights=x['weight']), fill_value=np.nan),
@@ -675,16 +672,16 @@ def search(
             It calculates the "Causal Fitness" score and updates the best scores found so far.
             dtrain is not used. The incapsulation is violated to make it performant.
             """
-            global current_error_train, current_error_valid, current_error_pre_treatment, current_error_post_treatment, current_error_covariates, current_weights, current_preds, current_num_units_bigger_min_weight, current_num_units_max_weight
+            global current_error_train, current_error_valid, current_error_pre_intervention, current_error_post_intervention, current_error_covariates, current_weights, current_preds, current_num_units_bigger_min_weight, current_num_units_max_weight
 
-            error_train, error_valid, error_pre_treatment, error_post_treatment, error_covariates, weights, num_units_bigger_min_weight, num_units_max_weight = dataset.eval_metric_ipw(preds, metric=time_serie_covariate_metric)
+            error_train, error_valid, error_pre_intervention, error_post_intervention, error_covariates, weights, num_units_bigger_min_weight, num_units_max_weight = dataset.eval_metric_ipw(preds, metric=time_serie_covariate_metric)
 
             if current_error_valid > error_valid:
                 current_weights = weights
                 current_error_train = error_train
                 current_error_valid = error_valid
-                current_error_pre_treatment = error_pre_treatment
-                current_error_post_treatment = error_post_treatment
+                current_error_pre_intervention = error_pre_intervention
+                current_error_post_intervention = error_post_intervention
                 current_error_covariates = error_covariates
                 current_preds = preds
                 current_num_units_bigger_min_weight = num_units_bigger_min_weight
@@ -765,9 +762,9 @@ def search(
                     # Only save results that meet the pre-treatment error threshold.
 
                     if 'covariate' in hyperparameter_search_extra_criteria:
-                        condition_save = current_error_pre_treatment < maximum_error_pre_treatment and len(covariates) > 0 and current_error_covariates < maximum_error_covariates
+                        condition_save = current_error_pre_intervention < maximum_error_pre_intervention and len(covariates) > 0 and current_error_covariates < maximum_error_covariates
                     else:
-                        condition_save = current_error_pre_treatment < maximum_error_pre_treatment
+                        condition_save = current_error_pre_intervention < maximum_error_pre_intervention
 
                     if condition_save:
                         # Save the donor units, weights and performance metrics of this viable solution.
@@ -777,12 +774,12 @@ def search(
                         data['trial'] = trial.number
                         data['error_train'] = current_error_train
                         data['error_valid'] = current_error_valid
-                        data['error_pre_treatment'] = current_error_pre_treatment
-                        data['error_post_treatment'] = current_error_post_treatment
+                        data['error_pre_intervention'] = current_error_pre_intervention
+                        data['error_post_intervention'] = current_error_post_intervention
                         data['error_covariates'] = current_error_covariates
                         data['num_units_bigger_min_weight'] = current_num_units_bigger_min_weight
                         data['num_units_max_weight'] = current_num_units_max_weight
-                        columns = ['variable', 'timeid', 'value', 'treatment', 'weight', 'unitid', 'valor_m_weight', 'id', 'cycle', 'trial', 'error_train', 'error_valid', 'error_pre_treatment', 'error_post_treatment', 'error_covariates', 'num_units_bigger_min_weight', 'num_units_max_weight']
+                        columns = ['variable', 'timeid', 'value', 'treatment', 'weight', 'unitid', 'valor_m_weight', 'id', 'cycle', 'trial', 'error_train', 'error_valid', 'error_pre_intervention', 'error_post_intervention', 'error_covariates', 'num_units_bigger_min_weight', 'num_units_max_weight']
                         data[columns].to_csv(scm_donor_selection_candidate_units_data_file_path, mode='a', header=False, index=False)
 
                         # Save the weights and performance metrics of this viable solution.
@@ -791,8 +788,8 @@ def search(
                         temp['trial'] = trial.number
                         temp['error_train'] = current_error_train
                         temp['error_valid'] = current_error_valid
-                        temp['error_pre_treatment'] = current_error_pre_treatment
-                        temp['error_post_treatment'] = current_error_post_treatment
+                        temp['error_pre_intervention'] = current_error_pre_intervention
+                        temp['error_post_intervention'] = current_error_post_intervention
                         temp['error_covariates'] = current_error_covariates
                         temp['num_units_bigger_min_weight'] = current_num_units_bigger_min_weight
                         temp['num_units_max_weight'] = current_num_units_max_weight
@@ -828,13 +825,13 @@ def search(
             # The article describes a multi-objective optimization problem. 
             # Optuna is configured to minimize, pre-treatment error, covariate error, and post-intervention error (optional for diagnose).
             if '' in hyperparameter_search_extra_criteria and 'post_intervetion_period' in hyperparameter_search_extra_criteria:
-                return current_error_pre_treatment, current_error_covariates, current_error_post_treatment
+                return current_error_pre_intervention, current_error_covariates, current_error_post_intervention
             elif 'covariate' in hyperparameter_search_extra_criteria:
-                return current_error_pre_treatment, current_error_covariates
+                return current_error_pre_intervention, current_error_covariates
             elif 'post_intervetion_period' in hyperparameter_search_extra_criteria:
-                return current_error_pre_treatment, current_error_post_treatment
+                return current_error_pre_intervention, current_error_post_intervention
             else:
-                return current_error_pre_treatment
+                return current_error_pre_intervention
 
         # --- 4. Run the Optuna Study ---
         if 'covariate' in hyperparameter_search_extra_criteria and 'post_intervetion_period' in hyperparameter_search_extra_criteria:

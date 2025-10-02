@@ -88,7 +88,7 @@ donor_selection.search(
 *   `tname_covariate` (str, optional): The name of the time period that identifies covariates. Defaults to `'covariate'`.
 *   `seed` (int, optional): The random seed for reproducibility. Defaults to `111`.
 *   `maximum_num_units_on_support_first_filter` (int, optional): The maximum number of units to be considered "on support" in the first filtering stage. Defaults to `50`.
-*   `maximum_error_pre_treatment` (float, optional): The maximum allowable error in the pre-treatment period for a donor pool to be considered valid. Defaults to `0.15`.
+*   `maximum_error_pre_intervention` (float, optional): The maximum allowable error in the pre-treatment period for a donor pool to be considered valid. Defaults to `0.15`.
 *   `maximum_error_covariates` (float, optional): The maximum allowable error for covariates. Defaults to `0.15`.
 *   `proportion_pre_intervention_period_outcomes_donor` (int, optional): The desired ratio of pre-intervention data points of all outcomes to the maximum size of the donor pool. Defaults to `10`.
 ```python
@@ -99,7 +99,7 @@ donor_selection.search(
 *   `inferior_limit_maximum_donor_pool_size` (int, optional): The minimum size of the donor pool. Defaults to `2`.
 *   `on_support_first_filter` (str, optional): The strategy for the first on-support filter. Can be `'max_weight'`, `'maximum_num_units_on_support_first_filter'`, or `'bigger_than_min_weight'`. Defaults to `'max_weight'`.
 *   `on_support_second_filter` (str, optional): The strategy for the second on-support filter, applyied after the first one. Can be `'randomN'` or `'all'`. N being a number between inferior_limit_maximum_donor_pool_size and superior_limit_maximum_donor_pool_size. Defaults to `'randomN'`.
-*   `hyperparameter_search_extra_criteria` (list, optional): Extra criteria for the hyperparameter search. Defaults to `[]`.
+*   `include_error_post_intervention_in_optuna_objective` (bool, optional): Flag to include or not the post-intervention error in the Optuna's search criteria. Defaults to `False`.
 *   `number_optuna_trials` (int, optional): The number of trials for the Optuna hyperparameter optimization. Defaults to `300`.
 *   `timeout_optuna_cycle` (int, optional): The timeout in seconds for each Optuna optimization cycle. Defaults to `900`.
 *   `time_serie_covariate_metric` (str, optional): The metric to be used for time-series covariate balancing. Can be `'rmse'` or `'mae'`. Defaults to `'rmse'`.
