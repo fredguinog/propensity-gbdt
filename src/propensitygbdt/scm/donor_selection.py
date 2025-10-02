@@ -103,9 +103,8 @@ on_support_second_filter : {'randomN', 'all'}, optional
     The secondary strategy to prune the on-support set down to the final donor pool size.
     'randomN' randomly samples N units, while 'all' takes the top N deterministically.
     Defaults to 'randomN'.
-hyperparameter_search_extra_criteria : list, optional
-    Additional objectives for the multi-objective Optuna search. Can include 'covariate'
-    and 'post_intervention_period'. Defaults to [].
+include_error_post_intervention_in_optuna_objective : bool, optional
+    Flag to include or not the post-intervention error in the Optuna's search criteria. Defaults to False.
 number_optuna_trials : int, optional
     The number of hyperparameter optimization trials to run for each cross-temporal fold.
     Defaults to 300.
@@ -251,7 +250,7 @@ def search(
     # timeid_post_intervention = all_units[all_units['pre_intervention'] == 0]['timeid'].sort_values().unique().tolist()
 
     hyperparameter_search_extra_criteria = []
-    if len(covariates) > 0 and not 'covariate' in hyperparameter_search_extra_criteria:
+    if len(covariates) > 0:
         hyperparameter_search_extra_criteria.append('covariate')
         
     if include_error_post_intervention_in_optuna_objective:
@@ -795,11 +794,11 @@ def search(
                         temp['num_units_max_weight'] = current_num_units_max_weight
                         temp.to_csv(scm_donor_selection_candidate_performance_file_path, mode='a', header=False, index=False)
                 else:
-                    if 'covariate' in hyperparameter_search_extra_criteria and 'post_intervetion_period' in hyperparameter_search_extra_criteria:
+                    if 'covariate' in hyperparameter_search_extra_criteria and 'post_intervention_period' in hyperparameter_search_extra_criteria:
                         return float('inf'), float('inf'), float('inf')
                     elif 'covariate' in hyperparameter_search_extra_criteria:
                         return float('inf'), float('inf')
-                    elif 'post_intervetion_period' in hyperparameter_search_extra_criteria:
+                    elif 'post_intervention_period' in hyperparameter_search_extra_criteria:
                         return float('inf'), float('inf')
                     else:
                         return float('inf')
@@ -813,32 +812,32 @@ def search(
             except Exception as e:
                 # Handle other potential errors during xgb.train
                 print(f"An error occurred during xgb.train for trial {trial.number}: {e}")
-                if 'covariate' in hyperparameter_search_extra_criteria and 'post_intervetion_period' in hyperparameter_search_extra_criteria:
+                if 'covariate' in hyperparameter_search_extra_criteria and 'post_intervention_period' in hyperparameter_search_extra_criteria:
                     return float('inf'), float('inf'), float('inf')
                 elif 'covariate' in hyperparameter_search_extra_criteria:
                     return float('inf'), float('inf')
-                elif 'post_intervetion_period' in hyperparameter_search_extra_criteria:
+                elif 'post_intervention_period' in hyperparameter_search_extra_criteria:
                     return float('inf'), float('inf')
                 else:
                     return float('inf')
             
             # The article describes a multi-objective optimization problem. 
             # Optuna is configured to minimize, pre-treatment error, covariate error, and post-intervention error (optional for diagnose).
-            if '' in hyperparameter_search_extra_criteria and 'post_intervetion_period' in hyperparameter_search_extra_criteria:
+            if 'covariate' in hyperparameter_search_extra_criteria and 'post_intervention_period' in hyperparameter_search_extra_criteria:
                 return current_error_pre_intervention, current_error_covariates, current_error_post_intervention
             elif 'covariate' in hyperparameter_search_extra_criteria:
                 return current_error_pre_intervention, current_error_covariates
-            elif 'post_intervetion_period' in hyperparameter_search_extra_criteria:
+            elif 'post_intervention_period' in hyperparameter_search_extra_criteria:
                 return current_error_pre_intervention, current_error_post_intervention
             else:
                 return current_error_pre_intervention
 
         # --- 4. Run the Optuna Study ---
-        if 'covariate' in hyperparameter_search_extra_criteria and 'post_intervetion_period' in hyperparameter_search_extra_criteria:
+        if 'covariate' in hyperparameter_search_extra_criteria and 'post_intervention_period' in hyperparameter_search_extra_criteria:
             directions=['minimize', 'minimize', 'minimize']
         elif 'covariate' in hyperparameter_search_extra_criteria:
             directions=['minimize', 'minimize']
-        elif 'post_intervetion_period' in hyperparameter_search_extra_criteria:
+        elif 'post_intervention_period' in hyperparameter_search_extra_criteria:
             directions=['minimize', 'minimize']
         else:
             directions=['minimize']
