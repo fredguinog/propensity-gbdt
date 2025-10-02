@@ -253,7 +253,8 @@ def search(
     outcomes = all_units[all_units['timeid'] != tname_covariate]['variable'].sort_values().unique().tolist()
     covariates = all_units[all_units['timeid'] == tname_covariate]['variable'].sort_values().unique().tolist()
     # timeids = all_units['timeid'].sort_values().unique().tolist()
-    timeid_pre_intervention = all_units[all_units['pre_intervention'] == 1]['timeid'].sort_values().unique().tolist()
+    timeid_pre_intervention = all_units[(all_units['pre_intervention'] == 1) & (all_units['timeid'] != tname_covariate)]['timeid'].sort_values().unique().tolist()
+    num_pre_intervention_periods_per_outcome = all_units[(all_units['pre_intervention'] == 1) & (all_units['timeid'] != tname_covariate)].groupby('variable').agg({'timeid': 'nunique' }).reset_index()
     # timeid_post_intervention = all_units[all_units['pre_intervention'] == 0]['timeid'].sort_values().unique().tolist()
 
     # STANDARDIZATION
@@ -288,15 +289,22 @@ def search(
     if os.path.exists(scm_donor_selection_candidate_performance_file_path):
         os.remove(scm_donor_selection_candidate_performance_file_path)
 
-    superior_limit_maximum_donor_pool_size = int(len(timeid_pre_intervention) * len(outcomes) / proportion_pre_intervention_period_outcomes_donor)
+    superior_limit_maximum_donor_pool_size = int(num_pre_intervention_periods_per_outcome['timeid'].sum() / proportion_pre_intervention_period_outcomes_donor)
     if superior_limit_maximum_donor_pool_size < 2:
         superior_limit_maximum_donor_pool_size = 2
 
     timeid_post_intervention = all_units[all_units['pre_intervention'] == 0]['timeid'].sort_values().unique().tolist()
-    all_units.drop('pre_intervention', axis=1, inplace=True)
 
     all_units.sort_values(by=['unitid', 'timeid', 'variable'], inplace=True)
     all_units['weight'] = 1.0
+
+    amplitude = all_units[(all_units['treatment'] == 1) & (all_units['pre_intervention'] == 1) & (all_units['timeid'] != tname_covariate)].groupby(['variable']).apply(
+        lambda x : pd.Series({
+            'amplitude': 1 if x['value'].max() == x['value'].min() else x['value'].max() - x['value'].min()
+        })
+    ).reset_index()
+
+    all_units.drop('pre_intervention', axis=1, inplace=True)
 
     def pre_treatment_scaling(data, period):
         """
@@ -339,12 +347,6 @@ def search(
 
     treatment = all_units[all_units['treatment'] == 1]
     treatment.loc[:, 'unitid'] = treatment_unitid
-
-    amplitude = all_units[(all_units['treatment'] == 1) & (all_units['timeid'].isin(timeid_pre_intervention[0:len(timeid_pre_intervention)-1]))].groupby(['variable']).apply(
-        lambda x : pd.Series({
-            'amplitude': 1 if x['value'].max() == x['value'].min() else x['value'].max() - x['value'].min()
-        })
-    ).reset_index()
 
     # Initialize CSV files for storing performance results and the donor candidates data with headers.
     scm_donor_selection_candidate_units_data = treatment[['variable', 'timeid', 'value', 'treatment', 'weight', 'unitid']].copy()

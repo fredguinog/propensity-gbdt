@@ -80,7 +80,7 @@ donor_selection.search(
 *   `value` (str): The name of the column for the value of the outcome variable.
 *   `treatment` (str): The name of the column indicating treatment status (1 for treated, 0 for control).
 *   `pre_intervention` (str): The name of the column indicating the pre-intervention period (1 for pre-intervention, 0 for post-intervention).
-*   `temporal_cross_search` (list): A list of time periods within the pre-intervention phase to be used for cross-validation.
+*   `temporal_cross_search` (list): A list of pre-intervention splits to be used for cross-validation.
 *   `workspace_folder` (str): The path to the folder where the output files will be saved.
 
 ### Optional Parameters
@@ -90,10 +90,15 @@ donor_selection.search(
 *   `maximum_num_units_on_support_first_filter` (int, optional): The maximum number of units to be considered "on support" in the first filtering stage. Defaults to `50`.
 *   `maximum_error_pre_treatment` (float, optional): The maximum allowable error in the pre-treatment period for a donor pool to be considered valid. Defaults to `0.15`.
 *   `maximum_error_covariates` (float, optional): The maximum allowable error for covariates. Defaults to `0.15`.
-*   `proportion_pre_intervention_period_outcomes_donor` (int, optional): The desired ratio of pre-intervention data points to the number of donors. Defaults to `10`.
+*   `proportion_pre_intervention_period_outcomes_donor` (int, optional): The desired ratio of pre-intervention data points of all outcomes to the maximum size of the donor pool. Defaults to `10`.
+```python
+    superior_limit_maximum_donor_pool_size = int(num_pre_intervention_periods_per_outcome['timeid'].sum() / proportion_pre_intervention_period_outcomes_donor)
+    if superior_limit_maximum_donor_pool_size < 2:
+        superior_limit_maximum_donor_pool_size = 2
+```
 *   `inferior_limit_maximum_donor_pool_size` (int, optional): The minimum size of the donor pool. Defaults to `2`.
 *   `on_support_first_filter` (str, optional): The strategy for the first on-support filter. Can be `'max_weight'`, `'maximum_num_units_on_support_first_filter'`, or `'bigger_than_min_weight'`. Defaults to `'max_weight'`.
-*   `on_support_second_filter` (str, optional): The strategy for the second on-support filter. Can be `'randomN'` or `'all'`. Defaults to `'randomN'`.
+*   `on_support_second_filter` (str, optional): The strategy for the second on-support filter, applyied after the first one. Can be `'randomN'` or `'all'`. N being a number between inferior_limit_maximum_donor_pool_size and superior_limit_maximum_donor_pool_size. Defaults to `'randomN'`.
 *   `hyperparameter_search_extra_criteria` (list, optional): Extra criteria for the hyperparameter search. Defaults to `[]`.
 *   `number_optuna_trials` (int, optional): The number of trials for the Optuna hyperparameter optimization. Defaults to `300`.
 *   `timeout_optuna_cycle` (int, optional): The timeout in seconds for each Optuna optimization cycle. Defaults to `900`.
