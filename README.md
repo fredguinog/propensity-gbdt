@@ -53,25 +53,21 @@ import numpy as np
 import pandas as pd
 from propensitygbdt.scm import donor_selection
 
-# for .xlsx files, you may need to install (`pip install openpyxl`).
-data = pd.read_excel("https://ers.usda.gov/sites/default/files/_laserfiche/DataFiles/48747/Unemployment2023.xlsx", header=4)
+# https://www.ers.usda.gov/data-products/county-level-data-sets/county-level-data-sets-download-data
+data = pd.read_csv("https://ers.usda.gov/sites/default/files/_laserfiche/DataFiles/48747/Unemployment2023.csv")
 
-data = data.melt(
-    id_vars=["FIPS_Code", "State", "Area_Name"],
-    var_name="indicator_year",
-    value_name="value"
-)
+data['FIPS_Code'] = data['FIPS_Code'].astype(str).str.zfill(5)
+data = data[~data['FIPS_Code'].astype(str).str.endswith('0')].reset_index(drop=True)
 
-data['year'] = data['indicator_year'].str[-4:]
-data['indicator'] = data['indicator_year'].str[:-5]
+data['year'] = data['Attribute'].str[-4:]
+data['indicator'] = data['Attribute'].str[:-5]
 
 indicators_to_keep = [
     "Civilian_labor_force",
     "Unemployment_rate",
     "Urban_Influence_Code"
 ]
-dataset_mask = data['indicator'].isin(indicators_to_keep)
-data = data[dataset_mask]
+data = data[data['indicator'].isin(indicators_to_keep)]
 
 columns_ordered = [
     "year",
@@ -79,19 +75,16 @@ columns_ordered = [
     "State",
     "Area_Name",
     "indicator",
-    "value"
+    "Value"
 ]
 data = data[columns_ordered]
 data.loc[data['indicator'] == "Urban_Influence_Code", 'year'] = "covariate"
 
-data = data.dropna(subset=['value']).reset_index(drop=True)
+data = data.dropna(subset=['Value']).reset_index(drop=True)
 
 print(data.head())
 print(data.info())
 
-data['indicator'] = data['indicator'].astype(str)
-data['FIPS_Code'] = data['FIPS_Code'].astype(str)
-data['year'] = data['year'].astype(str)
 data['treatment'] = np.where(data['FIPS_Code'] == "12001", 1, 0)
 data['pre_intervention'] = np.where(data['year'].isin(['2000', '2001', '2002', '2003','2004', '2005', '2006', '2007', '2008', '2009', '2010', '2011', '2012', '2013', '2014', '2015']), 1, 0)
 
@@ -100,7 +93,7 @@ donor_selection.search(
     yname = "indicator",
     unitname = "FIPS_Code",
     tname = "year",
-    value = "value",
+    value = "Value",
     treatment = "treatment",
     pre_intervention = "pre_intervention",
     temporal_cross_search = ['2004', '2005', '2006', '2007', '2008', '2009', '2010', '2011'],
