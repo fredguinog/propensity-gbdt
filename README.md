@@ -67,7 +67,6 @@ data['indicator'] = data['indicator_year'].str[:-5]
 
 indicators_to_keep = [
     "Civilian_labor_force",
-    "Unemployed",
     "Unemployment_rate",
     "Urban_Influence_Code"
 ]
