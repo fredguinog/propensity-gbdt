@@ -79,7 +79,7 @@ workspace_folder : str
     The path to a directory where output files (candidate donors and performance) will be saved.
 tname_covariate : str, optional
     A special value in the `tname` column used to identify rows that are time-invariant covariates.
-    Defaults to 'covariate'.
+    Defaults to None.
 seed : int, optional
     Random seed for reproducibility of the optimization process. Defaults to 111.
 maximum_num_units_on_support_first_filter : int, optional
@@ -129,7 +129,7 @@ def search(
     pre_intervention,
     temporal_cross_search,
     workspace_folder,
-    tname_covariate = 'covariate',
+    tname_covariate = None,
     seed = 111,
     maximum_num_units_on_support_first_filter = 50,
     maximum_error_pre_intervention = 0.15,
@@ -220,9 +220,9 @@ def search(
         print("Please ensure the package is correctly installed.")
 
     # CHECK tname_covariate COULUMN AGAINST all_units['timeid']
-    # tname_covariate MUST BE A VALUE ON all_units['timeid']
-    if tname_covariate not in all_units['timeid'].unique().tolist():
-        print(f"ERROR: tname_covariate '{tname_covariate}' MUST BE A VALUE ON all_units['timeid']")
+    # WHEN tname_covariate IS NOT NONE, MUST BE A VALUE FROM all_units['timeid']
+    if tname_covariate is not None and tname_covariate not in all_units['timeid'].unique().tolist():
+        print(f"ERROR: tname_covariate '{tname_covariate}' MUST BE A VALUE FROM all_units['timeid']")
         print(f"all_units['timeid']: {sorted(all_units['timeid'].unique().tolist())}")
         import sys
         sys.exit()

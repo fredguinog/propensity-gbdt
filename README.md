@@ -49,23 +49,65 @@ pip install git+https://github.com/fredguinog/propensity-gbdt.git
 ## Usage
 
 ```python
-from propensitygbdt.scm import donor_selection
+import numpy as np
 import pandas as pd
+from propensitygbdt.scm import donor_selection
 
-# Assuming 'data' is a pandas DataFrame with the required schema
-data = pd.read_csv('your_data.csv')
+# for .xlsx files, you may need to install (`pip install openpyxl`).
+data = pd.read_excel("https://ers.usda.gov/sites/default/files/_laserfiche/DataFiles/48747/Unemployment2023.xlsx", header=4)
+
+data = data.melt(
+    id_vars=["FIPS_Code", "State", "Area_Name"],
+    var_name="indicator_year",
+    value_name="value"
+)
+
+data['year'] = data['indicator_year'].str[-4:]
+data['indicator'] = data['indicator_year'].str[:-5]
+
+indicators_to_keep = [
+    "Civilian_labor_force",
+    "Unemployed",
+    "Unemployment_rate",
+    "Urban_Influence_Code"
+]
+dataset_mask = data['indicator'].isin(indicators_to_keep)
+data = data[dataset_mask]
+
+columns_ordered = [
+    "year",
+    "FIPS_Code",
+    "State",
+    "Area_Name",
+    "indicator",
+    "value"
+]
+data = data[columns_ordered]
+data.loc[data['indicator'] == "Urban_Influence_Code", 'year'] = "covariate"
+
+data = data.dropna(subset=['value']).reset_index(drop=True)
+
+print(data.head())
+print(data.info())
+
+data['indicator'] = data['indicator'].astype(str)
+data['FIPS_Code'] = data['FIPS_Code'].astype(str)
+data['year'] = data['year'].astype(str)
+data['treatment'] = np.where(data['FIPS_Code'] == "12001", 1, 0)
+data['pre_intervention'] = np.where(data['year'].isin(['2000', '2001', '2002', '2003','2004', '2005', '2006', '2007', '2008', '2009', '2010', '2011', '2012', '2013', '2014', '2015']), 1, 0)
 
 donor_selection.search(
-    all_units=data,
-    yname="indicador",
-    unitname="codigo_municipio6",
-    tname="ano",
-    value="valor",
-    treatment="tratamento",
-    pre_intervention="pre_intervencao",
-    temporal_cross_search=['2007', '2010'],
-    workspace_folder='C:/att_ipw_based_ranking_donor_selection/',
-    tname_covariate="covariavel"
+    all_units = data,
+    yname = "indicator",
+    unitname = "FIPS_Code",
+    tname = "year",
+    value = "value",
+    treatment = "treatment",
+    pre_intervention = "pre_intervention",
+    temporal_cross_search = ['2004', '2005', '2006', '2007', '2008', '2009', '2010', '2011'],
+    workspace_folder = 'C:/test_propensitygbdt_scm_donor_selection/',
+    tname_covariate = "covariate",
+    # include_error_post_intervention_in_optuna_objective = True
 )
 ```
 
@@ -85,7 +127,7 @@ donor_selection.search(
 
 ### Optional Parameters
 
-*   `tname_covariate` (str, optional): The name of the time period that identifies covariates. Defaults to `'covariate'`.
+*   `tname_covariate` (str, optional): The name of the time period that identifies covariates. Defaults to `None`.
 *   `seed` (int, optional): The random seed for reproducibility. Defaults to `111`.
 *   `maximum_num_units_on_support_first_filter` (int, optional): The maximum number of units to be considered "on support" in the first filtering stage. Defaults to `50`.
 *   `maximum_error_pre_intervention` (float, optional): The maximum allowable error in the pre-treatment period for a donor pool to be considered valid. Defaults to `0.15`.
