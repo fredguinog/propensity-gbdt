@@ -256,18 +256,6 @@ def search(
     if include_error_post_intervention_in_optuna_objective:
         hyperparameter_search_extra_criteria.append('post_intervention_period')
 
-    # STANDARDIZATION
-    # Make the values between outcomes and covariates comparible so their evaluation metrics can be aggregated
-    # Calculate mean and standard deviation for each outcome and covariate
-    mean_std = all_units.groupby('variable').agg({'value': ['mean', 'std']}).reset_index()
-    mean_std.columns = [f'{col[0]}_{col[1]}' if col[1] else col[0] for col in mean_std.columns.values]
-    mean_std.to_parquet(workspace_folder + 'all_units_mean_std.parquet', index=False)
-
-    # Apply the standardization to the 'value' column.
-    all_units = pd.merge(all_units, mean_std, on='variable', how='left')
-    all_units['value'] = (all_units['value'] - all_units['value_mean']) / all_units['value_std']
-    all_units.drop(['value_mean', 'value_std'], axis=1, inplace=True)
-
     import os
     import sys
     import xgboost as xgb
