@@ -44,7 +44,110 @@ causal inference.
 .. _Medium Article:
     https://medium.com/@frederico.nogueira/a-new-lens-for-donor-selection-att-ipw-based-ranking-198b9d30bc69
 
-#######################################################################################################
+"""
+
+from importlib import resources
+import numpy as np
+import pandas as pd
+import math
+
+"""
+Calculates a single "Stability Score" to identify models with no effect.
+The score combines the p-value with a penalty for how far the
+observed ratio deviates from the ideal of 1.0.
+
+Calculates the p-value across multiple outcomes by comparing the
+post-intervention to pre-intervention RMSPE ratio using a block bootstrap.
+
+The p-value represents the probability that the observed increase in RMSPE
+could have occurred by chance if the underlying process had not changed.
+
+Args:
+    data_pre (pd.DataFrame): DataFrame with pre-intervention data.
+                                Must contain 'variable', 'timeid', and 'value' columns.
+    data_post (pd.DataFrame): DataFrame with post-intervention data.
+                                Must contain 'variable', 'timeid', and 'value' columns.
+    n_bootstraps (int): The number of bootstrap samples to generate.
+    alpha (float): A tuning parameter controlling the severity of the
+                                penalty for ratios not equal to 1. Higher alpha
+                                means a stricter penalty.
+
+Returns:
+    float: A score between 0 and 1. Higher is better (stronger
+                                evidence of no effect).
+"""
+def block_bootstrap_rmspe_ratio_vectorized(data_pre, data_post, n_bootstraps=1000, alpha=2.0):
+    """
+    A fully vectorized implementation of the block bootstrap for calculating p-values.
+    """
+    all_observed_ratio = []
+    all_p_values = []
+    unique_outcomes = data_pre['variable'].unique()
+
+    for outcome in unique_outcomes:
+        pre_values = data_pre[data_pre['variable'] == outcome]['value'].to_numpy()
+        post_values = data_post[data_post['variable'] == outcome]['value'].to_numpy()
+
+        if len(pre_values) == 0: continue
+        
+        # 1. Calculate the single observed RMSPE ratio (same as before)
+        observed_pre_rmspe = np.sqrt(np.mean(pre_values**2))
+        observed_post_rmspe = np.sqrt(np.mean(post_values**2))
+        observed_ratio = observed_post_rmspe / observed_pre_rmspe if observed_pre_rmspe != 0 else np.inf
+
+        # 2. Setup for vectorization
+        combined_values = np.concatenate([pre_values, post_values])
+        n_combined = len(combined_values)
+        n_pre = len(pre_values)
+        block_length = math.ceil(n_combined**(1/3))
+        if block_length < 2: block_length = 2
+        
+        num_blocks_to_draw = math.ceil(n_combined / block_length)
+
+        # 3. Generate ALL random starting indices for ALL bootstraps at once
+        # This creates a 2D array of shape: (n_bootstraps, num_blocks_to_draw)
+        start_indices = np.random.randint(
+            0, n_combined - block_length + 1, 
+            size=(n_bootstraps, num_blocks_to_draw)
+        )
+
+        # 4. Create ALL bootstrapped series at once using advanced indexing
+        # This is the most complex step, but it's extremely fast.
+        # It builds a giant index matrix to pull values from the original series.
+        block_offsets = np.arange(block_length)
+        # Broadcasting creates a 3D index matrix: (n_bootstraps, num_blocks, block_length)
+        indices_3d = start_indices[:, :, np.newaxis] + block_offsets
+        # Flatten the blocks and grab the values
+        bootstrapped_series_full = combined_values[indices_3d].reshape(n_bootstraps, -1)
+        # Trim to the correct length
+        bootstrapped_series = bootstrapped_series_full[:, :n_combined]
+
+        # 5. Calculate RMSPE ratios for ALL bootstraps in a vectorized way
+        boot_pre_matrix = bootstrapped_series[:, :n_pre]
+        boot_post_matrix = bootstrapped_series[:, n_pre:]
+
+        boot_pre_rmspes = np.sqrt(np.mean(boot_pre_matrix**2, axis=1))
+        boot_post_rmspes = np.sqrt(np.mean(boot_post_matrix**2, axis=1))
+        
+        # Handle division by zero for all bootstraps at once
+        bootstrap_ratios = np.full(n_bootstraps, np.inf)
+        valid_mask = boot_pre_rmspes != 0
+        bootstrap_ratios[valid_mask] = boot_post_rmspes[valid_mask] / boot_pre_rmspes[valid_mask]
+        
+        # 6. Calculate the p-value
+        p_value = np.mean(bootstrap_ratios >= observed_ratio)
+        all_observed_ratio.append(observed_ratio)
+        all_p_values.append(p_value)
+
+    # The core of the penalty is the absolute distance from the ideal ratio of 1.0
+    ratio_penalty = np.exp(-alpha * abs(np.min(all_observed_ratio) - 1))
+    
+    # The final score is one minus the p-value modulated by the ratio penalty
+    score = 1 - np.min(all_p_values) * ratio_penalty
+
+    return score
+
+"""
 
 This function executes a multi-loop search to find the optimal donor pool for Synthetic Control Methods.
 
@@ -95,7 +198,7 @@ proportion_pre_intervention_period_outcomes_donor : int, optional
     Used to calculate the upper limit for the donor pool size. The limit is determined by
     (num_pre_intervention_periods * num_outcomes) / this_value. Defaults to 10.
 inferior_limit_maximum_donor_pool_size : int, optional
-    The minimum number of donors to be selected in any candidate pool. Defaults to 2.
+    The minimum number of donors to be selected in any candidate pool. Defaults to 1.
 on_support_first_filter : {'max_weight', 'maximum_num_units_on_support_first_filter', 'bigger_than_min_weight'}, optional
     The primary strategy for identifying the initial set of "on-support" donors from the
     IPW-ranked list. Defaults to 'max_weight'.
@@ -115,10 +218,6 @@ time_serie_covariate_metric : {'rmse', 'mae'}, optional
     The metric used to evaluate the fit on time-series outcomes and covariates.
     Defaults to 'rmse'.
 """
-from importlib import resources
-import numpy as np
-import pandas as pd
-
 def search(
     all_units,
     yname,
@@ -135,7 +234,7 @@ def search(
     maximum_error_pre_intervention = 0.15,
     maximum_error_covariates = 0.15,
     proportion_pre_intervention_period_outcomes_donor = 10,
-    inferior_limit_maximum_donor_pool_size = 2,
+    inferior_limit_maximum_donor_pool_size = 1,
     on_support_first_filter = 'max_weight',
     on_support_second_filter = 'randomN',
     include_error_post_intervention_in_optuna_objective = False,
@@ -241,6 +340,37 @@ def search(
         import sys
         sys.exit()
 
+    # CHECK IF THE on_support_second_filter HAS ONLY THE VALUES: 'randomN' AND/OR 'bigger_than_min_weight'
+    if on_support_second_filter not in ['randomN', 'all']:
+        print("ERROR: on_support_second_filter MUST HAVE ONLY THE VALUES: 'randomN' AND/OR 'all'")
+        print(f"on_support_second_filter: {on_support_second_filter}")
+        import sys
+        sys.exit()
+
+    # MAKE THE PANEL DATA BALANCED BY REMOVING ALL UNITS WHICH HAVE NOT THE SAME NUMBER OF timeids PER variable EQUAL TO THEN TREATMENT UNIT
+    print(all_units.shape)
+    all_units = all_units[all_units['value'].notna()]
+    dt1 = all_units[['unitid', 'treatment', 'timeid', 'variable']].copy()
+
+    treatment_indicators = dt1[dt1['treatment'] == 1]['variable'].unique()
+    dt2 = dt1[dt1['variable'].isin(treatment_indicators)][['unitid', 'treatment', 'timeid', 'variable']]
+    dt2 = dt2.groupby(['unitid', 'treatment', 'timeid']).agg({'variable': 'count'}).sort_values('variable').reset_index()
+    dt2 = dt2[dt2['variable'] == len(treatment_indicators)][['unitid', 'treatment', 'timeid']]
+
+    treatment_quarter_ids = dt2[dt2['treatment'] == 1]['timeid'].unique()
+    dt3 = dt2[dt2['timeid'].isin(treatment_quarter_ids)][['unitid', 'treatment', 'timeid']]
+    dt3 = dt3.groupby(['unitid', 'treatment']).agg({'timeid': 'count'}).sort_values('timeid').reset_index()
+    valid_units = dt3[dt3['timeid'] == len(treatment_quarter_ids)]['unitid'].unique()
+    invalid_units = all_units[~all_units['unitid'].isin(valid_units)]['unitid'].unique()
+    print(f"Number of dropped invalid unitids: {len(invalid_units)}")
+    print("Invalid units: ", invalid_units)
+    all_units = all_units[all_units['unitid'].isin(valid_units)]
+    print(all_units.shape)
+
+    print(all_units.groupby(['timeid', 'variable']).size().unstack(fill_value=0))
+    print(all_units.head())
+    print(all_units.info())
+
     treatment_unitid = all_units[all_units['treatment'] == 1]['unitid'].iloc[0]
     outcomes = all_units[all_units['timeid'] != tname_covariate]['variable'].sort_values().unique().tolist()
     covariates = all_units[all_units['timeid'] == tname_covariate]['variable'].sort_values().unique().tolist()
@@ -343,6 +473,7 @@ def search(
     scm_donor_selection_candidate_units_data['error_pre_intervention'] = None
     scm_donor_selection_candidate_units_data['error_post_intervention'] = None
     scm_donor_selection_candidate_units_data['error_covariates'] = None
+    scm_donor_selection_candidate_units_data['conservative_factor'] = None    
     scm_donor_selection_candidate_units_data['num_units_bigger_min_weight'] = None
     scm_donor_selection_candidate_units_data['num_units_max_weight'] = None
     scm_donor_selection_candidate_units_data.to_csv(scm_donor_selection_candidate_units_data_file_path, mode='w', header=True, index=False)
@@ -357,6 +488,7 @@ def search(
     scm_donor_selection_candidate_performance['error_pre_intervention'] = None
     scm_donor_selection_candidate_performance['error_post_intervention'] = None
     scm_donor_selection_candidate_performance['error_covariates'] = None
+    scm_donor_selection_candidate_performance['conservative_factor'] = None    
     scm_donor_selection_candidate_performance['num_units_bigger_min_weight'] = None
     scm_donor_selection_candidate_performance['num_units_max_weight'] = None
     scm_donor_selection_candidate_performance.to_csv(scm_donor_selection_candidate_performance_file_path, mode='w', header=True, index=False)
@@ -440,13 +572,13 @@ def search(
                 'value' : lambda x: x.iloc[0] - x.iloc[1]
             }).reset_index(level=['variable', 'timeid'])
 
-            aggregated3_diff_normalized = pd.merge(aggregated3_diff, amplitude, on='variable', how='left')
-            aggregated3_diff_normalized['value'] = aggregated3_diff_normalized['value'] / aggregated3_diff_normalized['amplitude']
+            aggregated3_diff_normalized_pre = pd.merge(aggregated3_diff, amplitude, on='variable', how='left')
+            aggregated3_diff_normalized_pre['value'] = aggregated3_diff_normalized_pre['value'] / aggregated3_diff_normalized_pre['amplitude']
 
             if metric == 'mae':
-                error_pre_intervention = aggregated3_diff_normalized['value'].abs().mean()
+                error_pre_intervention = aggregated3_diff_normalized_pre['value'].abs().mean()
             elif metric == 'rmse':
-                error_pre_intervention = ((aggregated3_diff_normalized['value'] ** 2).mean()) ** 0.5
+                error_pre_intervention = ((aggregated3_diff_normalized_pre['value'] ** 2).mean()) ** 0.5
 
             # Calculate error for the entire post-treatment period.
             # --- Diagnostic tool, not a core component, and it is disabled by default ---
@@ -463,13 +595,23 @@ def search(
                 'value' : lambda x: x.iloc[0] - x.iloc[1]
             }).reset_index(level=['variable', 'timeid'])
 
-            aggregated3_diff_normalized = pd.merge(aggregated3_diff, amplitude, on='variable', how='left')
-            aggregated3_diff_normalized['value'] = aggregated3_diff_normalized['value'] / aggregated3_diff_normalized['amplitude']
+            aggregated3_diff_normalized_post = pd.merge(aggregated3_diff, amplitude, on='variable', how='left')
+            aggregated3_diff_normalized_post['value'] = aggregated3_diff_normalized_post['value'] / aggregated3_diff_normalized_post['amplitude']
 
             if metric == 'mae':
-                error_post_intervention = aggregated3_diff_normalized['value'].abs().mean()
+                error_post_intervention = aggregated3_diff_normalized_post['value'].abs().mean()
             elif metric == 'rmse':
-                error_post_intervention = ((aggregated3_diff_normalized['value'] ** 2).mean()) ** 0.5
+                error_post_intervention = ((aggregated3_diff_normalized_post['value'] ** 2).mean()) ** 0.5
+
+            if error_pre_intervention < maximum_error_pre_intervention:
+                np.random.seed(attempt + seed) 
+                conservative_factor = block_bootstrap_rmspe_ratio_vectorized(
+                    aggregated3_diff_normalized_pre[aggregated3_diff_normalized_pre['timeid'] != tname_covariate],
+                    aggregated3_diff_normalized_post[aggregated3_diff_normalized_post['timeid'] != tname_covariate],
+                    n_bootstraps=1000
+                )
+            else:
+                conservative_factor = -float('inf')
 
             # Evaluate covariate balance.
             aggregated3_diff = aggregated3[aggregated3['timeid'].isin([tname_covariate])].sort_values(['variable', 'timeid', 'treatment'], ascending=True).groupby(['variable', 'timeid']).agg({
@@ -481,7 +623,7 @@ def search(
             elif metric == 'rmse':
                 error_covariates = ((aggregated3_diff['value'] ** 2).mean()) ** 0.5
 
-            return error_train, error_valid, error_pre_intervention, error_post_intervention, error_covariates
+            return error_train, error_valid, error_pre_intervention, error_post_intervention, error_covariates, conservative_factor
 
         def eval_metric_ipw(self, preds, metric):
             """
@@ -532,7 +674,8 @@ def search(
                     error_pre_intervention = float('inf')
                     error_post_intervention = float('inf')
                     error_covariates = float('inf')
-                    return error_train, error_valid, error_pre_intervention, error_post_intervention, error_covariates, ipw, num_units_bigger_min_weight, num_units_max_weight
+                    conservative_factor = -float('inf')
+                    return error_train, error_valid, error_pre_intervention, error_post_intervention, error_covariates, conservative_factor, ipw, num_units_bigger_min_weight, num_units_max_weight
                 
                 # If the number of units sharing the max weight is larger than the desired pool size,
                 # randomly sample from this top tier to select the final donors.
@@ -573,7 +716,8 @@ def search(
                     error_pre_intervention = float('inf')
                     error_post_intervention = float('inf')
                     error_covariates = float('inf')
-                    return error_train, error_valid, error_pre_intervention, error_post_intervention, error_covariates, ipw, num_units_bigger_min_weight, num_units_max_weight
+                    conservative_factor = -float('inf')
+                    return error_train, error_valid, error_pre_intervention, error_post_intervention, error_covariates, conservative_factor, ipw, num_units_bigger_min_weight, num_units_max_weight
 
                 # If the number of on-support units exceeds the desired pool size,
                 # randomly sample from them.
@@ -604,9 +748,9 @@ def search(
             ipw.drop('treatment', axis=1, inplace=True)
             
             # Evaluate the performance of this candidate donor pool.
-            error_train, error_valid, error_pre_intervention, error_post_intervention, error_covariates = self.evaluate_outcomes_metric(metric=metric, weights=ipw)
+            error_train, error_valid, error_pre_intervention, error_post_intervention, error_covariates, conservative_factor = self.evaluate_outcomes_metric(metric=metric, weights=ipw)
 
-            return error_train, error_valid, error_pre_intervention, error_post_intervention, error_covariates, ipw, num_units_bigger_min_weight, num_units_max_weight
+            return error_train, error_valid, error_pre_intervention, error_post_intervention, error_covariates, conservative_factor, ipw, num_units_bigger_min_weight, num_units_max_weight
 
         def full_data_treatment_control_scaling(self, weight):
             """Prepares the full dataset with the final weights for saving if it is good enough."""
@@ -659,9 +803,9 @@ def search(
             It calculates the "Causal Fitness" score and updates the best scores found so far.
             dtrain is not used. The incapsulation is violated to make it performant.
             """
-            global current_error_train, current_error_valid, current_error_pre_intervention, current_error_post_intervention, current_error_covariates, current_weights, current_preds, current_num_units_bigger_min_weight, current_num_units_max_weight
+            global current_error_train, current_error_valid, current_error_pre_intervention, current_error_post_intervention, current_error_covariates, current_conservative_factor, current_weights, current_preds, current_num_units_bigger_min_weight, current_num_units_max_weight
 
-            error_train, error_valid, error_pre_intervention, error_post_intervention, error_covariates, weights, num_units_bigger_min_weight, num_units_max_weight = dataset.eval_metric_ipw(preds, metric=time_serie_covariate_metric)
+            error_train, error_valid, error_pre_intervention, error_post_intervention, error_covariates, conservative_factor, weights, num_units_bigger_min_weight, num_units_max_weight = dataset.eval_metric_ipw(preds, metric=time_serie_covariate_metric)
 
             if current_error_valid > error_valid:
                 current_weights = weights
@@ -670,6 +814,7 @@ def search(
                 current_error_pre_intervention = error_pre_intervention
                 current_error_post_intervention = error_post_intervention
                 current_error_covariates = error_covariates
+                current_conservative_factor = conservative_factor
                 current_preds = preds
                 current_num_units_bigger_min_weight = num_units_bigger_min_weight
                 current_num_units_max_weight = num_units_max_weight
@@ -764,9 +909,10 @@ def search(
                         data['error_pre_intervention'] = current_error_pre_intervention
                         data['error_post_intervention'] = current_error_post_intervention
                         data['error_covariates'] = current_error_covariates
+                        data['conservative_factor'] = current_conservative_factor
                         data['num_units_bigger_min_weight'] = current_num_units_bigger_min_weight
                         data['num_units_max_weight'] = current_num_units_max_weight
-                        columns = ['variable', 'timeid', 'value', 'treatment', 'weight', 'unitid', 'valor_m_weight', 'id', 'cycle', 'trial', 'error_train', 'error_valid', 'error_pre_intervention', 'error_post_intervention', 'error_covariates', 'num_units_bigger_min_weight', 'num_units_max_weight']
+                        columns = ['variable', 'timeid', 'value', 'treatment', 'weight', 'unitid', 'valor_m_weight', 'id', 'cycle', 'trial', 'error_train', 'error_valid', 'error_pre_intervention', 'error_post_intervention', 'error_covariates', 'conservative_factor', 'num_units_bigger_min_weight', 'num_units_max_weight']
                         data[columns].to_csv(scm_donor_selection_candidate_units_data_file_path, mode='a', header=False, index=False)
 
                         # Save the weights and performance metrics of this viable solution.
@@ -778,6 +924,7 @@ def search(
                         temp['error_pre_intervention'] = current_error_pre_intervention
                         temp['error_post_intervention'] = current_error_post_intervention
                         temp['error_covariates'] = current_error_covariates
+                        temp['conservative_factor'] = current_conservative_factor                        
                         temp['num_units_bigger_min_weight'] = current_num_units_bigger_min_weight
                         temp['num_units_max_weight'] = current_num_units_max_weight
                         temp.to_csv(scm_donor_selection_candidate_performance_file_path, mode='a', header=False, index=False)
