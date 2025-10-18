@@ -473,7 +473,7 @@ def search(
     scm_donor_selection_candidate_units_data['error_pre_intervention'] = None
     scm_donor_selection_candidate_units_data['error_post_intervention'] = None
     scm_donor_selection_candidate_units_data['error_covariates'] = None
-    scm_donor_selection_candidate_units_data['conservative_factor'] = None    
+    scm_donor_selection_candidate_units_data['impact_score'] = None    
     scm_donor_selection_candidate_units_data['num_units_bigger_min_weight'] = None
     scm_donor_selection_candidate_units_data['num_units_max_weight'] = None
     scm_donor_selection_candidate_units_data.to_csv(scm_donor_selection_candidate_units_data_file_path, mode='w', header=True, index=False)
@@ -488,7 +488,7 @@ def search(
     scm_donor_selection_candidate_performance['error_pre_intervention'] = None
     scm_donor_selection_candidate_performance['error_post_intervention'] = None
     scm_donor_selection_candidate_performance['error_covariates'] = None
-    scm_donor_selection_candidate_performance['conservative_factor'] = None    
+    scm_donor_selection_candidate_performance['impact_score'] = None    
     scm_donor_selection_candidate_performance['num_units_bigger_min_weight'] = None
     scm_donor_selection_candidate_performance['num_units_max_weight'] = None
     scm_donor_selection_candidate_performance.to_csv(scm_donor_selection_candidate_performance_file_path, mode='w', header=True, index=False)
@@ -605,13 +605,13 @@ def search(
 
             if error_pre_intervention < maximum_error_pre_intervention:
                 np.random.seed(attempt + seed) 
-                conservative_factor = block_bootstrap_rmspe_ratio_vectorized(
+                impact_score = block_bootstrap_rmspe_ratio_vectorized(
                     aggregated3_diff_normalized_pre[aggregated3_diff_normalized_pre['timeid'] != tname_covariate],
                     aggregated3_diff_normalized_post[aggregated3_diff_normalized_post['timeid'] != tname_covariate],
                     n_bootstraps=1000
                 )
             else:
-                conservative_factor = -float('inf')
+                impact_score = -float('inf')
 
             # Evaluate covariate balance.
             aggregated3_diff = aggregated3[aggregated3['timeid'].isin([tname_covariate])].sort_values(['variable', 'timeid', 'treatment'], ascending=True).groupby(['variable', 'timeid']).agg({
@@ -623,7 +623,7 @@ def search(
             elif metric == 'rmse':
                 error_covariates = ((aggregated3_diff['value'] ** 2).mean()) ** 0.5
 
-            return error_train, error_valid, error_pre_intervention, error_post_intervention, error_covariates, conservative_factor
+            return error_train, error_valid, error_pre_intervention, error_post_intervention, error_covariates, impact_score
 
         def eval_metric_ipw(self, preds, metric):
             """
@@ -674,8 +674,8 @@ def search(
                     error_pre_intervention = float('inf')
                     error_post_intervention = float('inf')
                     error_covariates = float('inf')
-                    conservative_factor = -float('inf')
-                    return error_train, error_valid, error_pre_intervention, error_post_intervention, error_covariates, conservative_factor, ipw, num_units_bigger_min_weight, num_units_max_weight
+                    impact_score = -float('inf')
+                    return error_train, error_valid, error_pre_intervention, error_post_intervention, error_covariates, impact_score, ipw, num_units_bigger_min_weight, num_units_max_weight
                 
                 # If the number of units sharing the max weight is larger than the desired pool size,
                 # randomly sample from this top tier to select the final donors.
@@ -716,8 +716,8 @@ def search(
                     error_pre_intervention = float('inf')
                     error_post_intervention = float('inf')
                     error_covariates = float('inf')
-                    conservative_factor = -float('inf')
-                    return error_train, error_valid, error_pre_intervention, error_post_intervention, error_covariates, conservative_factor, ipw, num_units_bigger_min_weight, num_units_max_weight
+                    impact_score = -float('inf')
+                    return error_train, error_valid, error_pre_intervention, error_post_intervention, error_covariates, impact_score, ipw, num_units_bigger_min_weight, num_units_max_weight
 
                 # If the number of on-support units exceeds the desired pool size,
                 # randomly sample from them.
@@ -748,9 +748,9 @@ def search(
             ipw.drop('treatment', axis=1, inplace=True)
             
             # Evaluate the performance of this candidate donor pool.
-            error_train, error_valid, error_pre_intervention, error_post_intervention, error_covariates, conservative_factor = self.evaluate_outcomes_metric(metric=metric, weights=ipw)
+            error_train, error_valid, error_pre_intervention, error_post_intervention, error_covariates, impact_score = self.evaluate_outcomes_metric(metric=metric, weights=ipw)
 
-            return error_train, error_valid, error_pre_intervention, error_post_intervention, error_covariates, conservative_factor, ipw, num_units_bigger_min_weight, num_units_max_weight
+            return error_train, error_valid, error_pre_intervention, error_post_intervention, error_covariates, impact_score, ipw, num_units_bigger_min_weight, num_units_max_weight
 
         def full_data_treatment_control_scaling(self, weight):
             """Prepares the full dataset with the final weights for saving if it is good enough."""
@@ -803,9 +803,9 @@ def search(
             It calculates the "Causal Fitness" score and updates the best scores found so far.
             dtrain is not used. The incapsulation is violated to make it performant.
             """
-            global current_error_train, current_error_valid, current_error_pre_intervention, current_error_post_intervention, current_error_covariates, current_conservative_factor, current_weights, current_preds, current_num_units_bigger_min_weight, current_num_units_max_weight
+            global current_error_train, current_error_valid, current_error_pre_intervention, current_error_post_intervention, current_error_covariates, current_impact_score, current_weights, current_preds, current_num_units_bigger_min_weight, current_num_units_max_weight
 
-            error_train, error_valid, error_pre_intervention, error_post_intervention, error_covariates, conservative_factor, weights, num_units_bigger_min_weight, num_units_max_weight = dataset.eval_metric_ipw(preds, metric=time_serie_covariate_metric)
+            error_train, error_valid, error_pre_intervention, error_post_intervention, error_covariates, impact_score, weights, num_units_bigger_min_weight, num_units_max_weight = dataset.eval_metric_ipw(preds, metric=time_serie_covariate_metric)
 
             if current_error_valid > error_valid:
                 current_weights = weights
@@ -814,7 +814,7 @@ def search(
                 current_error_pre_intervention = error_pre_intervention
                 current_error_post_intervention = error_post_intervention
                 current_error_covariates = error_covariates
-                current_conservative_factor = conservative_factor
+                current_impact_score = impact_score
                 current_preds = preds
                 current_num_units_bigger_min_weight = num_units_bigger_min_weight
                 current_num_units_max_weight = num_units_max_weight
@@ -909,10 +909,10 @@ def search(
                         data['error_pre_intervention'] = current_error_pre_intervention
                         data['error_post_intervention'] = current_error_post_intervention
                         data['error_covariates'] = current_error_covariates
-                        data['conservative_factor'] = current_conservative_factor
+                        data['impact_score'] = current_impact_score
                         data['num_units_bigger_min_weight'] = current_num_units_bigger_min_weight
                         data['num_units_max_weight'] = current_num_units_max_weight
-                        columns = ['variable', 'timeid', 'value', 'treatment', 'weight', 'unitid', 'valor_m_weight', 'id', 'cycle', 'trial', 'error_train', 'error_valid', 'error_pre_intervention', 'error_post_intervention', 'error_covariates', 'conservative_factor', 'num_units_bigger_min_weight', 'num_units_max_weight']
+                        columns = ['variable', 'timeid', 'value', 'treatment', 'weight', 'unitid', 'valor_m_weight', 'id', 'cycle', 'trial', 'error_train', 'error_valid', 'error_pre_intervention', 'error_post_intervention', 'error_covariates', 'impact_score', 'num_units_bigger_min_weight', 'num_units_max_weight']
                         data[columns].to_csv(scm_donor_selection_candidate_units_data_file_path, mode='a', header=False, index=False)
 
                         # Save the weights and performance metrics of this viable solution.
@@ -924,7 +924,7 @@ def search(
                         temp['error_pre_intervention'] = current_error_pre_intervention
                         temp['error_post_intervention'] = current_error_post_intervention
                         temp['error_covariates'] = current_error_covariates
-                        temp['conservative_factor'] = current_conservative_factor                        
+                        temp['impact_score'] = current_impact_score                        
                         temp['num_units_bigger_min_weight'] = current_num_units_bigger_min_weight
                         temp['num_units_max_weight'] = current_num_units_max_weight
                         temp.to_csv(scm_donor_selection_candidate_performance_file_path, mode='a', header=False, index=False)
