@@ -99,8 +99,10 @@ def block_bootstrap_rmspe_ratio_vectorized(data_pre, data_post, n_bootstraps=100
         combined_values = np.concatenate([pre_values, post_values])
         n_combined = len(combined_values)
         n_pre = len(pre_values)
+
         block_length = math.ceil(n_combined**(1/3))
-        if block_length < 2: block_length = 2
+        if block_length < 1: block_length = 1
+        elif len(post_values) < 3: block_length = 1
         
         num_blocks_to_draw = math.ceil(n_combined / block_length)
 
@@ -294,6 +296,10 @@ def search(
         import sys
         sys.exit()
 
+    min_timeid_pre_intervention = all_units[(all_units['pre_intervention'] == 1) & (all_units['timeid'] != tname_covariate)]['timeid'].min()
+    max_timeid_pre_intervention = all_units[(all_units['pre_intervention'] == 0) & (all_units['timeid'] != tname_covariate)]['timeid'].max()
+    all_units = all_units[((all_units['timeid'] >= min_timeid_pre_intervention) & (all_units['timeid'] <= max_timeid_pre_intervention)) | (all_units['timeid'] == tname_covariate)]
+
     # CHECH DIRECTORY EXISTS AND CREATE IT IF NOT
     import os
     if not os.path.exists(workspace_folder):
@@ -346,6 +352,8 @@ def search(
         print(f"on_support_second_filter: {on_support_second_filter}")
         import sys
         sys.exit()
+
+    all_units = all_units[['timeid', 'pre_intervention', 'unitid', 'treatment', 'variable', 'value']]
 
     # MAKE THE PANEL DATA BALANCED BY REMOVING ALL UNITS WHICH HAVE NOT THE SAME NUMBER OF timeids PER variable EQUAL TO THEN TREATMENT UNIT
     print(all_units.shape)
