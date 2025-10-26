@@ -10,7 +10,7 @@ The vision of this repository is to provide a unified, machine learning-driven f
 
 For each causal method, our workflow enforces common support before the final estimation:
 
-1.  **Estimate Propensity Scores:** Use a flexible gradient boosting model to predict the probability of treatment based on pre-intervention data: outcomes and/or covariates.
+1.  **Estimate Propensity Scores:** Use a flexible gradient boosting model to predict the probability of treatment based on pre-intervention data: outcomes variables.
 2.  **Identify and Prune:** Use these scores to identify and remove control units that are **off-support**—those that don't overlap with the treated group's characteristics, ensuring that the common support assumption is met.
 3.  **Perform Causal Analysis:** Run the final analysis (SCM, DiD, etc.) using only the pruned, high-quality set of on-support control units.
 
@@ -32,8 +32,8 @@ The input DataFrame (`all_units`) must be in a **long format**, where each row r
 | Column Name | Data Type | Description |
 | :--- | :--- | :--- |
 | `unitname` | str | Orderable identifier for the unit (e.g., city ID, user ID). |
-| `tname` | str | Orderable time period identifier (e.g., year, month, 'covariate' for timeless covariables). |
-| `yname` | str | Name of the outcome variable or covariate. |
+| `tname` | str | Orderable time period identifier (e.g., year, year_month). |
+| `yname` | str | Name of the outcome variable. |
 | `value` | float | The numeric value for the given `yname`. |
 | `treatment` | int | Binary indicator: `1` for the treated unit, `0` for control units. |
 | `pre_intervention` | int | Binary indicator: `1` for the pre-intervention period, `0` for post-intervention. |
@@ -64,8 +64,7 @@ data['indicator'] = data['Attribute'].str[:-5]
 
 indicators_to_keep = [
     "Civilian_labor_force",
-    "Unemployment_rate",
-    "Urban_Influence_Code"
+    "Unemployment_rate"
 ]
 data = data[data['indicator'].isin(indicators_to_keep)]
 
@@ -78,7 +77,6 @@ columns_ordered = [
     "Value"
 ]
 data = data[columns_ordered]
-data.loc[data['indicator'] == "Urban_Influence_Code", 'year'] = "covariate"
 
 data = data.dropna(subset=['Value']).reset_index(drop=True)
 
@@ -98,8 +96,7 @@ donor_selection.search(
     pre_intervention = "pre_intervention",
     temporal_cross_search = ['2004', '2005', '2006', '2007', '2008', '2009', '2010', '2011'],
     workspace_folder = 'C:/test_propensitygbdt_scm_donor_selection/',
-    tname_covariate = "covariate",
-    # include_error_post_intervention_in_optuna_objective = True
+    # include_impact_score_in_optuna_objective = True
 )
 ```
 
@@ -119,24 +116,19 @@ donor_selection.search(
 
 ### Optional Parameters
 
-*   `tname_covariate` (str, optional): The name of the time period that identifies covariates. Defaults to `None`.
 *   `seed` (int, optional): The random seed for reproducibility. Defaults to `111`.
 *   `maximum_num_units_on_support_first_filter` (int, optional): The maximum number of units to be considered "on support" in the first filtering stage. Defaults to `50`.
 *   `maximum_error_pre_intervention` (float, optional): The maximum allowable error in the pre-treatment period for a donor pool to be considered valid. Defaults to `0.15`.
-*   `maximum_error_covariates` (float, optional): The maximum allowable error for covariates. Defaults to `0.15`.
 *   `proportion_pre_intervention_period_outcomes_donor` (int, optional): The desired ratio of pre-intervention data points of all outcomes to the maximum size of the donor pool. Defaults to `10`.
 ```python
     superior_limit_maximum_donor_pool_size = int(num_pre_intervention_periods_per_outcome['timeid'].sum() / proportion_pre_intervention_period_outcomes_donor)
     if superior_limit_maximum_donor_pool_size < 2:
         superior_limit_maximum_donor_pool_size = 2
 ```
-*   `inferior_limit_maximum_donor_pool_size` (int, optional): The minimum size of the donor pool. Defaults to `2`.
-*   `on_support_first_filter` (str, optional): The strategy for the first on-support filter. Can be `'max_weight'`, `'maximum_num_units_on_support_first_filter'`, or `'bigger_than_min_weight'`. Defaults to `'max_weight'`.
-*   `on_support_second_filter` (str, optional): The strategy for the second on-support filter, applyied after the first one. Can be `'randomN'` or `'all'`. N being a number between inferior_limit_maximum_donor_pool_size and superior_limit_maximum_donor_pool_size. Defaults to `'randomN'`.
-*   `include_error_post_intervention_in_optuna_objective` (bool, optional): Flag to include or not the post-intervention error in the Optuna's search criteria. Defaults to `False`.
+*   `inferior_limit_maximum_donor_pool_size` (int, optional): The minimum size of the donor pool. Defaults to `1`.
+*   `include_impact_score_in_optuna_objective` (bool, optional): Flag to include or not the impact score in the Optuna's search criteria. Defaults to `False`.
 *   `number_optuna_trials` (int, optional): The number of trials for the Optuna hyperparameter optimization. Defaults to `300`.
 *   `timeout_optuna_cycle` (int, optional): The timeout in seconds for each Optuna optimization cycle. Defaults to `900`.
-*   `time_serie_covariate_metric` (str, optional): The metric to be used for time-series covariate balancing. Can be `'rmse'` or `'mae'`. Defaults to `'rmse'`.
 
 ## Citation
 

@@ -50,9 +50,84 @@ from importlib import resources
 import numpy as np
 import pandas as pd
 import math
+from scipy.optimize import minimize
+import random
 
 """
-Calculates a single "Stability Score" to identify models with no effect.
+Calculates a single set of optimal weights for a synthetic control group
+by simultaneously minimizing the error across multiple, standardized outcome variables.
+
+This function first standardizes the data for each outcome variable (mean=0, std=1)
+before performing the optimization. This is crucial when outcomes are on different scales.
+
+Args:
+    treated_pre_intervention (np.ndarray): A 2D array where each row represents a
+                                            pre-intervention time period and each
+                                            column represents an outcome variable for
+                                            the treated unit. (Shape: periods x outcomes)
+    control_pre_intervention (np.ndarray): A 3D array where the first dimension
+                                            represents pre-intervention time periods,
+                                            the second represents control units, and
+                                            the third represents outcome variables.
+                                            (Shape: periods x units x outcomes)
+
+Returns:
+    np.ndarray: A 1D array of the optimal weights for the control units.
+"""
+def fast_synthetic_control_fitting(treated_pre_intervention, control_pre_intervention):
+    num_control_units = control_pre_intervention.shape[1]
+    num_outcomes = treated_pre_intervention.shape[1]
+
+    # --- Data Standardization Step ---
+    # Create copies to avoid modifying the original data
+    standardized_treated = np.copy(treated_pre_intervention).astype(float)
+    standardized_control = np.copy(control_pre_intervention).astype(float)
+
+    for i in range(num_outcomes):
+        # Extract all data for the current outcome
+        all_outcome_data = np.concatenate(
+            [treated_pre_intervention[:, i], control_pre_intervention[:, :, i].flatten()]
+        )
+
+        # Calculate mean and standard deviation for the current outcome
+        mean = np.mean(all_outcome_data)
+        std = np.std(all_outcome_data)
+
+        # Standardize, avoiding division by zero
+        if std > 0:
+            standardized_treated[:, i] = (standardized_treated[:, i] - mean) / std
+            standardized_control[:, :, i] = (standardized_control[:, :, i] - mean) / std
+
+    # --- Optimization using Standardized Data ---
+    def objective_function(weights):
+        """
+        The objective function to minimize using standardized data.
+
+        Calculates the synthetic control for all outcomes and returns the total
+        sum of squared errors.
+        """
+        # Sum over the 'units' axis (1) of the control data and the 'weights' axis (0)
+        synthetic_control = np.tensordot(standardized_control, weights, axes=([1], [0]))
+
+        # Return the sum of squared errors across all periods and outcomes
+        return np.sum((standardized_treated - synthetic_control)**2)
+
+    # Constraints: weights must sum to 1.
+    constraints = ({'type': 'eq', 'fun': lambda w: np.sum(w) - 1.0})
+
+    # Bounds: weights must be between 0 and 1.
+    bounds = tuple((0, 1) for _ in range(num_control_units))
+
+    # Initial guess for the weights (equal weighting).
+    initial_weights = np.ones(num_control_units) / num_control_units
+
+    # Solve the optimization problem.
+    result = minimize(objective_function, initial_weights, method='SLSQP', bounds=bounds, constraints=constraints)
+
+    return result.x
+
+"""
+Calculates a single "Impact Score" to identify models with no effect.
 The score combines the p-value with a penalty for how far the
 observed ratio deviates from the ideal of 1.0.
 
@@ -64,9 +139,9 @@ could have occurred by chance if the underlying process had not changed.
 
 Args:
     data_pre (pd.DataFrame): DataFrame with pre-intervention data.
-                                Must contain 'variable', 'timeid', and 'value' columns.
+                                Must contain 'outcome', 'timeid', and 'value' columns.
     data_post (pd.DataFrame): DataFrame with post-intervention data.
-                                Must contain 'variable', 'timeid', and 'value' columns.
+                                Must contain 'outcome', 'timeid', and 'value' columns.
     n_bootstraps (int): The number of bootstrap samples to generate.
     alpha (float): A tuning parameter controlling the severity of the
                                 penalty for ratios not equal to 1. Higher alpha
@@ -82,11 +157,11 @@ def block_bootstrap_rmspe_ratio_vectorized(data_pre, data_post, n_bootstraps=100
     """
     all_observed_ratio = []
     all_p_values = []
-    unique_outcomes = data_pre['variable'].unique()
+    unique_outcomes = data_pre['outcome'].unique()
 
     for outcome in unique_outcomes:
-        pre_values = data_pre[data_pre['variable'] == outcome]['value'].to_numpy()
-        post_values = data_post[data_post['variable'] == outcome]['value'].to_numpy()
+        pre_values = data_pre[data_pre['outcome'] == outcome]['value'].to_numpy()
+        post_values = data_post[data_post['outcome'] == outcome]['value'].to_numpy()
 
         if len(pre_values) == 0: continue
         
@@ -166,13 +241,13 @@ Parameters
 all_units : pd.DataFrame
     A DataFrame in long format containing all unit-time observations.
 yname : str
-    The name of the column that contains the names of the outcome variables and covariates.
+    The name of the column that contains the names of the outcome variables.
 unitname : str
     The name of the column that contains the unique identifiers for each unit.
 tname : str
     The name of the column that contains the time period identifiers (e.g., year).
 value : str
-    The name of the column that contains the numerical values for the outcomes/covariates.
+    The name of the column that contains the numerical values for the outcomes.
 treatment : str
     The name of the column that indicates treatment status (1 for treated, 0 for control).
 pre_intervention : str
@@ -182,9 +257,6 @@ temporal_cross_search : list of str
     cross-temporal validation. Each period marks the end of a training set.
 workspace_folder : str
     The path to a directory where output files (candidate donors and performance) will be saved.
-tname_covariate : str, optional
-    A special value in the `tname` column used to identify rows that are time-invariant covariates.
-    Defaults to None.
 seed : int, optional
     Random seed for reproducibility of the optimization process. Defaults to 111.
 maximum_num_units_on_support_first_filter : int, optional
@@ -193,32 +265,19 @@ maximum_num_units_on_support_first_filter : int, optional
 maximum_error_pre_intervention : float, optional
     The maximum acceptable error (e.g., RMSE or MAE) on the pre-treatment outcomes for a
     candidate donor pool to be saved. Defaults to 0.15.
-maximum_error_covariates : float, optional
-    The maximum acceptable error on the covariates for a candidate donor pool to be saved.
-    Defaults to 0.15.
 proportion_pre_intervention_period_outcomes_donor : int, optional
     Used to calculate the upper limit for the donor pool size. The limit is determined by
     (num_pre_intervention_periods * num_outcomes) / this_value. Defaults to 10.
 inferior_limit_maximum_donor_pool_size : int, optional
     The minimum number of donors to be selected in any candidate pool. Defaults to 1.
-on_support_first_filter : {'max_weight', 'maximum_num_units_on_support_first_filter', 'bigger_than_min_weight'}, optional
-    The primary strategy for identifying the initial set of "on-support" donors from the
-    IPW-ranked list. Defaults to 'max_weight'.
-on_support_second_filter : {'randomN', 'all'}, optional
-    The secondary strategy to prune the on-support set down to the final donor pool size.
-    'randomN' randomly samples N units, while 'all' takes the top N deterministically.
-    Defaults to 'randomN'.
-include_error_post_intervention_in_optuna_objective : bool, optional
-    Flag to include or not the post-intervention error in the Optuna's search criteria. Defaults to False.
+include_impact_score_in_optuna_objective : bool, optional
+    Flag to include or not the impact score in the Optuna's search criteria. Defaults to False.
 number_optuna_trials : int, optional
     The number of hyperparameter optimization trials to run for each cross-temporal fold.
     Defaults to 300.
 timeout_optuna_cycle : int, optional
     The maximum time in seconds for a single Optuna optimization cycle (one cross-temporal fold).
     Defaults to 900.
-time_serie_covariate_metric : {'rmse', 'mae'}, optional
-    The metric used to evaluate the fit on time-series outcomes and covariates.
-    Defaults to 'rmse'.
 """
 def search(
     all_units,
@@ -230,19 +289,14 @@ def search(
     pre_intervention,
     temporal_cross_search,
     workspace_folder,
-    tname_covariate = None,
     seed = 111,
     maximum_num_units_on_support_first_filter = 50,
     maximum_error_pre_intervention = 0.15,
-    maximum_error_covariates = 0.15,
     proportion_pre_intervention_period_outcomes_donor = 10,
     inferior_limit_maximum_donor_pool_size = 1,
-    on_support_first_filter = 'max_weight',
-    on_support_second_filter = 'randomN',
-    include_error_post_intervention_in_optuna_objective = False,
-    number_optuna_trials = 300,
-    timeout_optuna_cycle = 900,
-    time_serie_covariate_metric = 'rmse'
+    include_impact_score_in_optuna_objective = False,
+    number_optuna_trials = 1000,
+    timeout_optuna_cycle = 900
 ):
     # RENAME AND INFORM ERRORS
     if tname in all_units.columns:
@@ -258,9 +312,9 @@ def search(
         print(f"The '{unitname}' column does not exist in the dataframe.")
         import sys
         sys.exit()
-    
+
     if yname in all_units.columns:
-        all_units.rename(columns={yname: 'variable'}, inplace=True)
+        all_units.rename(columns={yname: 'outcome'}, inplace=True)
     else:
         print(f"The '{yname}' column does not exist in the dataframe.")
         import sys
@@ -272,14 +326,14 @@ def search(
         print(f"The '{value}' column does not exist in the dataframe.")
         import sys
         sys.exit()
-    
+
     if treatment in all_units.columns:
         all_units.rename(columns={treatment: 'treatment'}, inplace=True)
     else:
         print(f"The '{treatment}' column does not exist in the dataframe.")
         import sys
         sys.exit()
-    
+
     if pre_intervention in all_units.columns:
         all_units.rename(columns={pre_intervention: 'pre_intervention'}, inplace=True)
     else:
@@ -295,10 +349,6 @@ def search(
         print(f"pre_intervention: {sorted(all_units[all_units['pre_intervention'] == 1]['timeid'].unique().tolist())}")
         import sys
         sys.exit()
-
-    min_timeid_pre_intervention = all_units[(all_units['pre_intervention'] == 1) & (all_units['timeid'] != tname_covariate)]['timeid'].min()
-    max_timeid_pre_intervention = all_units[(all_units['pre_intervention'] == 0) & (all_units['timeid'] != tname_covariate)]['timeid'].max()
-    all_units = all_units[((all_units['timeid'] >= min_timeid_pre_intervention) & (all_units['timeid'] <= max_timeid_pre_intervention)) | (all_units['timeid'] == tname_covariate)]
 
     # CHECH DIRECTORY EXISTS AND CREATE IT IF NOT
     import os
@@ -324,74 +374,41 @@ def search(
         print("Error: Could not find the source file or the 'propensitygbdt.data' package.")
         print("Please ensure the package is correctly installed.")
 
-    # CHECK tname_covariate COULUMN AGAINST all_units['timeid']
-    # WHEN tname_covariate IS NOT NONE, MUST BE A VALUE FROM all_units['timeid']
-    if tname_covariate is not None and tname_covariate not in all_units['timeid'].unique().tolist():
-        print(f"ERROR: tname_covariate '{tname_covariate}' MUST BE A VALUE FROM all_units['timeid']")
-        print(f"all_units['timeid']: {sorted(all_units['timeid'].unique().tolist())}")
-        import sys
-        sys.exit()
+    all_units = all_units[['timeid', 'pre_intervention', 'unitid', 'treatment', 'outcome', 'value']]
 
-    # CHECK IF THE on_support_first_filter HAS ONLY THE VALUES: 'max_weight', 'maximum_num_units_on_support_first_filter' AND/OR 'bigger_than_min_weight'
-    if on_support_first_filter not in ['max_weight', 'maximum_num_units_on_support_first_filter', 'bigger_than_min_weight']:
-        print("ERROR: on_support_first_filter MUST HAVE ONLY THE VALUES: 'max_weight', 'maximum_num_units_on_support_first_filter' AND/OR 'bigger_than_min_weight'")
-        print(f"on_support_first_filter: {on_support_first_filter}")
-        import sys
-        sys.exit()
-
-    # CHECK IF THE on_support_second_filter HAS ONLY THE VALUES: 'randomN' AND/OR 'bigger_than_min_weight'
-    if on_support_second_filter not in ['randomN', 'all']:
-        print("ERROR: on_support_second_filter MUST HAVE ONLY THE VALUES: 'randomN' AND/OR 'all'")
-        print(f"on_support_second_filter: {on_support_second_filter}")
-        import sys
-        sys.exit()
-
-    # CHECK IF THE on_support_second_filter HAS ONLY THE VALUES: 'randomN' AND/OR 'bigger_than_min_weight'
-    if on_support_second_filter not in ['randomN', 'all']:
-        print("ERROR: on_support_second_filter MUST HAVE ONLY THE VALUES: 'randomN' AND/OR 'all'")
-        print(f"on_support_second_filter: {on_support_second_filter}")
-        import sys
-        sys.exit()
-
-    all_units = all_units[['timeid', 'pre_intervention', 'unitid', 'treatment', 'variable', 'value']]
-
-    # MAKE THE PANEL DATA BALANCED BY REMOVING ALL UNITS WHICH HAVE NOT THE SAME NUMBER OF timeids PER variable EQUAL TO THEN TREATMENT UNIT
+    # MAKE THE PANEL DATA BALANCED BY REMOVING ALL UNITS WHICH HAVE NOT THE SAME NUMBER OF timeids PER outcome EQUAL TO THEN TREATMENT UNIT
     print(all_units.shape)
     all_units = all_units[all_units['value'].notna()]
-    dt1 = all_units[['unitid', 'treatment', 'timeid', 'variable']].copy()
+    dt1 = all_units[['unitid', 'treatment', 'timeid', 'outcome']].copy()
 
-    treatment_indicators = dt1[dt1['treatment'] == 1]['variable'].unique()
-    dt2 = dt1[dt1['variable'].isin(treatment_indicators)][['unitid', 'treatment', 'timeid', 'variable']]
-    dt2 = dt2.groupby(['unitid', 'treatment', 'timeid']).agg({'variable': 'count'}).sort_values('variable').reset_index()
-    dt2 = dt2[dt2['variable'] == len(treatment_indicators)][['unitid', 'treatment', 'timeid']]
+    treatment_indicators = dt1[dt1['treatment'] == 1]['outcome'].unique()
+    dt2 = dt1[dt1['outcome'].isin(treatment_indicators)][['unitid', 'treatment', 'timeid', 'outcome']]
+    dt2 = dt2.groupby(['unitid', 'treatment', 'timeid']).agg({'outcome': 'count'}).sort_values('outcome').reset_index()
+    dt2 = dt2[dt2['outcome'] == len(treatment_indicators)][['unitid', 'treatment', 'timeid']]
 
-    treatment_quarter_ids = dt2[dt2['treatment'] == 1]['timeid'].unique()
-    dt3 = dt2[dt2['timeid'].isin(treatment_quarter_ids)][['unitid', 'treatment', 'timeid']]
+    treatment_timeids = dt2[dt2['treatment'] == 1]['timeid'].unique()
+    dt3 = dt2[dt2['timeid'].isin(treatment_timeids)][['unitid', 'treatment', 'timeid']]
     dt3 = dt3.groupby(['unitid', 'treatment']).agg({'timeid': 'count'}).sort_values('timeid').reset_index()
-    valid_units = dt3[dt3['timeid'] == len(treatment_quarter_ids)]['unitid'].unique()
+    valid_units = dt3[dt3['timeid'] == len(treatment_timeids)]['unitid'].unique()
     invalid_units = all_units[~all_units['unitid'].isin(valid_units)]['unitid'].unique()
     print(f"Number of dropped invalid unitids: {len(invalid_units)}")
     print("Invalid units: ", invalid_units)
     all_units = all_units[all_units['unitid'].isin(valid_units)]
     print(all_units.shape)
 
-    print(all_units.groupby(['timeid', 'variable']).size().unstack(fill_value=0))
+    print(all_units.groupby(['timeid', 'outcome']).size().unstack(fill_value=0))
     print(all_units.head())
     print(all_units.info())
 
     treatment_unitid = all_units[all_units['treatment'] == 1]['unitid'].iloc[0]
-    outcomes = all_units[all_units['timeid'] != tname_covariate]['variable'].sort_values().unique().tolist()
-    covariates = all_units[all_units['timeid'] == tname_covariate]['variable'].sort_values().unique().tolist()
+    outcomes = all_units['outcome'].sort_values().unique().tolist()
     # timeids = all_units['timeid'].sort_values().unique().tolist()
-    timeid_pre_intervention = all_units[(all_units['pre_intervention'] == 1) & (all_units['timeid'] != tname_covariate)]['timeid'].sort_values().unique().tolist()
-    num_pre_intervention_periods_per_outcome = all_units[(all_units['pre_intervention'] == 1) & (all_units['timeid'] != tname_covariate)].groupby('variable').agg({'timeid': 'nunique' }).reset_index()
-    # timeid_post_intervention = all_units[all_units['pre_intervention'] == 0]['timeid'].sort_values().unique().tolist()
+    timeid_pre_intervention = all_units[all_units['pre_intervention'] == 1]['timeid'].sort_values().unique().tolist()
+    num_pre_intervention_periods_per_outcome = all_units[all_units['pre_intervention'] == 1].groupby('outcome').agg({'timeid': 'nunique' }).reset_index()
+    timeid_post_intervention = all_units[all_units['pre_intervention'] == 0]['timeid'].sort_values().unique().tolist()
 
-    hyperparameter_search_extra_criteria = []
-    if len(covariates) > 0:
-        hyperparameter_search_extra_criteria.append('covariate')
-        
-    if include_error_post_intervention_in_optuna_objective:
+    hyperparameter_search_extra_criteria = []  
+    if include_impact_score_in_optuna_objective:
         hyperparameter_search_extra_criteria.append('post_intervention_period')
 
     import os
@@ -415,12 +432,10 @@ def search(
     if superior_limit_maximum_donor_pool_size < 2:
         superior_limit_maximum_donor_pool_size = 2
 
-    timeid_post_intervention = all_units[all_units['pre_intervention'] == 0]['timeid'].sort_values().unique().tolist()
-
-    all_units.sort_values(by=['unitid', 'timeid', 'variable'], inplace=True)
+    all_units.sort_values(by=['unitid', 'timeid', 'outcome'], inplace=True)
     all_units['weight'] = 1.0
 
-    amplitude = all_units[(all_units['treatment'] == 1) & (all_units['pre_intervention'] == 1) & (all_units['timeid'] != tname_covariate)].groupby(['variable']).apply(
+    amplitude = all_units[(all_units['treatment'] == 1) & all_units['pre_intervention'] == 1].groupby(['outcome']).apply(
         lambda x : pd.Series({
             'amplitude': 1 if x['value'].max() == x['value'].min() else x['value'].max() - x['value'].min()
         })
@@ -437,32 +452,30 @@ def search(
         Instead of having to learn weights that adjust for shape, level and scale, the model can focus
         solely on identifying control units with similar temporal shape to the treatment unit.
         """
-        # data = data.copy()
         data = data[data['weight'].notna()]
         # Generate the times series created by the weighted average of the units in the dataframe in the defined period 
-        aggregated = data.groupby(['variable', 'timeid', 'treatment'], dropna=False).apply(
+        aggregated = data.groupby(['outcome', 'timeid', 'treatment'], dropna=False).apply(
             lambda x : pd.Series({
                 'value' : np.ma.filled(np.ma.average(np.ma.masked_invalid(x['value']), weights=x['weight']), fill_value=np.nan)
             })
         ).reset_index()
 
         # Calculate the average and standard deviation of the time series in the given period
-        standardization = aggregated[aggregated['timeid'].isin(period)].groupby(['variable', 'treatment'], dropna=False).agg(
+        standardization = aggregated[aggregated['timeid'].isin(period)].groupby(['outcome', 'treatment'], dropna=False).agg(
             avg = ('value', lambda x: np.mean(x)),
             std = ('value', lambda x: np.std(x, ddof=1))
         ).reset_index()
         standardization['std'] = np.where(standardization['std'].isna(), 1.0, standardization['std'])
 
-        # Standardize the control times series created by the weighted average of the control unit in the dataframe in the defined period,
-        # ignoring the values related to the covariates which are timeless
-        data = pd.merge(data, standardization, on=['variable', 'treatment'], how='left')
-        data['value'] = np.where((data['treatment'] == 0) & (~data['timeid'].isin([tname_covariate])), (data['value'] - data['avg']) / data['std'], data['value'])
+        # Standardize the control times series created by the weighted average of the control unit in the dataframe in the defined period
+        data = pd.merge(data, standardization, on=['outcome', 'treatment'], how='left')
+        data['value'] = np.where(data['treatment'] == 0, (data['value'] - data['avg']) / data['std'], data['value'])
         data.drop(['avg', 'std'], axis=1, inplace=True)
 
         # Apply the treatment's time series mean and standard deviation to the standardized control units.
         # Positioning them in level and amplitude guaranteeing the only difference between them is the time series' shape.
-        data = pd.merge(data, standardization[standardization['treatment'] == 1][['variable', 'avg', 'std']], on=['variable'], how='left')
-        data['value'] = np.where((data['treatment'] == 0) & (~data['timeid'].isin([tname_covariate])), (data['value'] * data['std']) + data['avg'], data['value'])
+        data = pd.merge(data, standardization[standardization['treatment'] == 1][['outcome', 'avg', 'std']], on=['outcome'], how='left')
+        data['value'] = np.where(data['treatment'] == 0, (data['value'] * data['std']) + data['avg'], data['value'])
         data.drop(['avg', 'std'], axis=1, inplace=True)
 
         return data
@@ -471,31 +484,31 @@ def search(
     treatment.loc[:, 'unitid'] = treatment_unitid
 
     # Initialize CSV files for storing performance results and the donor candidates data with headers.
-    scm_donor_selection_candidate_units_data = treatment[['variable', 'timeid', 'value', 'treatment', 'weight', 'unitid']].copy()
+    scm_donor_selection_candidate_units_data = treatment[['outcome', 'timeid', 'value', 'treatment', 'weight', 'unitid']].copy()
     scm_donor_selection_candidate_units_data['valor_m_weight'] = scm_donor_selection_candidate_units_data['value'] * scm_donor_selection_candidate_units_data['weight']
     scm_donor_selection_candidate_units_data['id'] = None
     scm_donor_selection_candidate_units_data['cycle'] = None
     scm_donor_selection_candidate_units_data['trial'] = None
+    scm_donor_selection_candidate_units_data['solution_id'] = None
     scm_donor_selection_candidate_units_data['error_train'] = None
     scm_donor_selection_candidate_units_data['error_valid'] = None
     scm_donor_selection_candidate_units_data['error_pre_intervention'] = None
     scm_donor_selection_candidate_units_data['error_post_intervention'] = None
-    scm_donor_selection_candidate_units_data['error_covariates'] = None
     scm_donor_selection_candidate_units_data['impact_score'] = None    
     scm_donor_selection_candidate_units_data['num_units_bigger_min_weight'] = None
     scm_donor_selection_candidate_units_data['num_units_max_weight'] = None
     scm_donor_selection_candidate_units_data.to_csv(scm_donor_selection_candidate_units_data_file_path, mode='w', header=True, index=False)
 
     # Initialize CSV files for storing performance results with headers.
-    scm_donor_selection_candidate_performance = treatment[['variable', 'timeid', 'treatment', 'value']].copy()
+    scm_donor_selection_candidate_performance = treatment[['outcome', 'timeid', 'treatment', 'value']].copy()
     scm_donor_selection_candidate_performance['qtty'] = 1
     scm_donor_selection_candidate_performance['cycle'] = None
     scm_donor_selection_candidate_performance['trial'] = None
+    scm_donor_selection_candidate_performance['solution_id'] = None
     scm_donor_selection_candidate_performance['error_train'] = None
     scm_donor_selection_candidate_performance['error_valid'] = None
     scm_donor_selection_candidate_performance['error_pre_intervention'] = None
     scm_donor_selection_candidate_performance['error_post_intervention'] = None
-    scm_donor_selection_candidate_performance['error_covariates'] = None
     scm_donor_selection_candidate_performance['impact_score'] = None    
     scm_donor_selection_candidate_performance['num_units_bigger_min_weight'] = None
     scm_donor_selection_candidate_performance['num_units_max_weight'] = None
@@ -514,9 +527,9 @@ def search(
 
             # The article explains that the data is transposed so that units are rows and time periods are features.
             # This is the ideal format for machine learning models like XGBoost.
-            dataset_train = data[data['timeid'].isin(timeid_train + [tname_covariate])].pivot(
+            dataset_train = data[data['timeid'].isin(timeid_train)].pivot(
                 index=['unitid', 'treatment', 'weight'],
-                columns=['variable', 'timeid'],
+                columns=['outcome', 'timeid'],
                 values='value'
             )
             dataset_train.shape
@@ -533,60 +546,48 @@ def search(
             self.full_data.drop('weight', axis=1, inplace=True)
             self.full_data2 = data.copy()
 
-        def evaluate_outcomes_metric(self, metric, weights):
+        def evaluate_outcomes_metric(self, data):
             """
             Evaluates the performance of the synthetic control based on the provided weights.
             The article describes this as evaluating "Causal Fitness", which includes pre-intervention
-            outcome balance, covariate balance, and post-intervention "null" balance.
+            outcome balance, and post-intervention "null" balance.
             """
-            full_data = self.full_data.copy()
-            depara = pd.merge(weights, self.from_to, on='id', how='inner')
-            full_data_depara = pd.merge(full_data, depara, on='unitid', how='left').reset_index()
-            data = pre_intervention_scaling(data=full_data_depara, period=self.timeid_train + self.timeid_valid + [tname_covariate])
-            aggregated3 = data.groupby(['variable', 'timeid', 'treatment'], dropna=False).apply(
+            data = pre_intervention_scaling(data=data, period=self.timeid_train + self.timeid_valid)
+            aggregated3 = data.groupby(['outcome', 'timeid', 'treatment'], dropna=False).apply(
                 lambda x : pd.Series({
                     'value' : np.ma.filled(np.ma.average(np.ma.masked_invalid(x['value']), weights=x['weight']), fill_value=np.nan)
                 })
             ).reset_index()
 
             # Calculate error on the training set.
-            aggregated3_diff = aggregated3[aggregated3['timeid'].isin(self.timeid_train)].sort_values(['variable', 'timeid', 'treatment'], ascending=True).groupby(['variable', 'timeid']).agg({
+            aggregated3_diff = aggregated3[aggregated3['timeid'].isin(self.timeid_train)].sort_values(['outcome', 'timeid', 'treatment'], ascending=True).groupby(['outcome', 'timeid']).agg({
                 'value' : lambda x: x.iloc[0] - x.iloc[1]
-            }).reset_index(level=['variable', 'timeid'])
+            }).reset_index(level=['outcome', 'timeid'])
             
-            aggregated3_diff_normalized = pd.merge(aggregated3_diff, amplitude, on='variable', how='left')
+            aggregated3_diff_normalized = pd.merge(aggregated3_diff, amplitude, on='outcome', how='left')
             aggregated3_diff_normalized['value'] = aggregated3_diff_normalized['value'] / aggregated3_diff_normalized['amplitude']
 
-            if metric == 'mae':
-                error_train = aggregated3_diff_normalized['value'].abs().mean()
-            elif metric == 'rmse':
-                error_train = ((aggregated3_diff_normalized['value'] ** 2).mean()) ** 0.5
+            error_train = ((aggregated3_diff_normalized['value'] ** 2).mean()) ** 0.5
 
             # Calculate error on the validation set. This is crucial for early stopping and preventing overfitting.
-            aggregated3_diff = aggregated3[aggregated3['timeid'].isin(self.timeid_valid)].sort_values(['variable', 'timeid', 'treatment'], ascending=True).groupby(['variable', 'timeid']).agg({
+            aggregated3_diff = aggregated3[aggregated3['timeid'].isin(self.timeid_valid)].sort_values(['outcome', 'timeid', 'treatment'], ascending=True).groupby(['outcome', 'timeid']).agg({
                 'value' : lambda x: x.iloc[0] - x.iloc[1]
-            }).reset_index(level=['variable', 'timeid'])
+            }).reset_index(level=['outcome', 'timeid'])
 
-            aggregated3_diff_normalized = pd.merge(aggregated3_diff, amplitude, on='variable', how='left')
+            aggregated3_diff_normalized = pd.merge(aggregated3_diff, amplitude, on='outcome', how='left')
             aggregated3_diff_normalized['value'] = aggregated3_diff_normalized['value'] / aggregated3_diff_normalized['amplitude']
 
-            if metric == 'mae':
-                error_valid = aggregated3_diff_normalized['value'].abs().mean()
-            elif metric == 'rmse':
-                error_valid = ((aggregated3_diff_normalized['value'] ** 2).mean()) ** 0.5
+            error_valid = ((aggregated3_diff_normalized['value'] ** 2).mean()) ** 0.5
 
             # Calculate error for the entire pre-treatment period.
-            aggregated3_diff = aggregated3[aggregated3['timeid'].isin(self.timeid_train + self.timeid_valid)].sort_values(['variable', 'timeid', 'treatment'], ascending=True).groupby(['variable', 'timeid']).agg({
+            aggregated3_diff = aggregated3[aggregated3['timeid'].isin(self.timeid_train + self.timeid_valid)].sort_values(['outcome', 'timeid', 'treatment'], ascending=True).groupby(['outcome', 'timeid']).agg({
                 'value' : lambda x: x.iloc[0] - x.iloc[1]
-            }).reset_index(level=['variable', 'timeid'])
+            }).reset_index(level=['outcome', 'timeid'])
 
-            aggregated3_diff_normalized_pre = pd.merge(aggregated3_diff, amplitude, on='variable', how='left')
+            aggregated3_diff_normalized_pre = pd.merge(aggregated3_diff, amplitude, on='outcome', how='left')
             aggregated3_diff_normalized_pre['value'] = aggregated3_diff_normalized_pre['value'] / aggregated3_diff_normalized_pre['amplitude']
 
-            if metric == 'mae':
-                error_pre_intervention = aggregated3_diff_normalized_pre['value'].abs().mean()
-            elif metric == 'rmse':
-                error_pre_intervention = ((aggregated3_diff_normalized_pre['value'] ** 2).mean()) ** 0.5
+            error_pre_intervention = ((aggregated3_diff_normalized_pre['value'] ** 2).mean()) ** 0.5
 
             # Calculate error for the entire post-treatment period.
             # --- Diagnostic tool, not a core component, and it is disabled by default ---
@@ -598,46 +599,34 @@ def search(
             # * If both runs find good fits but disagree -> Bias is likely. Trust Run A.
             # * If Run A fails but Run B succeeds -> Run B's result is suspect. Rerun Run A with more Optuna trials.
             # * If both runs fail -> This indicates a more fundamental problem, such as no suitable donors in the pool
-            # or an insufficient Optuna trials, reduce the number of selected outcomes and covariates and rerun.
-            aggregated3_diff = aggregated3[aggregated3['timeid'].isin(self.timeid_post_intervention)].sort_values(['variable', 'timeid', 'treatment'], ascending=True).groupby(['variable', 'timeid']).agg({
+            # or an insufficient Optuna trials, reduce the number of selected outcomes and rerun.
+            aggregated3_diff = aggregated3[aggregated3['timeid'].isin(self.timeid_post_intervention)].sort_values(['outcome', 'timeid', 'treatment'], ascending=True).groupby(['outcome', 'timeid']).agg({
                 'value' : lambda x: x.iloc[0] - x.iloc[1]
-            }).reset_index(level=['variable', 'timeid'])
+            }).reset_index(level=['outcome', 'timeid'])
 
-            aggregated3_diff_normalized_post = pd.merge(aggregated3_diff, amplitude, on='variable', how='left')
+            aggregated3_diff_normalized_post = pd.merge(aggregated3_diff, amplitude, on='outcome', how='left')
             aggregated3_diff_normalized_post['value'] = aggregated3_diff_normalized_post['value'] / aggregated3_diff_normalized_post['amplitude']
 
-            if metric == 'mae':
-                error_post_intervention = aggregated3_diff_normalized_post['value'].abs().mean()
-            elif metric == 'rmse':
-                error_post_intervention = ((aggregated3_diff_normalized_post['value'] ** 2).mean()) ** 0.5
+            error_post_intervention = ((aggregated3_diff_normalized_post['value'] ** 2).mean()) ** 0.5
 
             if error_pre_intervention < maximum_error_pre_intervention:
                 np.random.seed(attempt + seed) 
                 impact_score = block_bootstrap_rmspe_ratio_vectorized(
-                    aggregated3_diff_normalized_pre[aggregated3_diff_normalized_pre['timeid'] != tname_covariate],
-                    aggregated3_diff_normalized_post[aggregated3_diff_normalized_post['timeid'] != tname_covariate],
+                    aggregated3_diff_normalized_pre,
+                    aggregated3_diff_normalized_post,
                     n_bootstraps=1000
                 )
             else:
-                impact_score = -float('inf')
+                impact_score = float('inf')
 
-            # Evaluate covariate balance.
-            aggregated3_diff = aggregated3[aggregated3['timeid'].isin([tname_covariate])].sort_values(['variable', 'timeid', 'treatment'], ascending=True).groupby(['variable', 'timeid']).agg({
-                'value' : lambda x: x.iloc[0] - x.iloc[1]
-            }).reset_index(level=['variable', 'timeid'])
+            return error_train, error_valid, error_pre_intervention, error_post_intervention, impact_score
 
-            if metric == 'mae':
-                error_covariates = aggregated3_diff['value'].abs().mean()
-            elif metric == 'rmse':
-                error_covariates = ((aggregated3_diff['value'] ** 2).mean()) ** 0.5
-
-            return error_train, error_valid, error_pre_intervention, error_post_intervention, error_covariates, impact_score
-
-        def eval_metric_ipw(self, preds, metric):
+        def eval_metric_ipw(self, preds):
             """
             This function implements the ATT/IPW-based ranking.
             It converts the XGBoost predictions (propensity scores) into weights and then selects N donors.
             """
+            global attempt, solution_id, estimated_solutions
             # Calculate Inverse Probability Weights (IPW). The formula ps / (1 - ps) is used to rank control units.
             ipw = pd.DataFrame({
                 'id': self.dataset_train['id'],
@@ -660,112 +649,138 @@ def search(
             max_weight_observations = ipw[(ipw['treatment'] == 0) & (ipw['weight'] == max_weight)]
             num_units_max_weight = max_weight_observations.shape[0]
 
-            maximum_donor_pool_size = pruning_trial.params['maximum_donor_pool_size']
+            maximum_donor_pool_size = possible_donor_pool_size[attempt % possible_donor_pool_size_num_items]
 
-            # ===================================================================================
-            # FINAL DONOR POOL PRUNING
-            #
-            # The following block implements various strategies for the final, crucial step of
-            # pruning the ranked list of all potential donors into a small, final donor pool.
-            # The specific strategy is controlled by the `on_support_first_filter` and
-            # `on_support_second_filter` configuration variables.
-            # ===================================================================================
-
-            # --- STRATEGY 1: From max-weighted units, randomly sample N. ---
-            if on_support_first_filter == 'max_weight' and on_support_second_filter == 'randomN':
-                # PENALTY: To encourage donor diversity, heavily penalize solutions where an
-                # excessive number of units share the same maximum weight. This prevents the model
-                # from converging on trivial solutions where many donors are equally "best".
-                if num_units_max_weight > maximum_num_units_on_support_first_filter:
-                    error_train = float('inf')
-                    error_valid = float('inf')
-                    error_pre_intervention = float('inf')
-                    error_post_intervention = float('inf')
-                    error_covariates = float('inf')
-                    impact_score = -float('inf')
-                    return error_train, error_valid, error_pre_intervention, error_post_intervention, error_covariates, impact_score, ipw, num_units_bigger_min_weight, num_units_max_weight
-                
-                # If the number of units sharing the max weight is larger than the desired pool size,
-                # randomly sample from this top tier to select the final donors.
-                if max_weight_observations.shape[0] > maximum_donor_pool_size:
-                    ipw = pd.concat([ipw[ipw['treatment'] != 0], max_weight_observations.sort_values(['id'], ascending=[True]).sample(n=maximum_donor_pool_size, random_state=attempt + seed)], ignore_index=True)
-                # Otherwise, if the pool of max-weighted units is smaller than the desired size,
-                # take all of them deterministically.
-                else:
-                    temp = min(maximum_donor_pool_size, num_units_max_weight)
-                    ipw = pd.concat([ipw[ipw['treatment'] != 0], ipw[ipw['treatment'] == 0].sort_values(['weight', 'id'], ascending=[False, True])[0:temp]], ignore_index=True)
-
-            # --- STRATEGY 2: From max-weighted units, take all (top N deterministically). ---
-            elif on_support_first_filter == 'max_weight' and on_support_second_filter == 'all':
-                # This is a deterministic version of the above. It selects the top N units from the
-                # max-weighted pool, sorted by weight and unit ID to ensure reproducibility.
-                temp = min(maximum_donor_pool_size, num_units_max_weight)
-                ipw = pd.concat([ipw[ipw['treatment'] != 0], ipw[ipw['treatment'] == 0].sort_values(['weight', 'id'], ascending=[False, True])[0:temp]], ignore_index=True)
-
-            # --- STRATEGY 3: From all ranked units, randomly sample N. ---
-            elif on_support_first_filter == 'maximum_num_units_on_support_first_filter' and on_support_second_filter == 'randomN':
-                # This strategy ignores tiers and simply performs a random sample of N donors
-                # from the entire ranked list of potential controls.
-                ipw = pd.concat([ipw[ipw['treatment'] != 0], ipw.sort_values(['id'], ascending=[True]).sample(n=maximum_donor_pool_size, random_state=attempt + seed)], ignore_index=True)
-
-            # --- STRATEGY 4: From all ranked units, take all (top N deterministically). ---
-            elif on_support_first_filter == 'maximum_num_units_on_support_first_filter'and on_support_second_filter == 'all':
-                # This is the most straightforward strategy: deterministically select the top N
-                # highest-weighted donors from the entire control group.
-                ipw = pd.concat([ipw[ipw['treatment'] != 0], ipw[ipw['treatment'] == 0].sort_values(['weight', 'id'], ascending=[False, True])[0:maximum_num_units_on_support_first_filter]], ignore_index=True)
-
-            # --- STRATEGY 5: From units with non-minimal weight, randomly sample N. ---
-            elif on_support_first_filter == 'bigger_than_min_weight' and on_support_second_filter == 'randomN':
-                # PENALTY: Similar to the max-weight penalty, this discourages solutions where
-                # nearly all units are considered "on support" (i.e., not the absolute minimum weight).
-                if num_units_bigger_min_weight > maximum_num_units_on_support_first_filter:
-                    error_train = float('inf')
-                    error_valid = float('inf')
-                    error_pre_intervention = float('inf')
-                    error_post_intervention = float('inf')
-                    error_covariates = float('inf')
-                    impact_score = -float('inf')
-                    return error_train, error_valid, error_pre_intervention, error_post_intervention, error_covariates, impact_score, ipw, num_units_bigger_min_weight, num_units_max_weight
-
-                # If the number of on-support units exceeds the desired pool size,
-                # randomly sample from them.
-                if min_weight_observations.shape[0] > maximum_donor_pool_size:
-                    ipw = pd.concat([ipw[ipw['treatment'] != 0], min_weight_observations.sort_values(['id'], ascending=[True]).sample(n=maximum_donor_pool_size, random_state=attempt + seed)], ignore_index=True)
-                # Otherwise, take all on-support units deterministically.
-                else:
-                    temp = min(maximum_donor_pool_size, num_units_bigger_min_weight)
-                    ipw = pd.concat([ipw[ipw['treatment'] != 0], ipw[ipw['treatment'] == 0].sort_values(['weight', 'id'], ascending=[False, True])[0:temp]], ignore_index=True)
-
-            # --- STRATEGY 6: From units with non-minimal weight, take all. ---
-            elif on_support_first_filter == 'bigger_than_min_weight' and on_support_second_filter == 'all':
-                # This strategy intends to deterministically select all units that are not
-                # assigned the absolute minimum weight.
-                ipw = pd.concat([ipw[ipw['treatment'] != 0], ipw[ipw['treatment'] == 0].sort_values(['weight', 'id'], ascending=[False, True])[0:num_units_bigger_min_weight]], ignore_index=True)
-            # --- WRONG OPTION ---
-            else:
-                print("WRONG ON-SUPPORT STRATEGY OPTION!")
-                sys.exit()
-
-            # Re-normalize weights after selecting the top N donors to sum to 1.
-            sum_weight_tratamento = ipw.groupby('treatment').agg({
-                'weight' : 'sum'
-            }).reset_index()
-            sum_weight_tratamento_0 = sum_weight_tratamento[sum_weight_tratamento['treatment'] == 0]['weight'].values[0]
-            ipw['weight'] = np.where(ipw['treatment'] == 0, ipw['weight'] / sum_weight_tratamento_0, ipw['weight'])
-
-            ipw.drop('treatment', axis=1, inplace=True)
+            if num_units_max_weight > maximum_num_units_on_support_first_filter:
+                error_valid = float('inf')
+                error_pre_intervention = float('inf')
+                impact_score = float('inf')
+                return error_valid, error_pre_intervention, impact_score
             
-            # Evaluate the performance of this candidate donor pool.
-            error_train, error_valid, error_pre_intervention, error_post_intervention, error_covariates, impact_score = self.evaluate_outcomes_metric(metric=metric, weights=ipw)
+            ipw = pd.concat([ipw[ipw['treatment'] != 0], ipw[ipw['treatment'] == 0].sort_values(['weight', 'id'], ascending=[False, True])[0:num_units_max_weight]], ignore_index=True)
 
-            return error_train, error_valid, error_pre_intervention, error_post_intervention, error_covariates, impact_score, ipw, num_units_bigger_min_weight, num_units_max_weight
+            full_data = self.full_data.copy()
+            depara = pd.merge(ipw, self.from_to, on='id', how='inner')
+            depara.drop('treatment', axis=1, inplace=True)
+            datat = pd.merge(full_data, depara, on='unitid', how='left').reset_index()
+            datat = datat[datat['weight'].notna()]
+
+            donor_unitids = datat[datat['treatment'] == 0]['unitid'].unique()
+
+            if len(donor_unitids) < maximum_donor_pool_size:
+                unitid_combination = donor_unitids
+            else:
+                random.seed(attempt + seed)
+                unitid_combination = np.random.choice(a=donor_unitids, size=maximum_donor_pool_size, replace=False)
+
+            combination_tuple = tuple(sorted(unitid_combination))
+            current_combination_tuple = tuple()
+            # Save time checking whether or not this solution already has been estimated
+            if combination_tuple in estimated_solutions:
+                (error_valid, error_pre_intervention, impact_score) = estimated_solutions[combination_tuple]
+            else:
+                data2 = datat[datat['unitid'].isin([treatment_unitid] + list(unitid_combination))].copy()
+                if maximum_donor_pool_size == 1:
+                    current_ipw = data2[['id','treatment','weight']].drop_duplicates().copy()
+                    current_ipw = pd.concat([current_ipw[current_ipw['treatment'] != 0], current_ipw[current_ipw['treatment'] == 0].sort_values(['weight', 'id'], ascending=[False, True])[0:maximum_donor_pool_size]], ignore_index=True)
+                else:
+                    df = data2.sort_values(by=['treatment', 'timeid', 'unitid', 'outcome']).reset_index(drop=True)
+                    df = df[df['timeid'].isin(self.timeid_train + self.timeid_valid)]
+                    treated_outcome_df = df[df['treatment'] == 1].copy()
+                    treated_outcome_pivot = treated_outcome_df.pivot_table(
+                        index='timeid',
+                        columns='outcome',
+                        values='value'
+                    )
+                    treated_outcome_data = treated_outcome_pivot.to_numpy()
+
+                    control_outcome_df = df[df['treatment'] == 0].copy()
+                    control_outcome_pivot = control_outcome_df.pivot_table(
+                        index=['timeid', 'unitid'],
+                        columns='outcome',
+                        values='value'
+                    )
+                    n_periods = control_outcome_df['timeid'].nunique()
+                    n_control_units = control_outcome_df['unitid'].nunique()
+                    n_outcomes = control_outcome_df['outcome'].nunique()
+                    control_outcome_data = control_outcome_pivot.to_numpy().reshape(n_periods, n_control_units, n_outcomes)
+
+                    optimal_weights = fast_synthetic_control_fitting(
+                        treated_pre_intervention = treated_outcome_data,
+                        control_pre_intervention = control_outcome_data
+                    )
+
+                    control_unit_ids = control_outcome_df['unitid'].unique()
+                    weight_mapping = dict(zip(control_unit_ids, optimal_weights))
+                    filtered_weights = {unit: weight for unit, weight in weight_mapping.items() if weight > 0.001}
+                    current_combination_tuple = tuple(sorted(filtered_weights.keys()))
+                    data2['weight'] = data2['unitid'].map(filtered_weights)
+                    data2['weight'] = np.where(data2['treatment'] == 1, 1, data2['weight'])
+                    data2 = data2[data2['weight'].notna()]
+                    current_ipw = data2[['id','treatment','weight']].drop_duplicates().copy()
+
+                # Re-normalize weights after selecting the top N donors to sum to 1.
+                sum_weight_tratamento = current_ipw.groupby('treatment').agg({
+                    'weight' : 'sum'
+                }).reset_index()
+                sum_weight_tratamento_0 = sum_weight_tratamento[sum_weight_tratamento['treatment'] == 0]['weight'].values[0]
+                current_ipw['weight'] = np.where(current_ipw['treatment'] == 0, current_ipw['weight'] / sum_weight_tratamento_0, current_ipw['weight'])
+                
+                current_ipw.drop('treatment', axis=1, inplace=True)
+
+                # Evaluate the performance of this candidate donor pool.
+                error_train, error_valid, error_pre_intervention, error_post_intervention, impact_score = self.evaluate_outcomes_metric(data=data2)
+
+                if error_pre_intervention < maximum_error_pre_intervention and (not current_combination_tuple or current_combination_tuple not in estimated_solutions):
+                    current_ipw.drop
+                    temp, data = dataset.full_data_treatment_control_scaling(current_ipw)
+                    # Save the donor units, weights and performance metrics of this viable solution.
+                    data = data[data['treatment'] == 0]
+                    data['valor_m_weight'] = data['value'] * data['weight']
+                    data['cycle'] = cycle
+                    data['trial'] = pruning_trial.number
+                    data['solution_id'] = solution_id
+                    data['error_train'] = error_train
+                    data['error_valid'] = error_valid
+                    data['error_pre_intervention'] = error_pre_intervention
+                    data['error_post_intervention'] = error_post_intervention
+                    data['impact_score'] = impact_score
+                    data['num_units_bigger_min_weight'] = num_units_bigger_min_weight
+                    data['num_units_max_weight'] = num_units_max_weight
+                    columns = ['outcome', 'timeid', 'value', 'treatment', 'weight', 'unitid', 'valor_m_weight', 'id', 'cycle', 'trial', 'solution_id', 'error_train', 'error_valid', 'error_pre_intervention', 'error_post_intervention', 'impact_score', 'num_units_bigger_min_weight', 'num_units_max_weight']
+                    data[columns].to_csv(scm_donor_selection_candidate_units_data_file_path, mode='a', header=False, index=False)
+
+                    # Save the weights and performance metrics of this viable solution.
+                    temp = temp[temp['treatment'] == 0]
+                    temp['cycle'] = cycle
+                    temp['trial'] = pruning_trial.number
+                    temp['solution_id'] = solution_id
+                    temp['error_train'] = error_train
+                    temp['error_valid'] = error_valid
+                    temp['error_pre_intervention'] = error_pre_intervention
+                    temp['error_post_intervention'] = error_post_intervention
+                    temp['impact_score'] = impact_score                        
+                    temp['num_units_bigger_min_weight'] = num_units_bigger_min_weight
+                    temp['num_units_max_weight'] = num_units_max_weight
+                    temp.to_csv(scm_donor_selection_candidate_performance_file_path, mode='a', header=False, index=False)
+
+                    solution_id = solution_id + 1
+
+                # Save in cache the current found solution and its simplified version
+                estimated_solutions[combination_tuple] = (error_valid, error_pre_intervention, impact_score)
+                if maximum_donor_pool_size > 1 and current_combination_tuple and combination_tuple != current_combination_tuple:
+                    estimated_solutions[current_combination_tuple] = (error_valid, error_pre_intervention, impact_score)
+
+            attempt = attempt + 1
+
+            return error_valid, error_pre_intervention, impact_score #error_post_intervention
 
         def full_data_treatment_control_scaling(self, weight):
             """Prepares the full dataset with the final weights for saving if it is good enough."""
             temp = pd.merge(weight, self.from_to, on='id', how='inner')
             temp = pd.merge(self.full_data, temp, on='unitid', how='left').reset_index()
-            data = pre_intervention_scaling(data=temp, period=self.timeid_train + self.timeid_valid + [tname_covariate])
-            aggregated3 = data.groupby(['variable', 'timeid', 'treatment'], dropna=False).apply(
+            data = pre_intervention_scaling(data=temp, period=self.timeid_train + self.timeid_valid)
+            aggregated3 = data.groupby(['outcome', 'timeid', 'treatment'], dropna=False).apply(
                 lambda x : pd.Series({
                     'value' : np.ma.filled(np.ma.average(np.ma.masked_invalid(x['value']), weights=x['weight']), fill_value=np.nan),
                     'qtty' : np.ma.filled(np.ma.count(np.ma.masked_invalid(x['value'])), fill_value=np.nan)
@@ -776,11 +791,18 @@ def search(
     # MAIN TRAINING LOOP
     # This outer loop performs Cross-Temporal Validation.
     cycle = 0
-    global attempt
+    global attempt, solution_id, estimated_solutions
     attempt = 0
+    solution_id = 0
+    # EXECUTION CACHE
+    estimated_solutions = dict()
+
+    possible_donor_pool_size = list(range(inferior_limit_maximum_donor_pool_size, superior_limit_maximum_donor_pool_size))
+    possible_donor_pool_size_num_items = len(possible_donor_pool_size)
+
     timeid_train_indexes = [timeid_pre_intervention.index(x) + 1 for x in temporal_cross_search]
     for timeid_train_index in timeid_train_indexes:
-        sampler = optuna.samplers.NSGAIIISampler(seed=seed)
+        sampler = optuna.samplers.NSGAIIISampler(seed=cycle+seed)
         print(f'train: {timeid_pre_intervention[0:timeid_train_index]}')
         print(f'valid: {timeid_pre_intervention[(timeid_train_index):len(timeid_pre_intervention)]}')
         cycle = cycle + 1
@@ -811,30 +833,24 @@ def search(
             It calculates the "Causal Fitness" score and updates the best scores found so far.
             dtrain is not used. The incapsulation is violated to make it performant.
             """
-            global current_error_train, current_error_valid, current_error_pre_intervention, current_error_post_intervention, current_error_covariates, current_impact_score, current_weights, current_preds, current_num_units_bigger_min_weight, current_num_units_max_weight
+            global current_error_valid, current_error_pre_intervention, current_impact_score
 
-            error_train, error_valid, error_pre_intervention, error_post_intervention, error_covariates, impact_score, weights, num_units_bigger_min_weight, num_units_max_weight = dataset.eval_metric_ipw(preds, metric=time_serie_covariate_metric)
+            error_valid, error_pre_intervention, impact_score = dataset.eval_metric_ipw(preds)
 
             if current_error_valid > error_valid:
-                current_weights = weights
-                current_error_train = error_train
                 current_error_valid = error_valid
                 current_error_pre_intervention = error_pre_intervention
-                current_error_post_intervention = error_post_intervention
-                current_error_covariates = error_covariates
                 current_impact_score = impact_score
-                current_preds = preds
-                current_num_units_bigger_min_weight = num_units_bigger_min_weight
-                current_num_units_max_weight = num_units_max_weight
 
             return 'causal_fitness', error_valid
 
         class training_callback(xgb.callback.TrainingCallback):
             """A callback to reset the error at the beginning of each training run."""
             def before_training(self, model):
-                global current_error_valid, attempt
+                global current_error_valid, current_error_pre_intervention, current_impact_score
                 current_error_valid = float('inf')
-                attempt = attempt + 1
+                current_error_pre_intervention = float('inf')
+                current_impact_score = float('inf')
 
                 return model
 
@@ -871,9 +887,7 @@ def search(
                 'min_child_weight': trial.suggest_int('min_child_weight', 1, 10),
 
                 # --- Mitiga o Desbalanceamento de Classes ---
-                'scale_pos_weight': trial.suggest_float('scale_pos_weight', calculated_scale_pos_weight * 0.5, calculated_scale_pos_weight * 2.0),
-
-                'maximum_donor_pool_size' : trial.suggest_int('maximum_donor_pool_size', inferior_limit_maximum_donor_pool_size, superior_limit_maximum_donor_pool_size),
+                'scale_pos_weight': trial.suggest_float('scale_pos_weight', calculated_scale_pos_weight * 0.5, calculated_scale_pos_weight * 2.0)
             }
 
             # --- Run Cross-Validation with Pruning ---
@@ -897,55 +911,6 @@ def search(
                     verbose_eval=False
                 )
 
-                if current_error_valid != float('inf'):
-                    temp, data = dataset.full_data_treatment_control_scaling(current_weights)
-                    # Only save results that meet the pre-treatment error threshold.
-
-                    if 'covariate' in hyperparameter_search_extra_criteria:
-                        condition_save = current_error_pre_intervention < maximum_error_pre_intervention and len(covariates) > 0 and current_error_covariates < maximum_error_covariates
-                    else:
-                        condition_save = current_error_pre_intervention < maximum_error_pre_intervention
-
-                    if condition_save:
-                        # Save the donor units, weights and performance metrics of this viable solution.
-                        data = data[data['treatment'] == 0]
-                        data['valor_m_weight'] = data['value'] * data['weight']
-                        data['cycle'] = cycle
-                        data['trial'] = trial.number
-                        data['error_train'] = current_error_train
-                        data['error_valid'] = current_error_valid
-                        data['error_pre_intervention'] = current_error_pre_intervention
-                        data['error_post_intervention'] = current_error_post_intervention
-                        data['error_covariates'] = current_error_covariates
-                        data['impact_score'] = current_impact_score
-                        data['num_units_bigger_min_weight'] = current_num_units_bigger_min_weight
-                        data['num_units_max_weight'] = current_num_units_max_weight
-                        columns = ['variable', 'timeid', 'value', 'treatment', 'weight', 'unitid', 'valor_m_weight', 'id', 'cycle', 'trial', 'error_train', 'error_valid', 'error_pre_intervention', 'error_post_intervention', 'error_covariates', 'impact_score', 'num_units_bigger_min_weight', 'num_units_max_weight']
-                        data[columns].to_csv(scm_donor_selection_candidate_units_data_file_path, mode='a', header=False, index=False)
-
-                        # Save the weights and performance metrics of this viable solution.
-                        temp = temp[temp['treatment'] == 0]
-                        temp['cycle'] = cycle
-                        temp['trial'] = trial.number
-                        temp['error_train'] = current_error_train
-                        temp['error_valid'] = current_error_valid
-                        temp['error_pre_intervention'] = current_error_pre_intervention
-                        temp['error_post_intervention'] = current_error_post_intervention
-                        temp['error_covariates'] = current_error_covariates
-                        temp['impact_score'] = current_impact_score                        
-                        temp['num_units_bigger_min_weight'] = current_num_units_bigger_min_weight
-                        temp['num_units_max_weight'] = current_num_units_max_weight
-                        temp.to_csv(scm_donor_selection_candidate_performance_file_path, mode='a', header=False, index=False)
-                else:
-                    if 'covariate' in hyperparameter_search_extra_criteria and 'post_intervention_period' in hyperparameter_search_extra_criteria:
-                        return float('inf'), float('inf'), float('inf')
-                    elif 'covariate' in hyperparameter_search_extra_criteria:
-                        return float('inf'), float('inf')
-                    elif 'post_intervention_period' in hyperparameter_search_extra_criteria:
-                        return float('inf'), float('inf')
-                    else:
-                        return float('inf')
-
                 # Store best iteration in trial attributes
                 trial.set_user_attr("best_iteration", results.best_iteration)
 
@@ -955,32 +920,20 @@ def search(
             except Exception as e:
                 # Handle other potential errors during xgb.train
                 print(f"An error occurred during xgb.train for trial {trial.number}: {e}")
-                if 'covariate' in hyperparameter_search_extra_criteria and 'post_intervention_period' in hyperparameter_search_extra_criteria:
-                    return float('inf'), float('inf'), float('inf')
-                elif 'covariate' in hyperparameter_search_extra_criteria:
-                    return float('inf'), float('inf')
-                elif 'post_intervention_period' in hyperparameter_search_extra_criteria:
+                if 'post_intervention_period' in hyperparameter_search_extra_criteria:
                     return float('inf'), float('inf')
                 else:
                     return float('inf')
             
             # The article describes a multi-objective optimization problem. 
-            # Optuna is configured to minimize, pre-treatment error, covariate error, and post-intervention error (optional for diagnose).
-            if 'covariate' in hyperparameter_search_extra_criteria and 'post_intervention_period' in hyperparameter_search_extra_criteria:
-                return current_error_pre_intervention, current_error_covariates, current_error_post_intervention
-            elif 'covariate' in hyperparameter_search_extra_criteria:
-                return current_error_pre_intervention, current_error_covariates
-            elif 'post_intervention_period' in hyperparameter_search_extra_criteria:
-                return current_error_pre_intervention, current_error_post_intervention
+            # Optuna is configured to minimize, pre-treatment error, and post-intervention error (optional for diagnose).
+            if 'post_intervention_period' in hyperparameter_search_extra_criteria:
+                return current_error_pre_intervention, current_impact_score
             else:
                 return current_error_pre_intervention
 
         # --- 4. Run the Optuna Study ---
-        if 'covariate' in hyperparameter_search_extra_criteria and 'post_intervention_period' in hyperparameter_search_extra_criteria:
-            directions=['minimize', 'minimize', 'minimize']
-        elif 'covariate' in hyperparameter_search_extra_criteria:
-            directions=['minimize', 'minimize']
-        elif 'post_intervention_period' in hyperparameter_search_extra_criteria:
+        if 'post_intervention_period' in hyperparameter_search_extra_criteria:
             directions=['minimize', 'minimize']
         else:
             directions=['minimize']
