@@ -379,6 +379,10 @@ def search(
     # MAKE THE PANEL DATA BALANCED BY REMOVING ALL UNITS WHICH HAVE NOT THE SAME NUMBER OF timeids PER outcome EQUAL TO THEN TREATMENT UNIT
     print(all_units.shape)
     all_units = all_units[all_units['value'].notna()]
+    
+    check_timeid_all_outcome = all_units.groupby(['timeid', 'outcome']).size().unstack(fill_value=0)
+    valid_timeids = check_timeid_all_outcome[(check_timeid_all_outcome != 0).all(axis=1)].index.tolist()
+    all_units = all_units[all_units['timeid'].isin(valid_timeids)]
     dt1 = all_units[['unitid', 'treatment', 'timeid', 'outcome']].copy()
 
     treatment_indicators = dt1[dt1['treatment'] == 1]['outcome'].unique()
@@ -465,7 +469,7 @@ def search(
             avg = ('value', lambda x: np.mean(x)),
             std = ('value', lambda x: np.std(x, ddof=1))
         ).reset_index()
-        standardization['std'] = np.where(standardization['std'].isna(), 1.0, standardization['std'])
+        standardization['std'] = np.where((standardization['std'].isna()) | (standardization['std'] == 0.0), 1.0, standardization['std'])
 
         # Standardize the control times series created by the weighted average of the control unit in the dataframe in the defined period
         data = pd.merge(data, standardization, on=['outcome', 'treatment'], how='left')
@@ -802,7 +806,11 @@ def search(
 
     timeid_train_indexes = [timeid_pre_intervention.index(x) + 1 for x in temporal_cross_search]
     for timeid_train_index in timeid_train_indexes:
-        sampler = optuna.samplers.NSGAIIISampler(seed=cycle+seed)
+        if include_impact_score_in_optuna_objective:
+            sampler = optuna.samplers.NSGAIIISampler(seed=cycle+seed)
+        else:
+            sampler = optuna.samplers.RandomSampler(seed=cycle+seed)
+        
         print(f'train: {timeid_pre_intervention[0:timeid_train_index]}')
         print(f'valid: {timeid_pre_intervention[(timeid_train_index):len(timeid_pre_intervention)]}')
         cycle = cycle + 1
