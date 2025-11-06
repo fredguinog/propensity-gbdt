@@ -34,8 +34,9 @@ The framework consists of two main steps:
     small, causally valid donor units. This is achieved through a
     sophisticated multi-loop search process that leverages ATT/IPW-based
     ranking and cross-temporal validation.
-2.  **Optimization:** The selected donors is then used in a traditional
-    SCM algorithm to determine the final weights for the synthetic control.
+2.  **Optimization:** The selected donors are then used in a
+    Bayesian SCM algorithm to estimate the effect and its uncertainty
+    associated with the synthetic control.
 
 This implementation aims to transform the donor selection process from a
 subjective "dark art" into a more scientific and trustworthy methodology for
@@ -265,9 +266,6 @@ maximum_num_units_on_support_first_filter : int, optional
 maximum_error_pre_intervention : float, optional
     The maximum acceptable error (e.g., RMSE or MAE) on the pre-treatment outcomes for a
     candidate donor pool to be saved. Defaults to 0.15.
-proportion_pre_intervention_period_outcomes_donor : int, optional
-    Used to calculate the upper limit for the donor pool size. The limit is determined by
-    (num_pre_intervention_periods * num_outcomes) / this_value. Defaults to 10.
 inferior_limit_maximum_donor_pool_size : int, optional
     The minimum number of donors to be selected in any candidate pool. Defaults to 1.
 include_impact_score_in_optuna_objective : bool, optional
@@ -292,7 +290,6 @@ def search(
     seed = 111,
     maximum_num_units_on_support_first_filter = 50,
     maximum_error_pre_intervention = 0.15,
-    proportion_pre_intervention_period_outcomes_donor = 10,
     inferior_limit_maximum_donor_pool_size = 1,
     include_impact_score_in_optuna_objective = False,
     number_optuna_trials = 1000,
@@ -432,9 +429,12 @@ def search(
     if os.path.exists(scm_donor_selection_candidate_performance_file_path):
         os.remove(scm_donor_selection_candidate_performance_file_path)
 
-    superior_limit_maximum_donor_pool_size = int(num_pre_intervention_periods_per_outcome['timeid'].sum() / proportion_pre_intervention_period_outcomes_donor)
+    superior_limit_maximum_donor_pool_size = math.floor(np.sqrt(num_pre_intervention_periods_per_outcome['timeid'].sum()))
     if superior_limit_maximum_donor_pool_size < 2:
         superior_limit_maximum_donor_pool_size = 2
+
+    if inferior_limit_maximum_donor_pool_size > superior_limit_maximum_donor_pool_size:
+        inferior_limit_maximum_donor_pool_size = superior_limit_maximum_donor_pool_size
 
     all_units.sort_values(by=['unitid', 'timeid', 'outcome'], inplace=True)
     all_units['weight'] = 1.0

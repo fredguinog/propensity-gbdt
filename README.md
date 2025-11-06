@@ -94,13 +94,23 @@ donor_selection.search(
     value = "Value",
     treatment = "treatment",
     pre_intervention = "pre_intervention",
-    temporal_cross_search = ['2004', '2005', '2006', '2007', '2008', '2009', '2010', '2011'],
+    temporal_cross_search = ['2004', '2007', '2010'],
     workspace_folder = 'C:/test_propensitygbdt_scm_donor_selection/',
     # include_impact_score_in_optuna_objective = True
 )
+
+from propensitygbdt.scm import bayesian_scm
+
+bayesian_scm.estimate(
+    timeid_previous_intervention = '2015',
+    workspace_folder = 'C:/test_propensitygbdt_scm_donor_selection/',
+    solution_id = None,
+    period_effect_format = '{:.2f}',
+    seed = 222
+)
 ```
 
-## Parameters
+## donor_selection.search Parameters
 
 ### Main Parameters
 
@@ -119,16 +129,23 @@ donor_selection.search(
 *   `seed` (int, optional): The random seed for reproducibility. Defaults to `111`.
 *   `maximum_num_units_on_support_first_filter` (int, optional): The maximum number of units to be considered "on support" in the first filtering stage. Defaults to `50`.
 *   `maximum_error_pre_intervention` (float, optional): The maximum allowable error in the pre-treatment period for a donor pool to be considered valid. Defaults to `0.15`.
-*   `proportion_pre_intervention_period_outcomes_donor` (int, optional): The desired ratio of pre-intervention data points of all outcomes to the maximum size of the donor pool. Defaults to `10`.
-```python
-    superior_limit_maximum_donor_pool_size = int(num_pre_intervention_periods_per_outcome['timeid'].sum() / proportion_pre_intervention_period_outcomes_donor)
-    if superior_limit_maximum_donor_pool_size < 2:
-        superior_limit_maximum_donor_pool_size = 2
-```
 *   `inferior_limit_maximum_donor_pool_size` (int, optional): The minimum size of the donor pool. Defaults to `1`.
 *   `include_impact_score_in_optuna_objective` (bool, optional): Flag to include or not the impact score in the Optuna's search criteria. Defaults to `False`.
 *   `number_optuna_trials` (int, optional): The number of trials for the Optuna hyperparameter optimization. Defaults to `300`.
 *   `timeout_optuna_cycle` (int, optional): The timeout in seconds for each Optuna optimization cycle. Defaults to `900`.
+
+## bayesian_scm.estimate Parameters
+
+### Main Parameters
+
+*   `timeid_previous_intervention` (str): The last time period before the intervention begins. This defines the end of the pre-treatment period.
+*   `workspace_folder` (str): The path to the folder where the output files will be saved.
+
+### Optional Parameters
+
+*   `solution_id` (int, optional): The specific ID for the set of control units (donor pool) to be used. If None, the function will automatically select the solution with the best trade-off between pre-intervention fit and impact score. Defaults to `None`.
+*   `period_effect_format` (str): A format string for displaying numeric results in plot annotations of period results. Defaults to `'{:.2f}'`.
+*   `seed` (int, optional): A random seed to ensure reproducibility of the MCMC sampling and other random processes. Defaults to `222`.
 
 ## Citation
 

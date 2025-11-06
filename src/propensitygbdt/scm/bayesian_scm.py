@@ -1,0 +1,534 @@
+# -*- coding: utf-8 -*-
+
+# Copyright (c) 2025 Frederico Guilherme Nogueira (frederico.nogueira@gmail.com)
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+"""
+This script implements a two-step, machine learning-driven framework for donor
+selection in Synthetic Control Methods (SCM), as described in the Medium article
+"A New Lens for Donor Selection: ATT/IPW-Based Ranking" by Frederico Nogueira.
+
+The primary goal of this algorithm is to address the "Curse of Dimensionality"
+in SCM by providing a rigorous and objective process for selecting a valid
+donor pool, thus minimizing the risks of overfitting and p-hacking.
+
+The framework consists of two main steps:
+1.  **Donor Selection:** A carefully tuned XGBoost model is used to identify a
+    small, causally valid donor units. This is achieved through a
+    sophisticated multi-loop search process that leverages ATT/IPW-based
+    ranking and cross-temporal validation.
+2.  **Optimization:** [THIS SCRIPT] The selected donors are then used in a
+    Bayesian SCM algorithm to estimate the effect and its uncertainty
+    associated with the synthetic control.
+
+This implementation aims to properly estimate the uncertainty associated with
+the synthetic control for causal inference.
+
+.. _Medium Article:
+    https://medium.com/@frederico.nogueira/a-new-lens-for-donor-selection-att-ipw-based-ranking-198b9d30bc69
+
+"""
+import math
+import os
+import pandas as pd
+import numpy as np
+import cmdstanpy
+import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
+from plotnine import *
+import arviz as az
+from importlib import resources
+import shutil
+import warnings
+# Suppress warnings to keep the output clean.
+warnings.filterwarnings("ignore")
+
+"""
+Executes a complete Bayesian Synthetic Control Model (BSCM) analysis.
+
+This function handles the entire pipeline from data loading and preprocessing
+to model fitting with Stan, and finally, post-processing and visualization
+of the results. It estimates the average treatment effect on the treated (ATT)
+for multiple outcomes simultaneously.
+
+Args:
+    timeid_base_input (str): The last time period before the intervention begins.
+                                This defines the end of the pre-treatment period.
+    workspace_folder (str): The root directory containing the input data file
+                    ('scm_donor_selection_candidate_units_data.csv') and
+                    where all output files (CSVs, plots) will be saved.
+    solution_id (int, optional): The specific ID for the set of control units
+                                    (donor pool) to be used. If None, the function
+                                    will automatically select the solution with the
+                                    best trade-off between pre-intervention fit
+                                    and impact score. Defaults to None.
+    period_effect_format (str, optional): A format string for displaying numeric
+                            results in plot annotations of period results.
+                            Defaults to '{:.2f}'.
+    seed (int, optional): A random seed to ensure reproducibility of the MCMC
+                            sampling and other random processes. Defaults to 222.
+"""
+def estimate(
+    timeid_base_input,
+    workspace_folder,
+    solution_id = None,
+    period_effect_format = '{:.2f}',
+    seed = 222
+):
+    # Set the random seed for NumPy to ensure reproducibility of its random operations.
+    np.random.seed(seed)
+
+    # Remove the last char from workspace_folder if it is /
+    if workspace_folder.endswith('/') or workspace_folder.endswith('\\'):
+        workspace_folder = workspace_folder[:-1]
+
+    # Check if CmdStanPy is installed and can find the CmdStan command-line interface.
+    # This is a crucial dependency for running the Bayesian models.
+    try:
+        cmdstan_path = cmdstanpy.cmdstan_path()
+        print("CmdStanPy is installed and has located a CmdStan installation.")
+        print(f"CmdStan path: {cmdstan_path}")
+        print(f"CmdStan version: {cmdstanpy.cmdstan_version()}")
+    except ValueError:
+        print("CmdStanPy is not installed.")
+        print("Installing CmdStan with compiler toolchain (one-time, ~5-10 min)...")
+        cmdstanpy.install_cmdstan(compiler=True)
+        print(f"Installation complete. Add directory {cmdstan_path}\\RTools40\\mingw64\\bin to PATH.")
+        print("Then restart session for update PATH.")
+        # Note: If in a script/IDE, restart and rerun to ensure PATH is updated
+
+    # 2. DATA
+    # -----------------------------------------------------------------------------
+    # Load the dataset from a CSV file. A try-except block handles the case where the file is not found.
+    # Data types for ID columns are explicitly set to string to avoid unintended numeric conversions.
+    try:
+        dataset = pd.read_csv(f"{workspace_folder}/scm_donor_selection_candidate_units_data.csv", dtype={'outcome': str, 'timeid': str, 'unitid': str})
+        if solution_id is None:
+            # Select the 'solution_id' with the minimum distance to the origin (0,0) in the error-impact space.
+            unique_observations = dataset[['solution_id', 'error_pre_intervention','impact_score']].drop_duplicates()
+            unique_observations['dist'] = np.sqrt(unique_observations['error_pre_intervention']**2 + unique_observations['impact_score']**2)
+            solution_id = unique_observations.loc[unique_observations['dist'].idxmin(), 'solution_id']
+            print(f"Using solution_id: {solution_id}")
+        # Filter the dataset to include only the treated unit and the control units from the specified 'solution_id'.
+        dataset = dataset[(dataset['treatment'] == 1) | (dataset['solution_id'] == solution_id)]
+    except FileNotFoundError:
+        print("Error: 'scm_donor_selection_candidate_units_data.csv' not found.")
+        exit()
+
+    # Keep only the essential columns for the analysis.
+    dataset = dataset[["outcome", "timeid", "value", "treatment", "unitid"]]
+
+    # Ensure that the analysis only uses time periods where data is available for all outcomes.
+    # This avoids issues with missing data in the model.
+    timeid_counts = dataset.groupby(['timeid', 'outcome']).size().reset_index(name='N')
+    timeid_outcome_counts = timeid_counts.groupby('timeid').size().reset_index(name='N_outcomes')
+    max_outcomes = timeid_outcome_counts['N_outcomes'].max()
+    valid_timeids = timeid_outcome_counts[timeid_outcome_counts['N_outcomes'] == max_outcomes]['timeid']
+    dataset = dataset[dataset['timeid'].isin(valid_timeids)]
+
+    # Standardize the 'value' for each outcome (e.g., indicator) independently.
+    # This is done by subtracting the mean and dividing by the standard deviation, calculated per outcome.
+    # This puts all outcomes on a similar scale, which can improve model stability and performance.
+    std_avg_dt = dataset.groupby('outcome')['value'].agg(['mean', 'std']).reset_index()
+    std_avg_dt.rename(columns={'mean': 'avg_value', 'std': 'std_value'}, inplace=True)
+
+    dataset = pd.merge(dataset, std_avg_dt, on='outcome', how='left')
+    dataset['value'] = (dataset['value'] - dataset['avg_value']) / dataset['std_value']
+    dataset.drop(columns=['avg_value', 'std_value'], inplace=True)
+
+    # Convert the 'timeid' column to a categorical type and then to integer codes.
+    # Stan requires integer indices, so this mapping is necessary. We add 1 because Stan uses 1-based indexing.
+    dataset['timeid'] = pd.Categorical(dataset['timeid'])
+    mapping_timeid = dataset['timeid'].cat.categories
+    dataset['timeid'] = dataset['timeid'].cat.codes + 1  # Stan uses 1-based indexing
+
+    # Define the start, base (end of pre-treatment), and end time periods using the integer codes.
+    timeid_inicio = 1
+    timeid_base = np.where(mapping_timeid == timeid_base_input)[0][0] + 1
+    timeid_fim = dataset['timeid'].max()
+
+    # 3. PREPARE DATA FOR STAN
+    # -----------------------------------------------------------------------------
+    # Define a helper function to pivot the data from long format to wide format.
+    # The wide format will have outcomes as columns and timeid/unitid as rows.
+    def pivot_and_extract(df, time_range):
+        if not time_range:
+            return pd.DataFrame()
+        subset = df[df['timeid'].isin(time_range)]
+        if subset.empty:
+            return pd.DataFrame()
+        # The pivoted table is then stripped of its ID columns to create a pure numeric matrix for Stan.
+        return subset.pivot_table(index=['timeid', 'unitid'], columns='outcome', values='value').reset_index().drop(columns=['timeid', 'unitid'])
+
+    # Separate the dataset into treated and control unit data.
+    treated_df = dataset[dataset['treatment'] == 1]
+
+    # Create the data matrices for the treated unit for the post-treatment period.
+    Y_treated_post = pivot_and_extract(treated_df, range(timeid_base + 1, timeid_fim + 1))
+    N_post = len(Y_treated_post)
+
+    # Define a "test" period using the last 20% of the pre-treatment data. This period is used for model validation (e.g., calculating NRMSE).
+    test_period_size = int(0.2 * timeid_base) if N_post > int(0.2 * timeid_base) else N_post
+
+    # Create data matrices for the treated unit for the pre-treatment training period and the test period.
+    Y_treated_pre = pivot_and_extract(treated_df, range(timeid_inicio, timeid_base - test_period_size + 1))
+    Y_treated_test = pivot_and_extract(treated_df, range(timeid_base - test_period_size + 1, timeid_base + 1))
+
+    # Separate the control unit data.
+    control_df = dataset[dataset['treatment'] == 0]
+    # Get sorted lists of unique control unit IDs and outcome names.
+    unitids = sorted(control_df['unitid'].unique())
+    outcomes = sorted(dataset['outcome'].unique())
+    N_outcomes = len(outcomes)
+
+    # Define a function to create a list of matrices, one for each outcome.
+    # Each matrix will have time periods as rows and control units as columns.
+    def get_control_matrices_by_outcome(df, time_range):
+        matrices = []
+        if not time_range:
+            return [np.array([[]])] * N_outcomes
+        subset = df[df['timeid'].isin(time_range)]
+        if subset.empty:
+            return [np.array([[]])] * N_outcomes
+            
+        for outcome in outcomes:
+            outcome_df = subset[subset['outcome'] == outcome]
+            # Pivot to get a timeid x unitid matrix for the current outcome.
+            pivoted = outcome_df.pivot_table(index='timeid', columns='unitid', values='value')[unitids]
+            matrices.append(pivoted.to_numpy())
+        return matrices
+
+    # Create the control data matrices for the pre-treatment, test, and post-treatment periods.
+    Y_control_pre = get_control_matrices_by_outcome(control_df, range(timeid_inicio, timeid_base - test_period_size + 1))
+    Y_control_test = get_control_matrices_by_outcome(control_df, range(timeid_base - test_period_size + 1, timeid_base + 1))
+    Y_control_post = get_control_matrices_by_outcome(control_df, range(timeid_base + 1, timeid_fim + 1))
+
+    # Get counts of control units, pre-treatment periods, and test periods.
+    N_controls = len(unitids)
+    N_pre = len(Y_treated_pre)
+    N_test = len(Y_treated_test)
+
+    # Assemble all the data into a dictionary, which is the required format for input to a Stan model via CmdStanPy.
+    # This dictionary contains all the data, dimensions, and hyperparameters for the model.
+    stan_data = {
+    'N_pre': N_pre,
+    'N_test': N_test,
+    'N_post': N_post,
+    'N_controls': N_controls,
+    'N_outcomes': N_outcomes,
+    'Y_treated_pre': Y_treated_pre.to_numpy(),
+    'Y_treated_test': Y_treated_test.to_numpy(),
+    'Y_treated_post': Y_treated_post.to_numpy(),
+    'Y_control_pre': Y_control_pre,
+    'Y_control_test': Y_control_test,
+    'Y_control_post': Y_control_post,
+    'dirichlet_alpha': np.repeat(1.0, N_controls), # Hyperparameter for the Dirichlet prior on weights (uninformative).
+    'tau_nrmse_scale': 0.05 # Hyperparameter for the prior on the NRMSE noise term.
+    }
+
+    # 4. FIT THE STAN MODEL
+    # -----------------------------------------------------------------------------
+    # Check file already exists in destination
+    if not os.path.exists(f"{workspace_folder}/bscm.stan"):
+        # Specify the path to the Stan model file.
+        # Resolve path to the source code in the package's data folder
+        file_path = resources.files('propensitygbdt.data').joinpath('bscm.stan')
+
+        # Copy the Stan model file to the workspace folder (writable)
+        try:
+            with resources.as_file(file_path) as source_path:
+                shutil.copy(source_path, workspace_folder)
+            print(f"Copied {file_path} to {workspace_folder}/bscm.stan")
+        except (FileNotFoundError, ModuleNotFoundError) as e:
+            print(f"Error: Could not find or copy the source file: {e}")
+            print("Please ensure the package is correctly installed with package_data including 'data/*.stan'.")
+            raise
+
+    # Verify toolchain accessibility (debug: check if mingw32-make is in PATH)
+    make_in_path = shutil.which('mingw32-make') is not None
+    print(f"mingw32-make available in PATH: {make_in_path}")
+    if not make_in_path:
+        raise RuntimeError(f"Add directory {cmdstan_path}\\RTools40\\mingw64\\bin to PATH.")
+
+    # Load the model (compiles to workspace_folder/bscm.exe, then caches)
+    stan_file_path = f"{workspace_folder}/bscm.stan"
+    print(f"Compiling/loading model from: {stan_file_path}")
+    model = cmdstanpy.CmdStanModel(stan_file=stan_file_path)
+
+    # Fit the model using MCMC sampling.
+    # 'data' is the input data dictionary.
+    # 'seed' ensures reproducibility of the sampling process.
+    # 'chains' specifies the number of independent MCMC chains to run.
+    # 'parallel_chains' runs the chains in parallel to speed up computation.
+    # 'iter_warmup' is the number of "burn-in" iterations to discard.
+    # 'iter_sampling' is the number of posterior samples to keep from each chain.
+    fit = model.sample(
+        data=stan_data,
+        seed=seed,
+        chains=4,
+        parallel_chains=4,
+        iter_warmup=1000,
+        iter_sampling=2000,
+        refresh=500
+    )
+
+    # Print a summary of the R-hat diagnostic statistic. R-hat values close to 1.0
+    # indicate that the MCMC chains have converged to the same posterior distribution.
+    print(fit.summary()['R_hat'].describe())
+    fit.summary().to_csv(f"{workspace_folder}/all_parameters_summary.csv", index=True)
+
+    # 5. POST-PROCESSING AND VISUALIZATION
+    # -----------------------------------------------------------------------------
+    # Extract the MCMC draws (posterior samples) into a pandas DataFrame for easier manipulation.
+    draws_df = fit.draws_pd()
+
+    # Filter for variables related to the treatment effect (residuals and effects) and reshape the data.
+    # The 'melt' function converts the DataFrame from wide format (one column per parameter instance)
+    # to long format, which is more convenient for grouping and plotting.
+    vars_to_extract = ["residuals_pre", "residuals_test", "effect_post"]
+    chains_effect_df = draws_df.melt(
+        id_vars=['chain__', 'iter__'],
+        value_vars=[col for col in draws_df.columns if any(col.startswith(v) for v in vars_to_extract)],
+        var_name='variable'
+    )
+    chains_effect_df.rename(columns={'chain__': 'chain', 'iter__': 'iteration'}, inplace=True)
+
+    # The variable names from Stan (e.g., "effect_post[1,2]") contain index information.
+    # This code extracts the variable name and its indices into separate columns.
+    extracted_info = chains_effect_df['variable'].str.extract(r'(\w+)\[(\d+),(\d+)\]')
+    chains_effect_df['var_name'] = extracted_info[0]
+    chains_effect_df['index_1'] = pd.to_numeric(extracted_info[1]) # Corresponds to time
+    chains_effect_df['index_2'] = pd.to_numeric(extracted_info[2]) # Corresponds to outcome
+
+    # Define a function to reconstruct the original 'timeid' from the Stan indices.
+    # This requires knowing the structure of the pre, test, and post periods.
+    def get_timeid(row):
+        if row['var_name'] == 'residuals_pre':
+            return row['index_1'] + timeid_inicio - 1
+        elif row['var_name'] == 'residuals_test':
+            return row['index_1'] + timeid_inicio + N_pre - 1
+        elif row['var_name'] == 'effect_post':
+            return row['index_1'] + timeid_base
+        return -1
+
+    # Apply the function to create a 'timeid' column with the original time labels.
+    chains_effect_df['timeid'] = chains_effect_df.apply(get_timeid, axis=1)
+    chains_effect_df['timeid'] = chains_effect_df['timeid'].apply(lambda x: mapping_timeid[x-1] if x > 0 and pd.notna(x) else -1)
+    chains_effect_df['timeid'] = np.where(chains_effect_df['timeid'] == -1, np.nan, chains_effect_df['timeid'])
+    # Map the second index back to the outcome name.
+    chains_effect_df['outcome'] = chains_effect_df['index_2'].apply(lambda x: outcomes[x-1])
+    # Drop the now redundant columns.
+    chains_effect_df.drop(columns=['variable', 'var_name', 'index_1', 'index_2'], inplace=True)
+
+    # Define a function to create formatted text annotations for the plots.
+    # This text will summarize the average effect for the pre and post periods,
+    # including a 95% credible interval and a significance star.
+    def format_annotation(df, p, period_effect_format):
+        row = df[df['period'] == p].iloc[0]
+        mean_value = row['mean']
+        lower_value = row['q2_5']
+        upper_value = row['q97_5']
+        # A '*' indicates significance if the 95% credible interval does not contain zero.
+        significative = "" if lower_value < 0.0 < upper_value else "*"
+        
+        prefix = "Parallel Trends: " if p == "Pre" else "ATT: "
+        
+        return (f"{prefix}"
+                f"{period_effect_format.format(mean_value)} "
+                f"[{period_effect_format.format(lower_value)}, "
+                f"{period_effect_format.format(upper_value)}]"
+                f"{significative}")
+
+
+    # Initialize lists to store summary statistics from each outcome's plot.
+    att_period_list = []
+    att_timeid_list = []
+
+    # Loop through each outcome to generate and save individual plots.
+    for idx, current_indicator in enumerate(outcomes):
+        # Create a directory for the current outcome to save its plots, if it doesn't already exist.
+        os.makedirs(f"{workspace_folder}/{current_indicator}", exist_ok=True)
+
+        # Retrieve the mean and standard deviation for the current outcome to un-standardize the results.
+        indicator_info = std_avg_dt[std_avg_dt['outcome'] == current_indicator]
+        avg_value = indicator_info['avg_value'].iloc[0]
+        std_value = indicator_info['std_value'].iloc[0]
+
+        # Create a directory for the current outcome to save its plots, if it doesn't already exist.
+        os.makedirs(current_indicator, exist_ok=True)
+        
+        # Filter the effects data for the current outcome.
+        effect_subset = chains_effect_df[chains_effect_df['outcome'] == current_indicator].copy()
+        # Create a 'period' column to distinguish between pre- and post-treatment time points.
+        effect_subset['period'] = np.where(effect_subset['timeid'].astype(str) > str(mapping_timeid[timeid_base-1]), "Post", "Pre")
+        # Rescale the 'value' (the effect) back to the original units by multiplying by the standard deviation.
+        # The mean is not added back because we are looking at effects (differences), where the mean cancels out.
+        effect_subset['value'] *= std_value 
+        
+        # Calculate the average effect per period for each MCMC iteration.
+        att_chain_period = effect_subset.groupby(['iteration', 'chain', 'period'])['value'].agg(
+            mean='mean'
+        ).reset_index()
+
+        # Summarize the posterior distribution of the average period effects to get the mean and 95% credible interval.
+        att_period = att_chain_period.groupby('period')['mean'].agg(
+            q2_5=lambda x: x.quantile(0.025),
+            mean='mean',
+            q97_5=lambda x: x.quantile(0.975)
+        ).reset_index()
+
+        # Summarize the posterior distribution of the effect for each individual time point.
+        att_timeid = effect_subset.groupby(['timeid', 'period'])['value'].agg(
+            q2_5=lambda x: x.quantile(0.025),
+            effect='mean',
+            q97_5=lambda x: x.quantile(0.975)
+        ).reset_index()
+
+        # Determine the tick marks for the time axis to avoid overcrowding.
+        num_unique_timeids = len(chains_effect_df['timeid'].unique())
+        length_desired_breaks = math.ceil(num_unique_timeids / 40.0)
+        time_breaks = mapping_timeid[::length_desired_breaks]
+
+        # Calculate the x-coordinates for placing the summary annotations on the plot.
+        x_pre_annotation = (timeid_base + 1) / 2
+        post_period_start_index = timeid_base + 1
+        post_period_length = len(mapping_timeid) - post_period_start_index
+        x_post_annotation = post_period_start_index + (post_period_length / 2)
+        
+        # Create the main effect plot using the plotnine (ggplot) library.
+        p = (
+            ggplot(att_timeid, aes(x='factor(timeid)', y='effect', color='factor(period)')) +
+            geom_vline(xintercept=timeid_base, linetype="dashed", color="red") + # Vertical line at the intervention point.
+            geom_hline(yintercept=0.0, linetype="dashed", color="black") + # Horizontal line at zero effect.
+            geom_point(size=1.5) + # Points for the mean effect at each time point.
+            geom_errorbar(aes(ymin='q2_5', ymax='q97_5'), width=0.2) + # Error bars for the 95% credible interval.
+            scale_color_manual(name=None, values={"Pre": "#e87d72", "Post": "#56bcc2"}, breaks=['Pre', 'Post']) +
+            ggtitle(current_indicator) +
+            theme_classic() +
+            scale_x_discrete(breaks=list(time_breaks), name="timeid") +
+            theme(axis_text_x=element_text(angle=45, hjust=1), legend_position="top", legend_title=element_blank(), plot_title=element_text(hjust=0)) +
+            # Add the summary text annotations to the plot.
+            annotate("text", x=x_pre_annotation, y=att_timeid['q97_5'].max(),
+                    label=format_annotation(att_period, "Pre", period_effect_format), color="black", size=10, fontweight='bold') +
+            annotate("text", x=x_post_annotation, y=att_timeid['q97_5'].max(),
+                    label=format_annotation(att_period, "Post", period_effect_format), color="black", size=10, fontweight='bold') +
+            ylab("Effect Magnitude")
+        )
+        # Save the plot to a file.
+        p.save(f"{workspace_folder}/{current_indicator}/effect.png", width=14, height=6, dpi=300)
+
+        # Generate and save forest plots for the NRMSE (Normalized Root Mean Square Error) model fit statistics using ArviZ.
+        # These plots help diagnose how well the synthetic control matched the treated unit in different periods.
+        az.plot_forest(
+            fit,
+            var_names=["nrmse_pre", "nrmse_test", "nrmse_post", "nrmse_pre_test"],
+            combined=True,
+            figsize=(14, 6),
+            hdi_prob=0.95,
+            coords={ # 'coords' is used to select only the NRMSE for the current outcome (indexed by 'idx').
+                "nrmse_pre_dim_0": [idx],
+                "nrmse_test_dim_0": [idx],
+                "nrmse_post_dim_0": [idx],
+                "nrmse_pre_test_dim_0": [idx]
+            }
+        )
+        plt.suptitle("RMSE (Normalized Root Mean Square Error) model fit statistics", fontsize=16, y=0.97)
+        plt.savefig(f"{workspace_folder}/{current_indicator}/nrmse.png")
+
+        # Store the summary results for the current outcome in the lists.
+        att_period['outcome'] = current_indicator
+        att_period_list.append(att_period)
+
+        att_timeid['outcome'] = current_indicator
+        att_timeid_list.append(att_timeid)
+
+    # Combine the summary results from all outcomes into single DataFrames.
+    att_period_df = pd.concat(att_period_list)
+    att_timeid_df = pd.concat(att_timeid_list)
+    # Save the summarized results and the full set of MCMC draws to CSV files for further analysis.
+    att_period_df.to_csv(f"{workspace_folder}/att_period_dt.csv", index=False)
+    att_timeid_df.to_csv(f"{workspace_folder}/att_timeid_dt.csv", index=False)
+    draws_df.to_csv(f"{workspace_folder}/chains_all_parameters.csv", index=False)
+
+    # Convert the CmdStanPy fit object to an ArviZ InferenceData object for advanced plotting.
+    inference_data = az.from_cmdstanpy(fit)
+
+    # --- Create a customized density plot for key parameters ---
+    # Define a color map for the MCMC chains.
+    cmap = plt.get_cmap("Blues")
+    legend_colors = [cmap(x) for x in np.linspace(0.9, 0.4, 4)]
+
+    # Use ArviZ to create a grid of density plots for the weights (w), sigma, and tau parameters.
+    # This plot is excellent for visually checking chain convergence and the shape of posterior distributions.
+    axes = az.plot_density(
+        [inference_data.sel(chain=[0]), inference_data.sel(chain=[1]),
+        inference_data.sel(chain=[2]), inference_data.sel(chain=[3])],
+        var_names=["w", "sigma", "tau_nrmse"],
+        shade=0.0,
+        hdi_prob=0.95,
+        point_estimate="mean",
+        colors=legend_colors,
+        figsize=(14, 6)
+    )
+    # Remove the default legends generated by ArviZ for each subplot.
+    for ax in axes.flatten():
+        if ax.get_legend() is not None:
+            ax.get_legend().remove()
+
+    # Customize the plot aesthetics.
+                                                
+    fig = axes.flatten()[0].get_figure()
+    fig.set_constrained_layout(True) 
+
+    # Create user-friendly titles for each subplot.
+    plot_titles = [name for name in az.summary(inference_data).index.tolist() if name.startswith(("w", "sigma", "tau_nrmse"))]
+                                                        
+    for i, ax in enumerate(axes.flatten()):
+        if i < len(plot_titles):
+                                
+            ax.set_title(plot_titles[i], fontsize=12)
+            ax.tick_params(axis='x', labelsize=12)
+
+    # Create a single, custom legend for the entire figure.
+    legend_handles = [Line2D([0], [0], color=c, lw=2, label=str(i+1)) for i, c in enumerate(legend_colors)]
+                                            
+    axes.flatten()[2].legend(
+        handles=legend_handles,
+        title="Chain",
+        loc='upper right',
+        bbox_to_anchor=(1.8, 1.0), # Position legend outside the plot area.
+        frameon=False,
+        fontsize=12,
+        title_fontsize=12
+    )
+    plt.savefig(f"{workspace_folder}/unitid_weight_individual_distribution_sigma.png")
+
+    # --- Create a forest plot for the donor weights (w) ---
+    # This plot shows the posterior distribution (mean and 95% HDI) for each control unit's weight.
+    # It clearly visualizes which control units are most important for constructing the synthetic control.
+    az.plot_forest(
+        fit,
+        var_names="w",
+        combined=True,
+        figsize=(14, max(6, N_controls * 0.3)), # Adjust height based on number of controls.
+        hdi_prob=0.95
+    )
+    plt.suptitle("Posterior Distribution of Donor Unit Weights (w)", fontsize=16, y=0.97)
+    plt.savefig(f"{workspace_folder}/unitid_weight_simultanous_distribution.png")
