@@ -103,10 +103,7 @@ from propensitygbdt.scm import bayesian_scm
 
 bayesian_scm.estimate(
     timeid_previous_intervention = '2015',
-    workspace_folder = 'C:/test_propensitygbdt_scm_donor_selection/',
-    solution_id = None,
-    period_effect_format = '{:.2f}',
-    seed = 222
+    workspace_folder = 'C:/test_propensitygbdt_scm_donor_selection/'
 )
 ```
 

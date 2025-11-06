@@ -69,7 +69,7 @@ of the results. It estimates the average treatment effect on the treated (ATT)
 for multiple outcomes simultaneously.
 
 Args:
-    timeid_base_input (str): The last time period before the intervention begins.
+    timeid_previous_intervention (str): The last time period before the intervention begins.
                                 This defines the end of the pre-treatment period.
     workspace_folder (str): The root directory containing the input data file
                     ('scm_donor_selection_candidate_units_data.csv') and
@@ -86,7 +86,7 @@ Args:
                             sampling and other random processes. Defaults to 222.
 """
 def estimate(
-    timeid_base_input,
+    timeid_previous_intervention,
     workspace_folder,
     solution_id = None,
     period_effect_format = '{:.2f}',
@@ -143,16 +143,6 @@ def estimate(
     valid_timeids = timeid_outcome_counts[timeid_outcome_counts['N_outcomes'] == max_outcomes]['timeid']
     dataset = dataset[dataset['timeid'].isin(valid_timeids)]
 
-    # Standardize the 'value' for each outcome (e.g., indicator) independently.
-    # This is done by subtracting the mean and dividing by the standard deviation, calculated per outcome.
-    # This puts all outcomes on a similar scale, which can improve model stability and performance.
-    std_avg_dt = dataset.groupby('outcome')['value'].agg(['mean', 'std']).reset_index()
-    std_avg_dt.rename(columns={'mean': 'avg_value', 'std': 'std_value'}, inplace=True)
-
-    dataset = pd.merge(dataset, std_avg_dt, on='outcome', how='left')
-    dataset['value'] = (dataset['value'] - dataset['avg_value']) / dataset['std_value']
-    dataset.drop(columns=['avg_value', 'std_value'], inplace=True)
-
     # Convert the 'timeid' column to a categorical type and then to integer codes.
     # Stan requires integer indices, so this mapping is necessary. We add 1 because Stan uses 1-based indexing.
     dataset['timeid'] = pd.Categorical(dataset['timeid'])
@@ -161,8 +151,21 @@ def estimate(
 
     # Define the start, base (end of pre-treatment), and end time periods using the integer codes.
     timeid_inicio = 1
-    timeid_base = np.where(mapping_timeid == timeid_base_input)[0][0] + 1
+    timeid_base = np.where(mapping_timeid == timeid_previous_intervention)[0][0] + 1
     timeid_fim = dataset['timeid'].max()
+
+    # Standardize the 'value' for each outcome (e.g., indicator) independently using only the pre-intervention period.
+    # This is done by subtracting the mean and dividing by the standard deviation, calculated per outcome.
+    # This puts all outcomes on a similar scale, which can improve model stability and performance.
+    treated_pre_df = dataset[dataset['timeid'] <= timeid_base]
+    std_avg_dt = treated_pre_df.groupby('outcome')['value'].agg(['mean', 'std']).reset_index()
+    std_avg_dt.rename(columns={'mean': 'avg_value', 'std': 'std_value'}, inplace=True)
+    std_avg_dt['std_value'] = std_avg_dt['std_value'].clip(lower=1e-10)  # Avoid div0
+
+    # Apply to full dataset
+    dataset = pd.merge(dataset, std_avg_dt, on='outcome', how='left')
+    dataset['value'] = (dataset['value'] - dataset['avg_value']) / dataset['std_value']
+    dataset.drop(columns=['avg_value', 'std_value'], inplace=True)
 
     # 3. PREPARE DATA FOR STAN
     # -----------------------------------------------------------------------------
@@ -434,8 +437,9 @@ def estimate(
         # Save the plot to a file.
         p.save(f"{workspace_folder}/{current_indicator}/effect.png", width=14, height=6, dpi=300)
 
-        # Generate and save forest plots for the NRMSE (Normalized Root Mean Square Error) model fit statistics using ArviZ.
-        # These plots help diagnose how well the synthetic control matched the treated unit in different periods.
+        # Assumption 3' (Strict Parallel Trends)
+        # Generate and save forest plots for the Predictive NRMSE (Normalized Root Mean Square Error) model fit statistics using ArviZ.
+        # These plots help diagnose how well the synthetic control complies with the strict parallel trends assumption.
         az.plot_forest(
             fit,
             var_names=["nrmse_pre", "nrmse_test", "nrmse_post", "nrmse_pre_test"],
@@ -449,8 +453,27 @@ def estimate(
                 "nrmse_pre_test_dim_0": [idx]
             }
         )
-        plt.suptitle("RMSE (Normalized Root Mean Square Error) model fit statistics", fontsize=16, y=0.97)
-        plt.savefig(f"{workspace_folder}/{current_indicator}/nrmse.png")
+        plt.suptitle("Strict Parallel Trends - Predictive RMSE (Normalized Root Mean Square Error)", fontsize=16, y=0.97)
+        plt.savefig(f"{workspace_folder}/{current_indicator}/predictive_nrmse.png")
+
+        # Assumption 3 (Low-Rank Trends)
+        # Generate and save forest plots for the Structural NRMSE (Normalized Root Mean Square Error) model fit statistics using ArviZ.
+        # These plots help diagnose how well the synthetic control complies with the low-rank trends assumption.
+        az.plot_forest(
+            fit,
+            var_names=["struc_nrmse_pre", "struc_nrmse_test", "struc_nrmse_post", "struc_nrmse_pre_test"],
+            combined=True,
+            figsize=(20, 6),
+            hdi_prob=0.95,
+            coords={ # 'coords' is used to select only the NRMSE for the current outcome (indexed by 'idx').
+                "struc_nrmse_pre_dim_0": [idx],
+                "struc_nrmse_test_dim_0": [idx],
+                "struc_nrmse_post_dim_0": [idx],
+                "struc_nrmse_pre_test_dim_0": [idx]
+            }
+        )
+        plt.suptitle("Low-Rank Trends - Structural RMSE (Normalized Root Mean Square Error)", fontsize=16, y=0.97)
+        plt.savefig(f"{workspace_folder}/{current_indicator}/structural_nrmse.png")
 
         # Store the summary results for the current outcome in the lists.
         att_period['outcome'] = current_indicator

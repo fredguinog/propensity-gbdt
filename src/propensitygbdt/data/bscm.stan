@@ -135,7 +135,7 @@ model {
   w ~ dirichlet(dirichlet_alpha);
 
   // A weakly informative prior on the error term for each outcome.
-  sigma ~ normal(0, 10); //student_t(3, 0, 2.5); //
+  sigma ~ cauchy(0, 2.5);
   
   tau_nrmse ~ cauchy(0, tau_nrmse_scale);
 
@@ -168,6 +168,7 @@ generated quantities {
   // This block generates quantities of interest for each outcome using the posterior draws.
   // Generate draws from the posterior predictive distribution for the effect of each outcome.
   // This incorporates the estimated model noise `sigma` into our prediction. 
+  // Predictive residuals
   matrix[N_pre, N_outcomes] residuals_pre;
   matrix[N_test, N_outcomes] residuals_test;
   matrix[N_post, N_outcomes] effect_post;
@@ -191,4 +192,30 @@ generated quantities {
   }
   
   vector[N_outcomes] nrmse_pre_test = (nrmse_pre + nrmse_test) / 2;
+
+  // Structural for raw trends
+  matrix[N_pre, N_outcomes] struc_residuals_pre;
+  matrix[N_test, N_outcomes] struc_residuals_test;
+  matrix[N_post, N_outcomes] struc_effect_post;
+  vector[N_outcomes] struc_nrmse_pre;
+  vector[N_outcomes] struc_nrmse_test;
+  vector[N_outcomes] struc_nrmse_post;	
+  for (k in 1:N_outcomes) {
+    for (t in 1:N_pre) {
+      struc_residuals_pre[t, k] = Y_treated_pre[t, k] - y_synth_pre_scaled[t, k];
+    }
+    for (t in 1:N_test) {
+      struc_residuals_test[t, k] = Y_treated_test[t, k] - y_synth_test_scaled[t, k];
+    }
+    for (t in 1:N_post) {
+      struc_effect_post[t, k] = Y_treated_post[t, k] - y_synth_post_scaled[t, k];
+    }
+
+    struc_nrmse_pre[k] = sqrt(mean(square(struc_residuals_pre[, k] / amplitude[k])));
+    struc_nrmse_test[k] = sqrt(mean(square(struc_residuals_test[, k] / amplitude[k])));
+    struc_nrmse_post[k] = sqrt(mean(square(struc_effect_post[, k] / amplitude[k])));
+  }
+
+  vector[N_outcomes] struc_nrmse_pre_test = (struc_nrmse_pre + struc_nrmse_test) / 2;
+
 }
