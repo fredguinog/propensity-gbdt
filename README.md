@@ -126,7 +126,7 @@ bayesian_scm.estimate(
 *   `seed` (int, optional): The random seed for reproducibility. Defaults to `111`.
 *   `maximum_num_units_on_support_first_filter` (int, optional): The maximum number of units to be considered "on support" in the first filtering stage. Defaults to `50`.
 *   `maximum_error_pre_intervention` (float, optional): The maximum allowable error in the pre-treatment period for a donor pool to be considered valid. Defaults to `0.15`.
-*   `inferior_limit_maximum_donor_pool_size` (int, optional): The minimum size of the donor pool. Defaults to `1`.
+*   `inferior_limit_maximum_donor_pool_size` (int, optional): The minimum size of the donor pool. Defaults to `4`.
 *   `include_impact_score_in_optuna_objective` (bool, optional): Flag to include or not the impact score in the Optuna's search criteria. Defaults to `False`.
 *   `number_optuna_trials` (int, optional): The number of trials for the Optuna hyperparameter optimization. Defaults to `300`.
 *   `timeout_optuna_cycle` (int, optional): The timeout in seconds for each Optuna optimization cycle. Defaults to `900`.

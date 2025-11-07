@@ -267,7 +267,7 @@ maximum_error_pre_intervention : float, optional
     The maximum acceptable error (e.g., RMSE or MAE) on the pre-treatment outcomes for a
     candidate donor pool to be saved. Defaults to 0.15.
 inferior_limit_maximum_donor_pool_size : int, optional
-    The minimum number of donors to be selected in any candidate pool. Defaults to 1.
+    The minimum number of donors to be selected in any candidate pool. Defaults to 4.
 include_impact_score_in_optuna_objective : bool, optional
     Flag to include or not the impact score in the Optuna's search criteria. Defaults to False.
 number_optuna_trials : int, optional
@@ -290,7 +290,7 @@ def search(
     seed = 111,
     maximum_num_units_on_support_first_filter = 50,
     maximum_error_pre_intervention = 0.15,
-    inferior_limit_maximum_donor_pool_size = 1,
+    inferior_limit_maximum_donor_pool_size = 4,
     include_impact_score_in_optuna_objective = False,
     number_optuna_trials = 1000,
     timeout_optuna_cycle = 900
@@ -405,7 +405,6 @@ def search(
     outcomes = all_units['outcome'].sort_values().unique().tolist()
     # timeids = all_units['timeid'].sort_values().unique().tolist()
     timeid_pre_intervention = all_units[all_units['pre_intervention'] == 1]['timeid'].sort_values().unique().tolist()
-    num_pre_intervention_periods_per_outcome = all_units[all_units['pre_intervention'] == 1].groupby('outcome').agg({'timeid': 'nunique' }).reset_index()
     timeid_post_intervention = all_units[all_units['pre_intervention'] == 0]['timeid'].sort_values().unique().tolist()
 
     hyperparameter_search_extra_criteria = []  
@@ -429,12 +428,12 @@ def search(
     if os.path.exists(scm_donor_selection_candidate_performance_file_path):
         os.remove(scm_donor_selection_candidate_performance_file_path)
 
-    superior_limit_maximum_donor_pool_size = math.floor(np.sqrt(num_pre_intervention_periods_per_outcome['timeid'].sum()))
-    if superior_limit_maximum_donor_pool_size < 2:
-        superior_limit_maximum_donor_pool_size = 2
-
-    if inferior_limit_maximum_donor_pool_size > superior_limit_maximum_donor_pool_size:
-        inferior_limit_maximum_donor_pool_size = superior_limit_maximum_donor_pool_size
+    superior_limit_maximum_donor_pool_size = math.floor(np.sqrt(len(timeid_pre_intervention)))
+    if superior_limit_maximum_donor_pool_size < inferior_limit_maximum_donor_pool_size:
+        if len(timeid_pre_intervention) < 6:
+            raise ValueError("Insufficient pre-data (need ≥6 time points).")
+        else:
+            superior_limit_maximum_donor_pool_size = inferior_limit_maximum_donor_pool_size
 
     all_units.sort_values(by=['unitid', 'timeid', 'outcome'], inplace=True)
     all_units['weight'] = 1.0
@@ -801,7 +800,7 @@ def search(
     # EXECUTION CACHE
     estimated_solutions = dict()
 
-    possible_donor_pool_size = list(range(inferior_limit_maximum_donor_pool_size, superior_limit_maximum_donor_pool_size))
+    possible_donor_pool_size = list(range(inferior_limit_maximum_donor_pool_size, superior_limit_maximum_donor_pool_size + 1))
     possible_donor_pool_size_num_items = len(possible_donor_pool_size)
 
     timeid_train_indexes = [timeid_pre_intervention.index(x) + 1 for x in temporal_cross_search]

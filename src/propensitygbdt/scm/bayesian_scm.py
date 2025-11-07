@@ -56,9 +56,159 @@ from plotnine import *
 import arviz as az
 from importlib import resources
 import shutil
+from scipy.linalg import eigh
 import warnings
 # Suppress warnings to keep the output clean.
 warnings.filterwarnings("ignore")
+
+"""
+Perform post-pruning diagnostics for Assumption 5 (scale similarity, conditioning).
+
+Verifies:
+- Gram matrix condition number < threshold (for structural conditioning).
+- Scale mismatch |mean_treated - mean_synth| / sd_treated < threshold.
+
+Args:
+    dataset: Filtered dataset with 'outcome', 'timeid', 'value', 'treatment', 'unitid'.
+    pre_range: List of integer timeids for pre-period (e.g., [1,2,3,4]); must have ≥2 points.
+    cond_threshold: Max condition number (e.g., 1500).
+    scale_mismatch_threshold: Max scale mismatch (e.g., 0.2).
+    verbose: Print warnings if True.
+
+Returns:
+    dict: Summary of checks (passes: bool, details: dict per outcome).
+
+Raises:
+    ValueError: If checks fail critically or inputs invalid (e.g., empty pre_range).
+"""
+def post_prune_checks(
+    dataset: pd.DataFrame,
+    pre_range: list,
+    cond_threshold: float = 500.0,
+    scale_mismatch_threshold: float = 0.2,
+    verbose: bool = True
+):
+    if not pre_range or len(pre_range) < 2:
+        raise ValueError("pre_range must be non-empty with ≥2 time points for covariance.")
+    
+    # Filter to treated and selected controls (assumes dataset already solution_id-filtered)
+    treated_df = dataset[dataset['treatment'] == 1].copy()
+    control_df = dataset[dataset['treatment'] == 0].copy()
+    
+    if treated_df.empty or control_df.empty:
+        raise ValueError("Dataset must include at least one treated and one control unit.")
+    
+    # Map timeid to int (1-based) for BOTH DFs; assume timeid is string, convert to cat consistently
+    all_timeids = pd.Categorical(dataset['timeid'])
+    timeid_to_int = {cat: i+1 for i, cat in enumerate(all_timeids.categories)}
+    
+    treated_df['timeid_int'] = treated_df['timeid'].map(timeid_to_int)
+    control_df['timeid_int'] = control_df['timeid'].map(timeid_to_int)
+    
+    # Filter to pre_range early (int comparison)
+    pre_range_set = set(pre_range)  # For fast lookup
+    treated_df = treated_df[treated_df['timeid_int'].isin(pre_range_set)]
+    control_df = control_df[control_df['timeid_int'].isin(pre_range_set)]
+    
+    outcomes = sorted(dataset['outcome'].unique())
+    if not outcomes:
+        raise ValueError("No outcomes found in dataset.")
+    
+    # Pivot helper for pre-data (now assumes pre-filtered DF)
+    def pivot_pre(df, outcomes):
+        if df.empty:
+            return pd.DataFrame(index=[], columns=outcomes)
+        # Pivot: time x outcomes (wide)
+        pivoted = df.pivot_table(
+            index='timeid_int', columns='outcome', values='value'
+        ).reset_index(drop=True)[outcomes]  # Select outcomes only; fill NaN if sparse
+        pivoted = pivoted.fillna(pivoted.mean())  # Optional: Impute means for sparse
+        return pivoted
+    
+    # Get pre-data matrices (time x outcomes for treated; time x controls per outcome for controls)
+    Y_treated_pre = pivot_pre(treated_df, outcomes)
+    if Y_treated_pre.empty or Y_treated_pre.shape[0] < 2:
+        raise ValueError("Insufficient pre-data for treated unit (need ≥2 time points).")
+    
+    Y_control_pre = []  # List of (time x controls) per outcome
+    unitids = sorted(control_df['unitid'].unique())
+    N_controls = len(unitids)
+    if N_controls == 0 or N_controls < 2:
+        raise ValueError("Need ≥2 control units for Gram matrix.")
+    
+    for outcome in outcomes:
+        outcome_df = control_df[control_df['outcome'] == outcome]
+        if outcome_df.empty:
+            Y_control_pre.append(np.empty((0, N_controls)))
+            continue
+        control_pivoted = outcome_df.pivot_table(
+            index='timeid_int', columns='unitid', values='value'
+        ).reindex(columns=unitids).reset_index(drop=True)  # Time rows, control cols
+        control_pivoted = control_pivoted.fillna(control_pivoted.mean())  # Impute for sparse
+        Y_control_pre.append(control_pivoted.to_numpy())
+    
+    N_outcomes = len(outcomes)
+    N_pre = Y_treated_pre.shape[0]
+    
+    checks = {'passes': True, 'details': {}}
+    
+    for k in range(N_outcomes):
+        outcome_name = outcomes[k]
+        y_treated_k = Y_treated_pre.iloc[:, k].values
+        y_control_k = Y_control_pre[k]  # (N_pre x N_controls)
+        
+        if len(y_treated_k) < 2 or y_control_k.shape[0] < 2 or y_control_k.shape[1] < 2:
+            # Insufficient data for Gram (cov needs ≥2 obs/vars)
+            detail = {'cond_num': np.inf, 'scale_mismatch': np.inf, 'cond_pass': False, 'scale_pass': False}
+            checks['details'][outcome_name] = detail
+            checks['passes'] = False
+            if verbose:
+                print(f"Warning: Insufficient data for {outcome_name} (N_pre={N_pre}, N_controls={N_controls}). Skipping Gram.")
+            continue
+        
+        # 1. Gram matrix condition number
+        # Gram: Covariance of donor trajectories (centered)
+        mean_k = np.mean(y_control_k, axis=0, keepdims=True)
+        centered_control = y_control_k - mean_k
+        gram = np.cov(centered_control.T)  # Controls x controls (var over time)
+        # Handle any lingering NaN (e.g., constant series)
+        gram = np.nan_to_num(gram, nan=np.inf)
+        if np.all(np.isinf(gram)):
+            cond_num = np.inf
+        else:
+            eigenvalues = eigh(gram, eigvals_only=True)
+            min_eig = eigenvalues[0] if len(eigenvalues) > 0 else 0
+            max_eig = eigenvalues[-1] if len(eigenvalues) > 0 else 0
+            cond_num = max_eig / min_eig if min_eig > 1e-10 else np.inf
+        
+        # 2. Scale mismatch (using uniform avg synth mean as proxy; oracle would use w*)
+        mean_treated = np.mean(y_treated_k)
+        mean_synth_uniform = np.mean(np.mean(y_control_k, axis=0))  # Avg donor mean
+        sd_treated = np.std(y_treated_k)
+        scale_mismatch = abs(mean_treated - mean_synth_uniform) / max(sd_treated, 1e-10)
+        
+        detail = {
+            'cond_num': cond_num,
+            'scale_mismatch': scale_mismatch,
+            'cond_pass': np.isfinite(cond_num) and cond_num <= cond_threshold,
+            'scale_pass': scale_mismatch <= scale_mismatch_threshold
+        }
+        checks['details'][outcome_name] = detail
+        checks['passes'] &= detail['cond_pass'] and detail['scale_pass']
+        
+        if verbose:
+            if not detail['cond_pass']:
+                print(f"Warning: High condition number for {outcome_name}: {cond_num:.2f} (> {cond_threshold})")
+            if not detail['scale_pass']:
+                print(f"Warning: Scale mismatch for {outcome_name}: {scale_mismatch:.2f} (> {scale_mismatch_threshold})")
+    
+    if verbose and checks['passes']:
+        print("Post-prune diagnostics passed for Assumption 5.")
+    
+    if not checks['passes']:
+        raise ValueError("Post-prune checks failed. Review donor selection or pre_range.")
+    
+    return checks
 
 """
 Executes a complete Bayesian Synthetic Control Model (BSCM) analysis.
@@ -167,6 +317,20 @@ def estimate(
     dataset['value'] = (dataset['value'] - dataset['avg_value']) / dataset['std_value']
     dataset.drop(columns=['avg_value', 'std_value'], inplace=True)
 
+    # Separate the control unit data.
+    control_df = dataset[dataset['treatment'] == 0]
+    # Get sorted lists of unique control unit IDs and outcome names.
+    unitids = sorted(control_df['unitid'].unique())
+    outcomes = sorted(dataset['outcome'].unique())
+    N_outcomes = len(outcomes)
+
+    if len(unitids) >= 2:
+        resp = post_prune_checks(
+            dataset = dataset,
+            pre_range = range(timeid_inicio, timeid_base + 1)
+        )
+        print(resp)
+
     # 3. PREPARE DATA FOR STAN
     # -----------------------------------------------------------------------------
     # Define a helper function to pivot the data from long format to wide format.
@@ -193,13 +357,6 @@ def estimate(
     # Create data matrices for the treated unit for the pre-treatment training period and the test period.
     Y_treated_pre = pivot_and_extract(treated_df, range(timeid_inicio, timeid_base - test_period_size + 1))
     Y_treated_test = pivot_and_extract(treated_df, range(timeid_base - test_period_size + 1, timeid_base + 1))
-
-    # Separate the control unit data.
-    control_df = dataset[dataset['treatment'] == 0]
-    # Get sorted lists of unique control unit IDs and outcome names.
-    unitids = sorted(control_df['unitid'].unique())
-    outcomes = sorted(dataset['outcome'].unique())
-    N_outcomes = len(outcomes)
 
     # Define a function to create a list of matrices, one for each outcome.
     # Each matrix will have time periods as rows and control units as columns.
