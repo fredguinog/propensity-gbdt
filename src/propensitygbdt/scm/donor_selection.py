@@ -65,93 +65,119 @@ warnings.simplefilter(action='ignore', category=FutureWarning)
 warnings.simplefilter(action='ignore', category=DeprecationWarning)
 
 """
-Filters the maximum number of non-multicollinear donors using greedy forward selection.
+Calculates the Gram condition number of the shapes of time series for multiple outcomes.
 
-This function is fully invariant to the level (mean) and scale (variance) of the
-donor data, focusing only on the shape of the time series to detect collinearity.
+This function isolates the shape of the time series by taking the first difference.
+It then computes the condition number of the Gram matrix of these differenced series
+for each outcome, providing a measure of shape multicollinearity among control units.
 
-It uses two checks:
-1.  **Pairwise Pearson Correlation:** Ensures no two selected donors are too similarly shaped.
-2.  **Gram Matrix Condition Number:** Ensures the entire set of selected donors is not
-    collectively multicollinear.
+Args:
+    df: A long format pandas DataFrame with the following columns:
+        'treatment': A binary indicator (0 for control, 1 for treated).
+        'timeid': The time period identifier.
+        'unitid': The unit identifier.
+        'outcome': The name of the outcome variable.
+        'value': The value of the outcome.
+
+Returns:
+    A pandas DataFrame with the Gram condition number for each outcome.
+"""
+def calculate_gram_cond_by_shape(df: pd.DataFrame) -> pd.DataFrame:
+    # Ensure the DataFrame is sorted for differencing
+    df = df.sort_values(by=['outcome', 'unitid', 'timeid']).reset_index(drop=True)
+
+    # Isolate control units
+    control_df = df[df['treatment'] == 0].copy()
+
+    # Calculate the first difference of the 'value' for each unit and outcome
+    # This transformation focuses on the shape of the time series
+    control_df['value_diff'] = control_df.groupby(['unitid', 'outcome'])['value'].diff()
+
+    # Pivot the table to have time series of control units as columns for each outcome
+    # Drop rows with NaN values resulting from the differencing
+    pivot_df = control_df.dropna().pivot_table(
+        index=['outcome', 'timeid'],
+        columns='unitid',
+        values='value_diff'
+    )
+
+    # Group by outcome to calculate the Gram condition number for each
+    results = []
+    for outcome, group_df in pivot_df.groupby(level='outcome'):
+        # The matrix of differenced time series for the control units
+        X = group_df.values
+        
+        # Calculate the condition number of the Gram matrix (X.T @ X)
+        # Using np.linalg.cond on X directly is more numerically stable and efficient
+        # as it computes the ratio of the largest to smallest singular values of X,
+        # the square of which is the condition number of X.T @ X.
+        if X.shape[1] > 0:
+            cond_number = np.linalg.cond(X) ** 2
+            results.append({'outcome': outcome, 'gram_cond': cond_number})
+
+    return pd.DataFrame(results)
+
+"""
+Finds a near-optimal large set of donors under a pairwise correlation constraint.
+
+This function finds a large Independent Set on a
+"conflict graph" where an edge exists between donors with a correlation
+above the threshold. It uses a greedy heuristic that prioritizes selecting
+donors with the fewest conflicts.
+
+This method is deterministic and often more effective than randomized greedy selection.
 
 Parameters:
 -----------
 X : array-like, shape (T, K*M)
-    Donor time series matrix. For multiple outcomes (M), columns must be concatenated per donor.
+    Donor time series matrix.
 n_outcomes : int
-    The number of outcome variables (M) per donor, required to interpret the shape of X.
-collinear_threshold : float, default=0.85
+    The number of outcome variables (M) per donor.
+correlation_threshold : float, default=0.5
     Maximum absolute Pearson correlation allowed between any two selected donors.
-max_cond : float, default=500.0
-    Maximum condition number of the correlation matrix for the selected donors.
-seed : int, optional
-    Seed for the random number generator to ensure a reproducible selection order.
 
 Returns:
 --------
 selected_indices : list of int
-    Indices (from 0 to K-1) of the selected subset of donors.
-gram_cond : float
-    Condition number of the final selected donor matrix (inf if empty, 1.0 for a single donor).
-selected_size : int
-    The number of selected donors.
+    A large, nearly-optimal set of donor indices satisfying the constraint.
 """
-def filter_donors_by_collinearity(X, n_outcomes, collinear_threshold=0.85, max_cond=100.0, seed=None):
-
-    if seed is not None:
-        np.random.seed(seed)
+def maximize_uncorrelated_set(X, n_outcomes, correlation_threshold=0.7):
+    if not 0 < correlation_threshold < 1:
+        raise ValueError("correlation_threshold must be between 0 and 1.")
 
     T, total_cols = X.shape
-
     if total_cols % n_outcomes != 0:
         raise ValueError(f"Total columns in X ({total_cols}) must be divisible by n_outcomes ({n_outcomes}).")
     K = total_cols // n_outcomes
-    
-    # Reshape X so each column is the full time series for one donor (across all outcomes)
+
+    # 1. Compute donor-donor correlation matrix
     X_reshaped = X.reshape(T * n_outcomes, K)
-
-    # --- Fully Invariant Pairwise Check ---
-    # Compute the donor-donor Pearson correlation matrix.
-    # This is invariant to both level and scale.
-    # np.corrcoef expects variables as rows, so we pass the transpose of our reshaped X.
     corr_matrix = np.corrcoef(X_reshaped.T)
-    np.fill_diagonal(corr_matrix, 0) # Exclude self-correlation from checks
+    np.fill_diagonal(corr_matrix, 0)
 
-    # Create a randomized order for evaluating donors to avoid bias
-    order = list(range(K))
-    np.random.shuffle(order)
+    # 2. Binary conflict matrix (True = too correlated)
+    conflict_matrix = np.abs(corr_matrix) >= correlation_threshold
 
-    # --- Greedy selection loop ---
+    # 3. Degrees (number of conflicts)
+    degrees = conflict_matrix.sum(axis=1)
+
+    # 4. Greedy selection using masking (no dicts or Python loops)
     selected = []
-    for idx in order:
-        # Check 1: Pairwise collinearity using Pearson correlation
-        if any(abs(corr_matrix[idx, sel]) >= collinear_threshold for sel in selected):
-            continue
+    available = np.ones(K, dtype=bool)
 
-        # Check 2: Overall multicollinearity via condition number
-        temp_indices = selected + [idx]
-        if len(temp_indices) > 1:
-            temp_X = X_reshaped[:, temp_indices]
-            # Standardize columns for a scale-invariant condition number calculation
-            temp_X_std = (temp_X - temp_X.mean(axis=0)) / (temp_X.std(axis=0) + 1e-9)
-            gram_temp = temp_X_std.T @ temp_X_std
-            if np.linalg.cond(gram_temp) > max_cond:
-                continue
+    while np.any(available):
+        # Pick node with fewest conflicts among available
+        idxs = np.where(available)[0]
+        degs = degrees[idxs]
+        best_idx = idxs[np.argmin(degs)]
+        selected.append(best_idx)
 
-        selected.append(idx)
+        # Remove this node and all its conflicts from availability
+        to_remove = conflict_matrix[best_idx] | (np.arange(K) == best_idx)
+        available[to_remove] = False
 
-    # --- Compute final metrics for the selected set ---
-    selected_size = len(selected)
-    if selected_size <= 1:
-        gram_cond = 1.0 if selected_size == 1 else np.inf
-    else:
-        final_X = X_reshaped[:, selected]
-        final_X_std = (final_X - final_X.mean(axis=0)) / (final_X.std(axis=0) + 1e-9)
-        gram_final = final_X_std.T @ final_X_std
-        gram_cond = np.linalg.cond(gram_final)
+    return np.sort(selected)
 
-    return selected, gram_cond
 
 """
 Calculates a single set of optimal weights for a synthetic control group
@@ -365,6 +391,9 @@ maximum_num_units_on_support_first_filter : int, optional
 maximum_error_pre_intervention : float, optional
     The maximum acceptable error (e.g., RMSE or MAE) on the pre-treatment outcomes for a
     candidate donor pool to be saved. Defaults to 0.15.
+gram_cond_max_acceptable : float, optional
+    The maximum accetaple Gram condition between all outcome variables of the donor set candidate.
+    Defaults to 100.0
 include_impact_score_in_optuna_objective : bool, optional
     Flag to include or not the impact score in the Optuna's search criteria. Defaults to False.
 number_optuna_trials : int, optional
@@ -387,6 +416,7 @@ def search(
     seed = 111,
     maximum_num_units_on_support_first_filter = 50,
     maximum_error_pre_intervention = 0.15,
+    gram_cond_max_acceptable = 100.0,
     include_impact_score_in_optuna_objective = False,
     number_optuna_trials = 1000,
     timeout_optuna_cycle = 900
@@ -567,7 +597,8 @@ def search(
     scm_donor_selection_candidate_units_data['error_valid'] = None
     scm_donor_selection_candidate_units_data['error_pre_intervention'] = None
     scm_donor_selection_candidate_units_data['error_post_intervention'] = None
-    scm_donor_selection_candidate_units_data['impact_score'] = None    
+    scm_donor_selection_candidate_units_data['impact_score'] = None
+    scm_donor_selection_candidate_units_data['gram_cond_max'] = None
     scm_donor_selection_candidate_units_data['num_units_bigger_min_weight'] = None
     scm_donor_selection_candidate_units_data.to_csv(scm_donor_selection_candidate_units_data_file_path, mode='w', header=True, index=False)
 
@@ -581,7 +612,8 @@ def search(
     scm_donor_selection_candidate_performance['error_valid'] = None
     scm_donor_selection_candidate_performance['error_pre_intervention'] = None
     scm_donor_selection_candidate_performance['error_post_intervention'] = None
-    scm_donor_selection_candidate_performance['impact_score'] = None    
+    scm_donor_selection_candidate_performance['impact_score'] = None
+    scm_donor_selection_candidate_performance['gram_cond_max'] = None
     scm_donor_selection_candidate_performance['num_units_bigger_min_weight'] = None
     scm_donor_selection_candidate_performance.to_csv(scm_donor_selection_candidate_performance_file_path, mode='w', header=True, index=False)
 
@@ -733,12 +765,15 @@ def search(
             # Select non multicollinearity control units
             donor_unitids = datat[datat['treatment'] == 0]['unitid'].unique()
             data2 = datat[datat['unitid'].isin([treatment_unitid] + list(donor_unitids))].copy()
-            donor_df = data2[data2['treatment'] == 0].copy()
+            donor_df = data2[(data2['treatment'] == 0) & (data2['timeid'].isin(self.timeid_train + self.timeid_valid))].copy()
             pivot_donor = donor_df.pivot(index='timeid', columns=['unitid', 'outcome'], values='value')
-            column_order = pd.MultiIndex.from_product([donor_unitids, outcomes], names=['unitid', 'outcome'])
-            pivot_donor = pivot_donor.reindex(columns=column_order, fill_value=0)  # Fill NAs if sparse
-            selected_donors, gram_cond = filter_donors_by_collinearity(X=pivot_donor.values, n_outcomes=len(outcomes), collinear_threshold=0.85, max_cond=100.0, seed=(attempt + seed))
-            # CHECK IF selected_donors ARE IN CACHE AND SKIP IF FOUND
+            selected_donors = maximize_uncorrelated_set(
+                X=pivot_donor.values,
+                n_outcomes=len(outcomes),
+                correlation_threshold=0.7
+            )
+            
+            # Uses cache to speed up the process
             combination_tuple = tuple(sorted(donor_unitids[selected_donors]))
             if combination_tuple in estimated_solutions:
                 (error_valid, error_pre_intervention, impact_score) = estimated_solutions[combination_tuple]
@@ -789,38 +824,45 @@ def search(
                 # Evaluate the performance of this candidate donor pool.
                 error_train, error_valid, error_pre_intervention, error_post_intervention, impact_score = self.evaluate_outcomes_metric(data=data2)
 
-                if error_pre_intervention < maximum_error_pre_intervention and gram_cond <= 100 and current_combination_tuple and current_combination_tuple not in estimated_solutions:
+                if error_pre_intervention < maximum_error_pre_intervention and current_combination_tuple and current_combination_tuple not in estimated_solutions:
                     current_ipw.drop
                     temp, data = dataset.full_data_treatment_control_scaling(current_ipw)
-                    # Save the donor units, weights and performance metrics of this viable solution.
-                    data = data[data['treatment'] == 0]
-                    data['valor_m_weight'] = data['value'] * data['weight']
-                    data['cycle'] = cycle
-                    data['trial'] = pruning_trial.number
-                    data['solution_id'] = solution_id
-                    data['error_train'] = error_train
-                    data['error_valid'] = error_valid
-                    data['error_pre_intervention'] = error_pre_intervention
-                    data['error_post_intervention'] = error_post_intervention
-                    data['impact_score'] = impact_score
-                    data['num_units_bigger_min_weight'] = num_units_bigger_min_weight
-                    columns = ['outcome', 'timeid', 'value', 'treatment', 'weight', 'unitid', 'valor_m_weight', 'id', 'cycle', 'trial', 'solution_id', 'error_train', 'error_valid', 'error_pre_intervention', 'error_post_intervention', 'impact_score', 'num_units_bigger_min_weight']
-                    data[columns].to_csv(scm_donor_selection_candidate_units_data_file_path, mode='a', header=False, index=False)
 
-                    # Save the weights and performance metrics of this viable solution.
-                    temp = temp[temp['treatment'] == 0]
-                    temp['cycle'] = cycle
-                    temp['trial'] = pruning_trial.number
-                    temp['solution_id'] = solution_id
-                    temp['error_train'] = error_train
-                    temp['error_valid'] = error_valid
-                    temp['error_pre_intervention'] = error_pre_intervention
-                    temp['error_post_intervention'] = error_post_intervention
-                    temp['impact_score'] = impact_score                        
-                    temp['num_units_bigger_min_weight'] = num_units_bigger_min_weight
-                    temp.to_csv(scm_donor_selection_candidate_performance_file_path, mode='a', header=False, index=False)
+                    gram_cond_df = calculate_gram_cond_by_shape(df = data[(data['treatment'] == 0) & (data['timeid'].isin(self.timeid_train + self.timeid_valid))])
+                    gram_cond_max = gram_cond_df['gram_cond'].max()
 
-                    solution_id = solution_id + 1
+                    if gram_cond_max <= gram_cond_max_acceptable: 
+                        # Save the donor units, weights and performance metrics of this viable solution.
+                        data = data[data['treatment'] == 0]
+                        data['valor_m_weight'] = data['value'] * data['weight']
+                        data['cycle'] = cycle
+                        data['trial'] = pruning_trial.number
+                        data['solution_id'] = solution_id
+                        data['error_train'] = round(error_train, 3)
+                        data['error_valid'] = round(error_valid, 3)
+                        data['error_pre_intervention'] = round(error_pre_intervention, 3)
+                        data['error_post_intervention'] = round(error_post_intervention, 3)
+                        data['impact_score'] = round(impact_score, 4)
+                        data['gram_cond_max'] = round(gram_cond_max, 0)
+                        data['num_units_bigger_min_weight'] = num_units_bigger_min_weight
+                        columns = ['outcome', 'timeid', 'value', 'treatment', 'weight', 'unitid', 'valor_m_weight', 'id', 'cycle', 'trial', 'solution_id', 'error_train', 'error_valid', 'error_pre_intervention', 'error_post_intervention', 'impact_score', 'gram_cond_max', 'num_units_bigger_min_weight']
+                        data[columns].to_csv(scm_donor_selection_candidate_units_data_file_path, mode='a', header=False, index=False)
+
+                        # Save the weights and performance metrics of this viable solution.
+                        temp = temp[temp['treatment'] == 0]
+                        temp['cycle'] = cycle
+                        temp['trial'] = pruning_trial.number
+                        temp['solution_id'] = solution_id
+                        temp['error_train'] = round(error_train, 3)
+                        temp['error_valid'] = round(error_valid, 3)
+                        temp['error_pre_intervention'] = round(error_pre_intervention, 3)
+                        temp['error_post_intervention'] = round(error_post_intervention, 3)
+                        temp['impact_score'] = round(impact_score, 4)
+                        temp['gram_cond_max'] = round(gram_cond_max, 0)
+                        temp['num_units_bigger_min_weight'] = num_units_bigger_min_weight
+                        temp.to_csv(scm_donor_selection_candidate_performance_file_path, mode='a', header=False, index=False)
+
+                        solution_id = solution_id + 1
 
                 # Save in cache the current found solution and its simplified version
                 if current_combination_tuple and current_combination_tuple not in estimated_solutions:
