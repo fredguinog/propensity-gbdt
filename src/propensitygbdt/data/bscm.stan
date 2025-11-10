@@ -39,7 +39,7 @@
 data {
   // --- Dimensions ---
   int<lower=1> N_pre;       // Number of pre-treatment train time periods
-  int<lower=1> N_test;       // Number of pre-tratment test time periods
+  int<lower=1> N_test;      // Number of pre-treatment test time periods
   int<lower=0> N_post;      // Number of post-treatment time periods
   int<lower=1> N_controls;  // Number of control units in the donor pool
   int<lower=1> N_outcomes;  // Number of outcome variables to fit simultaneously

@@ -57,157 +57,229 @@ import arviz as az
 from importlib import resources
 import shutil
 from scipy.linalg import eigh
+from scipy.optimize import minimize
 import warnings
 # Suppress warnings to keep the output clean.
 warnings.filterwarnings("ignore")
 
 """
-Perform post-pruning diagnostics for Assumption 5 (scale similarity, conditioning).
-
-Verifies:
+Perform post-pruning diagnostics (shape-only: conditioning and variance certificate).
+Verifies (shape-invariant):
 - Gram matrix condition number < threshold (for structural conditioning).
-- Scale mismatch |mean_treated - mean_synth| / sd_treated < threshold.
-
+- Variance Certificate: block-bootstrap lower bound on minimal synthetic variance.
 Args:
     dataset: Filtered dataset with 'outcome', 'timeid', 'value', 'treatment', 'unitid'.
     pre_range: List of integer timeids for pre-period (e.g., [1,2,3,4]); must have ≥2 points.
-    cond_threshold: Max condition number (e.g., 1500).
-    scale_mismatch_threshold: Max scale mismatch (e.g., 0.2).
+    cond_threshold: Max condition number (e.g., 100).
+    B: Bootstrap iterations for variance certificate (e.g., 100).
     verbose: Print warnings if True.
-
 Returns:
     dict: Summary of checks (passes: bool, details: dict per outcome).
-
 Raises:
     ValueError: If checks fail critically or inputs invalid (e.g., empty pre_range).
 """
 def post_prune_checks(
     dataset: pd.DataFrame,
     pre_range: list,
-    cond_threshold: float = 500.0,
-    scale_mismatch_threshold: float = 0.2,
+    cond_threshold: float = 100.0,
+    B: int = 100,
     verbose: bool = True
 ):
     if not pre_range or len(pre_range) < 2:
         raise ValueError("pre_range must be non-empty with ≥2 time points for covariance.")
-    
+ 
+    # Ensure timeid is numeric
+    dataset = dataset.copy()
+    dataset['timeid'] = pd.to_numeric(dataset['timeid'])
+ 
     # Filter to treated and selected controls (assumes dataset already solution_id-filtered)
     treated_df = dataset[dataset['treatment'] == 1].copy()
     control_df = dataset[dataset['treatment'] == 0].copy()
-    
+ 
     if treated_df.empty or control_df.empty:
         raise ValueError("Dataset must include at least one treated and one control unit.")
-    
-    # Map timeid to int (1-based) for BOTH DFs; assume timeid is string, convert to cat consistently
-    all_timeids = pd.Categorical(dataset['timeid'])
-    timeid_to_int = {cat: i+1 for i, cat in enumerate(all_timeids.categories)}
-    
-    treated_df['timeid_int'] = treated_df['timeid'].map(timeid_to_int)
-    control_df['timeid_int'] = control_df['timeid'].map(timeid_to_int)
-    
-    # Filter to pre_range early (int comparison)
-    pre_range_set = set(pre_range)  # For fast lookup
-    treated_df = treated_df[treated_df['timeid_int'].isin(pre_range_set)]
-    control_df = control_df[control_df['timeid_int'].isin(pre_range_set)]
-    
+ 
+    # Check for single treated unit
+    treated_units = treated_df['unitid'].unique()
+    if len(treated_units) > 1:
+        if verbose:
+            print(f"Warning: Multiple treated units detected ({len(treated_units)}); aggregating across them.")
+ 
+    # Filter to pre_range using original timeid (fast lookup)
+    pre_range_set = set(pre_range)
+    treated_df = treated_df[treated_df['timeid'].isin(pre_range_set)].sort_values('timeid')
+    control_df = control_df[control_df['timeid'].isin(pre_range_set)].sort_values('timeid')
+ 
     outcomes = sorted(dataset['outcome'].unique())
     if not outcomes:
         raise ValueError("No outcomes found in dataset.")
-    
-    # Pivot helper for pre-data (now assumes pre-filtered DF)
-    def pivot_pre(df, outcomes):
+ 
+    # Pivot helper for pre-data (assumes pre-filtered DF, timeid as index)
+    def pivot_pre(df, outcomes, is_treated=True):
         if df.empty:
             return pd.DataFrame(index=[], columns=outcomes)
-        # Pivot: time x outcomes (wide)
-        pivoted = df.pivot_table(
-            index='timeid_int', columns='outcome', values='value'
-        ).reset_index(drop=True)[outcomes]  # Select outcomes only; fill NaN if sparse
-        pivoted = pivoted.fillna(pivoted.mean())  # Optional: Impute means for sparse
+        if is_treated:
+            # For treated: aggregate across units if multiple, time x outcomes
+            agg_df = df.groupby(['timeid', 'outcome'])['value'].mean().reset_index()
+            pivoted = agg_df.pivot(index='timeid', columns='outcome', values='value')[outcomes]
+        else:
+            # For controls: time x units per outcome (but we'll handle per outcome later)
+            return df
+        pivoted = pivoted.fillna(pivoted.mean(axis=0)) # Impute column means for sparse
         return pivoted
-    
-    # Get pre-data matrices (time x outcomes for treated; time x controls per outcome for controls)
-    Y_treated_pre = pivot_pre(treated_df, outcomes)
+ 
+    # Get pre-data for treated (time x outcomes)
+    Y_treated_pre = pivot_pre(treated_df, outcomes, is_treated=True)
     if Y_treated_pre.empty or Y_treated_pre.shape[0] < 2:
         raise ValueError("Insufficient pre-data for treated unit (need ≥2 time points).")
-    
-    Y_control_pre = []  # List of (time x controls) per outcome
+ 
+    # For controls: prepare per outcome
     unitids = sorted(control_df['unitid'].unique())
     N_controls = len(unitids)
-    if N_controls == 0 or N_controls < 2:
-        raise ValueError("Need ≥2 control units for Gram matrix.")
-    
+ 
+    Y_control_pre = [] # List of (time x controls) per outcome
     for outcome in outcomes:
         outcome_df = control_df[control_df['outcome'] == outcome]
         if outcome_df.empty:
             Y_control_pre.append(np.empty((0, N_controls)))
             continue
+        # Pivot: time x controls
         control_pivoted = outcome_df.pivot_table(
-            index='timeid_int', columns='unitid', values='value'
-        ).reindex(columns=unitids).reset_index(drop=True)  # Time rows, control cols
-        control_pivoted = control_pivoted.fillna(control_pivoted.mean())  # Impute for sparse
+            index='timeid', columns='unitid', values='value'
+        ).reindex(columns=unitids).fillna(method='ffill').fillna(method='bfill') # Better imputation for time series
+        # Drop units with too many NaNs (>50% missing)
+        missing_frac = control_pivoted.isnull().mean(axis=0)
+        good_units = missing_frac < 0.5
+        if not good_units.any():
+            Y_control_pre.append(np.empty((0, N_controls)))
+            continue
+        control_pivoted = control_pivoted.loc[:, good_units]
         Y_control_pre.append(control_pivoted.to_numpy())
-    
+ 
     N_outcomes = len(outcomes)
-    N_pre = Y_treated_pre.shape[0]
-    
+ 
     checks = {'passes': True, 'details': {}}
-    
+ 
     for k in range(N_outcomes):
         outcome_name = outcomes[k]
         y_treated_k = Y_treated_pre.iloc[:, k].values
-        y_control_k = Y_control_pre[k]  # (N_pre x N_controls)
+        y_control_k = Y_control_pre[k] # (N_pre x N_controls)
+        current_N_controls = y_control_k.shape[1] if y_control_k.size > 0 else 0
+        current_N_pre_control = y_control_k.shape[0] if y_control_k.size > 0 else 0
+     
+        # Normalize trajectories for shape-only analysis (z-score each time series)
+        def normalize_ts(ts):
+            if len(ts) < 2:
+                return np.zeros_like(ts)
+            m = np.mean(ts)
+            s = np.std(ts)
+            if s > 1e-10:
+                return (ts - m) / s
+            else:
+                return np.zeros_like(ts)
         
-        if len(y_treated_k) < 2 or y_control_k.shape[0] < 2 or y_control_k.shape[1] < 2:
-            # Insufficient data for Gram (cov needs ≥2 obs/vars)
-            detail = {'cond_num': np.inf, 'scale_mismatch': np.inf, 'cond_pass': False, 'scale_pass': False}
+        y_treated_k = normalize_ts(y_treated_k)
+        if current_N_controls > 0:
+            for j in range(current_N_controls):
+                y_control_k[:, j] = normalize_ts(y_control_k[:, j])
+     
+        if current_N_controls == 0:
+            detail = {
+                'cond_num': np.inf,
+                'underline_sigma2': -np.inf,
+                'c_threshold': 0,
+                'cond_pass': False,
+                'var_cert_pass': False
+            }
             checks['details'][outcome_name] = detail
-            checks['passes'] = False
-            if verbose:
-                print(f"Warning: Insufficient data for {outcome_name} (N_pre={N_pre}, N_controls={N_controls}). Skipping Gram.")
+            checks['passes'] &= False
             continue
-        
+     
         # 1. Gram matrix condition number
-        # Gram: Covariance of donor trajectories (centered)
-        mean_k = np.mean(y_control_k, axis=0, keepdims=True)
-        centered_control = y_control_k - mean_k
-        gram = np.cov(centered_control.T)  # Controls x controls (var over time)
-        # Handle any lingering NaN (e.g., constant series)
-        gram = np.nan_to_num(gram, nan=np.inf)
-        if np.all(np.isinf(gram)):
-            cond_num = np.inf
+        # Gram: Covariance of donor trajectories (already normalized/centered)
+        if len(y_treated_k) >= 2 and current_N_pre_control >= 2 and current_N_controls >= 1:
+            mean_k = np.mean(y_control_k, axis=0, keepdims=True)
+            centered_control = y_control_k - mean_k
+            gram = np.cov(centered_control.T) # Controls x controls (var over time)
+            # Handle NaN/inf
+            gram = np.nan_to_num(gram, nan=0.0, posinf=0.0, neginf=0.0)
+            if np.all(gram == 0):
+                cond_num = np.inf
+            else:
+                eigenvalues = eigh(gram, eigvals_only=True)
+                min_eig = eigenvalues[0] if len(eigenvalues) > 0 else 0
+                max_eig = eigenvalues[-1] if len(eigenvalues) > 0 else 0
+                cond_num = max_eig / max(min_eig, 1e-10)
         else:
-            eigenvalues = eigh(gram, eigvals_only=True)
-            min_eig = eigenvalues[0] if len(eigenvalues) > 0 else 0
-            max_eig = eigenvalues[-1] if len(eigenvalues) > 0 else 0
-            cond_num = max_eig / min_eig if min_eig > 1e-10 else np.inf
-        
-        # 2. Scale mismatch (using uniform avg synth mean as proxy; oracle would use w*)
-        mean_treated = np.mean(y_treated_k)
-        mean_synth_uniform = np.mean(np.mean(y_control_k, axis=0))  # Avg donor mean
-        sd_treated = np.std(y_treated_k)
-        scale_mismatch = abs(mean_treated - mean_synth_uniform) / max(sd_treated, 1e-10)
-        
+            cond_num = np.inf
+     
+        # 2. Variance Certificate (per Lemma E.9, fixed bootstrap)
+        if current_N_controls >= 1 and len(y_treated_k) >= 2:
+            block_size = max(1, len(y_treated_k) // 5)
+            n_blocks = (len(y_treated_k) + block_size - 1) // block_size # Ceiling div for full coverage
+            vars_min = []
+            for _ in range(B):
+                # Block-bootstrap indices (resample blocks, concatenate to full N_pre)
+                block_indices = np.random.choice(n_blocks, n_blocks, replace=True)
+                boot_indices = []
+                for i in block_indices:
+                    start = (i * block_size) % len(y_treated_k)
+                    end = min(start + block_size, len(y_treated_k))
+                    boot_indices.extend(range(start, end))
+                    if len(boot_indices) < len(y_treated_k):
+                        # Wrap to fill if needed
+                        wrap_start = 0
+                        wrap_end = len(y_treated_k) - len(boot_indices)
+                        boot_indices.extend(range(wrap_start, wrap_end))
+                boot_indices = boot_indices[:len(y_treated_k)] # Truncate if over
+                # Bootstrap both treated and controls consistently
+                boot_y_treated = y_treated_k[boot_indices]
+                boot_y_control = y_control_k[boot_indices]
+                # Optimize w_b: min ||boot_y_treated - boot_y_control @ w||^2 s.t. sum w=1, w>=0
+                def qp_loss(w): return np.sum((boot_y_treated - boot_y_control @ w)**2)
+                initial_w = np.ones(current_N_controls) / current_N_controls
+                cons = {'type': 'eq', 'fun': lambda w: np.sum(w) - 1}
+                bounds = [(0, None)] * current_N_controls
+                res = minimize(qp_loss, initial_w, method='SLSQP', bounds=bounds, constraints=cons)
+                if res.success:
+                    w_b = res.x
+                    w_b /= np.sum(w_b) # Renormalize in case
+                else:
+                    w_b = initial_w
+                synth_var = np.var(boot_y_control @ w_b)
+                vars_min.append(synth_var)
+            min_var = np.min(vars_min)
+            se_min = np.std(vars_min) / np.sqrt(B)
+            underline_sigma2 = min_var - 1.96 * se_min
+            c = 0.1 * np.var(y_treated_k) # 10% of treated variance
+            var_cert_pass = underline_sigma2 >= max(c, 1e-10)
+        else:
+            underline_sigma2 = -np.inf
+            var_cert_pass = False
+     
         detail = {
             'cond_num': cond_num,
-            'scale_mismatch': scale_mismatch,
+            'underline_sigma2': underline_sigma2,
+            'c_threshold': c if 'c' in locals() else 0,
             'cond_pass': np.isfinite(cond_num) and cond_num <= cond_threshold,
-            'scale_pass': scale_mismatch <= scale_mismatch_threshold
+            'var_cert_pass': var_cert_pass
         }
         checks['details'][outcome_name] = detail
-        checks['passes'] &= detail['cond_pass'] and detail['scale_pass']
-        
+        # Shape-only: pass if cond and var_cert pass (ignores scale/sd mismatches)
+        checks['passes'] &= (detail['cond_pass'] and detail['var_cert_pass'])
+     
         if verbose:
             if not detail['cond_pass']:
                 print(f"Warning: High condition number for {outcome_name}: {cond_num:.2f} (> {cond_threshold})")
-            if not detail['scale_pass']:
-                print(f"Warning: Scale mismatch for {outcome_name}: {scale_mismatch:.2f} (> {scale_mismatch_threshold})")
-    
+            if not detail['var_cert_pass']:
+                print(f"Warning: Variance certificate failed for {outcome_name}: underline_sigma2={underline_sigma2:.4f} (< {detail['c_threshold']:.4f})")
+ 
     if verbose and checks['passes']:
-        print("Post-prune diagnostics passed for Assumption 5.")
-    
+        print("Post-prune diagnostics passed (shape-only).")
+ 
     if not checks['passes']:
-        raise ValueError("Post-prune checks failed. Review donor selection or pre_range.")
-    
+        raise ValueError("Post-prune checks failed (shape-only). Review donor selection or pre_range.")
+ 
     return checks
 
 """
@@ -234,13 +306,19 @@ Args:
                             Defaults to '{:.2f}'.
     seed (int, optional): A random seed to ensure reproducibility of the MCMC
                             sampling and other random processes. Defaults to 222.
+    cond_threshold (int, optional): Max condition number. Defaults to 100.
+    scale_mismatch_threshold (float, optional): Max scale mismatch. Defaults to 0.45.
+    sd_mismatch_threshold (float, optional): Max SD mismatch. Defaults to 0.45.
+    B (int, optional): Bootstrap iterations for variance certificate. Defaults to 100.
 """
 def estimate(
     timeid_previous_intervention,
     workspace_folder,
     solution_id = None,
     period_effect_format = '{:.2f}',
-    seed = 222
+    seed = 222,
+    cond_threshold: float = 100.0,
+    B: int = 100
 ):
     # Set the random seed for NumPy to ensure reproducibility of its random operations.
     np.random.seed(seed)
@@ -304,10 +382,13 @@ def estimate(
     timeid_base = np.where(mapping_timeid == timeid_previous_intervention)[0][0] + 1
     timeid_fim = dataset['timeid'].max()
 
+    # Define a "test" period using the last 20% of the pre-treatment data with minimum of 2. This period is used for model validation (e.g., calculating NRMSE).
+    test_period_size = max(2, int(0.2 * timeid_base))
+
     # Standardize the 'value' for each outcome (e.g., indicator) independently using only the pre-intervention period.
     # This is done by subtracting the mean and dividing by the standard deviation, calculated per outcome.
     # This puts all outcomes on a similar scale, which can improve model stability and performance.
-    treated_pre_df = dataset[dataset['timeid'] <= timeid_base]
+    treated_pre_df = dataset[dataset['timeid'] <= timeid_base - test_period_size]
     std_avg_dt = treated_pre_df.groupby('outcome')['value'].agg(['mean', 'std']).reset_index()
     std_avg_dt.rename(columns={'mean': 'avg_value', 'std': 'std_value'}, inplace=True)
     std_avg_dt['std_value'] = std_avg_dt['std_value'].clip(lower=1e-10)  # Avoid div0
@@ -321,15 +402,18 @@ def estimate(
     control_df = dataset[dataset['treatment'] == 0]
     # Get sorted lists of unique control unit IDs and outcome names.
     unitids = sorted(control_df['unitid'].unique())
+    print(f"Using unitids: {unitids}")
     outcomes = sorted(dataset['outcome'].unique())
     N_outcomes = len(outcomes)
 
-    if len(unitids) >= 2:
-        resp = post_prune_checks(
-            dataset = dataset,
-            pre_range = range(timeid_inicio, timeid_base + 1)
+    if len(unitids) > 1:
+        list_post_prunning_check = post_prune_checks(
+            dataset=dataset,
+            pre_range=range(timeid_inicio, timeid_base + 1),
+            cond_threshold=cond_threshold,
+            B=B
         )
-        print(resp)
+        print(list_post_prunning_check)
 
     # 3. PREPARE DATA FOR STAN
     # -----------------------------------------------------------------------------
@@ -350,9 +434,6 @@ def estimate(
     # Create the data matrices for the treated unit for the post-treatment period.
     Y_treated_post = pivot_and_extract(treated_df, range(timeid_base + 1, timeid_fim + 1))
     N_post = len(Y_treated_post)
-
-    # Define a "test" period using the last 20% of the pre-treatment data. This period is used for model validation (e.g., calculating NRMSE).
-    test_period_size = int(0.2 * timeid_base) if N_post > int(0.2 * timeid_base) else N_post
 
     # Create data matrices for the treated unit for the pre-treatment training period and the test period.
     Y_treated_pre = pivot_and_extract(treated_df, range(timeid_inicio, timeid_base - test_period_size + 1))
@@ -400,7 +481,7 @@ def estimate(
     'Y_control_test': Y_control_test,
     'Y_control_post': Y_control_post,
     'dirichlet_alpha': np.repeat(1.0, N_controls), # Hyperparameter for the Dirichlet prior on weights (uninformative).
-    'tau_nrmse_scale': 0.05 # Hyperparameter for the prior on the NRMSE noise term.
+    'tau_nrmse_scale': 0.1 # Hyperparameter for the prior on the NRMSE noise term.
     }
 
     # 4. FIT THE STAN MODEL

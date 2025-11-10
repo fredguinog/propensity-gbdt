@@ -48,11 +48,110 @@ causal inference.
 """
 
 from importlib import resources
+import os
+import shutil
 import numpy as np
 import pandas as pd
 import math
-from scipy.optimize import minimize
 import random
+from scipy import linalg as la
+from scipy.optimize import minimize
+import sys
+import xgboost as xgb
+xgb.set_config(verbosity=0)
+import optuna
+import warnings
+warnings.simplefilter(action='ignore', category=FutureWarning)
+warnings.simplefilter(action='ignore', category=DeprecationWarning)
+
+"""
+Filters the maximum number of non-multicollinear donors using greedy forward selection.
+
+This function is fully invariant to the level (mean) and scale (variance) of the
+donor data, focusing only on the shape of the time series to detect collinearity.
+
+It uses two checks:
+1.  **Pairwise Pearson Correlation:** Ensures no two selected donors are too similarly shaped.
+2.  **Gram Matrix Condition Number:** Ensures the entire set of selected donors is not
+    collectively multicollinear.
+
+Parameters:
+-----------
+X : array-like, shape (T, K*M)
+    Donor time series matrix. For multiple outcomes (M), columns must be concatenated per donor.
+n_outcomes : int
+    The number of outcome variables (M) per donor, required to interpret the shape of X.
+collinear_threshold : float, default=0.85
+    Maximum absolute Pearson correlation allowed between any two selected donors.
+max_cond : float, default=500.0
+    Maximum condition number of the correlation matrix for the selected donors.
+seed : int, optional
+    Seed for the random number generator to ensure a reproducible selection order.
+
+Returns:
+--------
+selected_indices : list of int
+    Indices (from 0 to K-1) of the selected subset of donors.
+gram_cond : float
+    Condition number of the final selected donor matrix (inf if empty, 1.0 for a single donor).
+selected_size : int
+    The number of selected donors.
+"""
+def filter_donors_by_collinearity(X, n_outcomes, collinear_threshold=0.85, max_cond=100.0, seed=None):
+
+    if seed is not None:
+        np.random.seed(seed)
+
+    T, total_cols = X.shape
+
+    if total_cols % n_outcomes != 0:
+        raise ValueError(f"Total columns in X ({total_cols}) must be divisible by n_outcomes ({n_outcomes}).")
+    K = total_cols // n_outcomes
+    
+    # Reshape X so each column is the full time series for one donor (across all outcomes)
+    X_reshaped = X.reshape(T * n_outcomes, K)
+
+    # --- Fully Invariant Pairwise Check ---
+    # Compute the donor-donor Pearson correlation matrix.
+    # This is invariant to both level and scale.
+    # np.corrcoef expects variables as rows, so we pass the transpose of our reshaped X.
+    corr_matrix = np.corrcoef(X_reshaped.T)
+    np.fill_diagonal(corr_matrix, 0) # Exclude self-correlation from checks
+
+    # Create a randomized order for evaluating donors to avoid bias
+    order = list(range(K))
+    np.random.shuffle(order)
+
+    # --- Greedy selection loop ---
+    selected = []
+    for idx in order:
+        # Check 1: Pairwise collinearity using Pearson correlation
+        if any(abs(corr_matrix[idx, sel]) >= collinear_threshold for sel in selected):
+            continue
+
+        # Check 2: Overall multicollinearity via condition number
+        temp_indices = selected + [idx]
+        if len(temp_indices) > 1:
+            temp_X = X_reshaped[:, temp_indices]
+            # Standardize columns for a scale-invariant condition number calculation
+            temp_X_std = (temp_X - temp_X.mean(axis=0)) / (temp_X.std(axis=0) + 1e-9)
+            gram_temp = temp_X_std.T @ temp_X_std
+            if np.linalg.cond(gram_temp) > max_cond:
+                continue
+
+        selected.append(idx)
+
+    # --- Compute final metrics for the selected set ---
+    selected_size = len(selected)
+    if selected_size <= 1:
+        gram_cond = 1.0 if selected_size == 1 else np.inf
+    else:
+        final_X = X_reshaped[:, selected]
+        final_X_std = (final_X - final_X.mean(axis=0)) / (final_X.std(axis=0) + 1e-9)
+        gram_final = final_X_std.T @ final_X_std
+        gram_cond = np.linalg.cond(gram_final)
+
+    return selected, gram_cond
 
 """
 Calculates a single set of optimal weights for a synthetic control group
@@ -266,8 +365,6 @@ maximum_num_units_on_support_first_filter : int, optional
 maximum_error_pre_intervention : float, optional
     The maximum acceptable error (e.g., RMSE or MAE) on the pre-treatment outcomes for a
     candidate donor pool to be saved. Defaults to 0.15.
-inferior_limit_maximum_donor_pool_size : int, optional
-    The minimum number of donors to be selected in any candidate pool. Defaults to 4.
 include_impact_score_in_optuna_objective : bool, optional
     Flag to include or not the impact score in the Optuna's search criteria. Defaults to False.
 number_optuna_trials : int, optional
@@ -290,7 +387,6 @@ def search(
     seed = 111,
     maximum_num_units_on_support_first_filter = 50,
     maximum_error_pre_intervention = 0.15,
-    inferior_limit_maximum_donor_pool_size = 4,
     include_impact_score_in_optuna_objective = False,
     number_optuna_trials = 1000,
     timeout_optuna_cycle = 900
@@ -300,42 +396,36 @@ def search(
         all_units.rename(columns={tname: 'timeid'}, inplace=True)
     else:
         print(f"The '{tname}' column does not exist in the dataframe.")
-        import sys
         sys.exit()
 
     if unitname in all_units.columns:
         all_units.rename(columns={unitname: 'unitid'}, inplace=True)
     else:
         print(f"The '{unitname}' column does not exist in the dataframe.")
-        import sys
         sys.exit()
 
     if yname in all_units.columns:
         all_units.rename(columns={yname: 'outcome'}, inplace=True)
     else:
         print(f"The '{yname}' column does not exist in the dataframe.")
-        import sys
         sys.exit()
 
     if value in all_units.columns:
         all_units.rename(columns={value: 'value'}, inplace=True)
     else:
         print(f"The '{value}' column does not exist in the dataframe.")
-        import sys
         sys.exit()
 
     if treatment in all_units.columns:
         all_units.rename(columns={treatment: 'treatment'}, inplace=True)
     else:
         print(f"The '{treatment}' column does not exist in the dataframe.")
-        import sys
         sys.exit()
 
     if pre_intervention in all_units.columns:
         all_units.rename(columns={pre_intervention: 'pre_intervention'}, inplace=True)
     else:
         print(f"The '{pre_intervention}' column does not exist in the dataframe.")
-        import sys
         sys.exit()
 
     # CHECK pre_intervention COULUMN AGAINST temporal_cross_search
@@ -344,17 +434,13 @@ def search(
         print("ERROR: temporal_cross_search MUST BE A SUBSET OF pre_intervention")
         print(f"temporal_cross_search: {sorted(temporal_cross_search)}")
         print(f"pre_intervention: {sorted(all_units[all_units['pre_intervention'] == 1]['timeid'].unique().tolist())}")
-        import sys
         sys.exit()
 
     # CHECH DIRECTORY EXISTS AND CREATE IT IF NOT
-    import os
     if not os.path.exists(workspace_folder):
         os.makedirs(workspace_folder)
         print(f"Created workspace folder: {workspace_folder}")
-
-    from importlib import resources
-    import shutil
+   
     file_path = resources.files('propensitygbdt.data').joinpath('scm_donor_selection_candidate_performance.xlsx')
     try:
         with resources.as_file(file_path) as source_path:
@@ -411,15 +497,6 @@ def search(
     if include_impact_score_in_optuna_objective:
         hyperparameter_search_extra_criteria.append('post_intervention_period')
 
-    import os
-    import sys
-    import xgboost as xgb
-    xgb.set_config(verbosity=0)
-    import optuna
-    import warnings
-    warnings.simplefilter(action='ignore', category=FutureWarning)
-    warnings.simplefilter(action='ignore', category=DeprecationWarning)
-
     scm_donor_selection_candidate_units_data_file_path = workspace_folder + 'scm_donor_selection_candidate_units_data.csv'
     if os.path.exists(scm_donor_selection_candidate_units_data_file_path):
         os.remove(scm_donor_selection_candidate_units_data_file_path)
@@ -427,13 +504,6 @@ def search(
     scm_donor_selection_candidate_performance_file_path = workspace_folder + 'scm_donor_selection_candidate_performance.csv'
     if os.path.exists(scm_donor_selection_candidate_performance_file_path):
         os.remove(scm_donor_selection_candidate_performance_file_path)
-
-    superior_limit_maximum_donor_pool_size = math.floor(np.sqrt(len(timeid_pre_intervention)))
-    if superior_limit_maximum_donor_pool_size < inferior_limit_maximum_donor_pool_size:
-        if len(timeid_pre_intervention) < 6:
-            raise ValueError("Insufficient pre-data (need ≥6 time points).")
-        else:
-            superior_limit_maximum_donor_pool_size = inferior_limit_maximum_donor_pool_size
 
     all_units.sort_values(by=['unitid', 'timeid', 'outcome'], inplace=True)
     all_units['weight'] = 1.0
@@ -499,7 +569,6 @@ def search(
     scm_donor_selection_candidate_units_data['error_post_intervention'] = None
     scm_donor_selection_candidate_units_data['impact_score'] = None    
     scm_donor_selection_candidate_units_data['num_units_bigger_min_weight'] = None
-    scm_donor_selection_candidate_units_data['num_units_max_weight'] = None
     scm_donor_selection_candidate_units_data.to_csv(scm_donor_selection_candidate_units_data_file_path, mode='w', header=True, index=False)
 
     # Initialize CSV files for storing performance results with headers.
@@ -514,7 +583,6 @@ def search(
     scm_donor_selection_candidate_performance['error_post_intervention'] = None
     scm_donor_selection_candidate_performance['impact_score'] = None    
     scm_donor_selection_candidate_performance['num_units_bigger_min_weight'] = None
-    scm_donor_selection_candidate_performance['num_units_max_weight'] = None
     scm_donor_selection_candidate_performance.to_csv(scm_donor_selection_candidate_performance_file_path, mode='w', header=True, index=False)
 
     class Dataset:
@@ -648,19 +716,13 @@ def search(
             min_weight_observations = ipw[(ipw['treatment'] == 0) & (ipw['weight'] > min_weight)]
             num_units_bigger_min_weight = min_weight_observations.shape[0]
 
-            max_weight = ipw[ipw['treatment'] == 0]['weight'].max()
-            max_weight_observations = ipw[(ipw['treatment'] == 0) & (ipw['weight'] == max_weight)]
-            num_units_max_weight = max_weight_observations.shape[0]
-
-            maximum_donor_pool_size = possible_donor_pool_size[attempt % possible_donor_pool_size_num_items]
-
-            if num_units_max_weight > maximum_num_units_on_support_first_filter:
+            if num_units_bigger_min_weight > maximum_num_units_on_support_first_filter or num_units_bigger_min_weight == 0:
                 error_valid = float('inf')
                 error_pre_intervention = float('inf')
                 impact_score = float('inf')
                 return error_valid, error_pre_intervention, impact_score
             
-            ipw = pd.concat([ipw[ipw['treatment'] != 0], ipw[ipw['treatment'] == 0].sort_values(['weight', 'id'], ascending=[False, True])[0:num_units_max_weight]], ignore_index=True)
+            ipw = pd.concat([ipw[ipw['treatment'] != 0], ipw[ipw['treatment'] == 0].sort_values(['weight', 'id'], ascending=[False, True])[0:num_units_bigger_min_weight]], ignore_index=True)
 
             full_data = self.full_data.copy()
             depara = pd.merge(ipw, self.from_to, on='id', how='inner')
@@ -668,59 +730,53 @@ def search(
             datat = pd.merge(full_data, depara, on='unitid', how='left').reset_index()
             datat = datat[datat['weight'].notna()]
 
+            # Select non multicollinearity control units
             donor_unitids = datat[datat['treatment'] == 0]['unitid'].unique()
-
-            if len(donor_unitids) < maximum_donor_pool_size:
-                unitid_combination = donor_unitids
-            else:
-                random.seed(attempt + seed)
-                unitid_combination = np.random.choice(a=donor_unitids, size=maximum_donor_pool_size, replace=False)
-
-            combination_tuple = tuple(sorted(unitid_combination))
-            current_combination_tuple = tuple()
-            # Save time checking whether or not this solution already has been estimated
+            data2 = datat[datat['unitid'].isin([treatment_unitid] + list(donor_unitids))].copy()
+            donor_df = data2[data2['treatment'] == 0].copy()
+            pivot_donor = donor_df.pivot(index='timeid', columns=['unitid', 'outcome'], values='value')
+            column_order = pd.MultiIndex.from_product([donor_unitids, outcomes], names=['unitid', 'outcome'])
+            pivot_donor = pivot_donor.reindex(columns=column_order, fill_value=0)  # Fill NAs if sparse
+            selected_donors, gram_cond = filter_donors_by_collinearity(X=pivot_donor.values, n_outcomes=len(outcomes), collinear_threshold=0.85, max_cond=100.0, seed=(attempt + seed))
+            # CHECK IF selected_donors ARE IN CACHE AND SKIP IF FOUND
+            combination_tuple = tuple(sorted(donor_unitids[selected_donors]))
             if combination_tuple in estimated_solutions:
                 (error_valid, error_pre_intervention, impact_score) = estimated_solutions[combination_tuple]
             else:
-                data2 = datat[datat['unitid'].isin([treatment_unitid] + list(unitid_combination))].copy()
-                if maximum_donor_pool_size == 1:
-                    current_ipw = data2[['id','treatment','weight']].drop_duplicates().copy()
-                    current_ipw = pd.concat([current_ipw[current_ipw['treatment'] != 0], current_ipw[current_ipw['treatment'] == 0].sort_values(['weight', 'id'], ascending=[False, True])[0:maximum_donor_pool_size]], ignore_index=True)
-                else:
-                    df = data2.sort_values(by=['treatment', 'timeid', 'unitid', 'outcome']).reset_index(drop=True)
-                    df = df[df['timeid'].isin(self.timeid_train + self.timeid_valid)]
-                    treated_outcome_df = df[df['treatment'] == 1].copy()
-                    treated_outcome_pivot = treated_outcome_df.pivot_table(
-                        index='timeid',
-                        columns='outcome',
-                        values='value'
-                    )
-                    treated_outcome_data = treated_outcome_pivot.to_numpy()
+                data2 = data2[(data2['treatment'] != 0) | (data2['unitid'].isin(donor_unitids[selected_donors]))]
 
-                    control_outcome_df = df[df['treatment'] == 0].copy()
-                    control_outcome_pivot = control_outcome_df.pivot_table(
-                        index=['timeid', 'unitid'],
-                        columns='outcome',
-                        values='value'
-                    )
-                    n_periods = control_outcome_df['timeid'].nunique()
-                    n_control_units = control_outcome_df['unitid'].nunique()
-                    n_outcomes = control_outcome_df['outcome'].nunique()
-                    control_outcome_data = control_outcome_pivot.to_numpy().reshape(n_periods, n_control_units, n_outcomes)
-
-                    optimal_weights = fast_synthetic_control_fitting(
-                        treated_pre_intervention = treated_outcome_data,
-                        control_pre_intervention = control_outcome_data
-                    )
-
-                    control_unit_ids = control_outcome_df['unitid'].unique()
-                    weight_mapping = dict(zip(control_unit_ids, optimal_weights))
-                    filtered_weights = {unit: weight for unit, weight in weight_mapping.items() if weight > 0.001}
-                    current_combination_tuple = tuple(sorted(filtered_weights.keys()))
-                    data2['weight'] = data2['unitid'].map(filtered_weights)
-                    data2['weight'] = np.where(data2['treatment'] == 1, 1, data2['weight'])
-                    data2 = data2[data2['weight'].notna()]
-                    current_ipw = data2[['id','treatment','weight']].drop_duplicates().copy()
+                # Estimate weights via traditional SCM
+                df = data2.sort_values(by=['treatment', 'timeid', 'unitid', 'outcome']).reset_index(drop=True)
+                df = df[df['timeid'].isin(self.timeid_train + self.timeid_valid)]
+                treated_outcome_df = df[df['treatment'] == 1].copy()
+                treated_outcome_pivot = treated_outcome_df.pivot_table(
+                    index='timeid',
+                    columns='outcome',
+                    values='value'
+                )
+                treated_outcome_data = treated_outcome_pivot.to_numpy()
+                control_outcome_df = df[df['treatment'] == 0].copy()
+                control_outcome_pivot = control_outcome_df.pivot_table(
+                    index=['timeid', 'unitid'],
+                    columns='outcome',
+                    values='value'
+                )
+                n_periods = control_outcome_df['timeid'].nunique()
+                n_control_units = control_outcome_df['unitid'].nunique()
+                n_outcomes = control_outcome_df['outcome'].nunique()
+                control_outcome_data = control_outcome_pivot.to_numpy().reshape(n_periods, n_control_units, n_outcomes)
+                optimal_weights = fast_synthetic_control_fitting(
+                    treated_pre_intervention = treated_outcome_data,
+                    control_pre_intervention = control_outcome_data
+                )
+                control_unit_ids = control_outcome_df['unitid'].unique()
+                weight_mapping = dict(zip(control_unit_ids, optimal_weights))
+                filtered_weights = {unit: weight for unit, weight in weight_mapping.items() if weight > 0.001}
+                current_combination_tuple = tuple(sorted(filtered_weights.keys()))
+                data2['weight'] = data2['unitid'].map(filtered_weights)
+                data2['weight'] = np.where(data2['treatment'] == 1, 1, data2['weight'])
+                data2 = data2[data2['weight'].notna()]
+                current_ipw = data2[['id','treatment','weight']].drop_duplicates().copy()
 
                 # Re-normalize weights after selecting the top N donors to sum to 1.
                 sum_weight_tratamento = current_ipw.groupby('treatment').agg({
@@ -728,13 +784,12 @@ def search(
                 }).reset_index()
                 sum_weight_tratamento_0 = sum_weight_tratamento[sum_weight_tratamento['treatment'] == 0]['weight'].values[0]
                 current_ipw['weight'] = np.where(current_ipw['treatment'] == 0, current_ipw['weight'] / sum_weight_tratamento_0, current_ipw['weight'])
-                
                 current_ipw.drop('treatment', axis=1, inplace=True)
 
                 # Evaluate the performance of this candidate donor pool.
                 error_train, error_valid, error_pre_intervention, error_post_intervention, impact_score = self.evaluate_outcomes_metric(data=data2)
 
-                if error_pre_intervention < maximum_error_pre_intervention and (not current_combination_tuple or current_combination_tuple not in estimated_solutions):
+                if error_pre_intervention < maximum_error_pre_intervention and gram_cond <= 100 and current_combination_tuple and current_combination_tuple not in estimated_solutions:
                     current_ipw.drop
                     temp, data = dataset.full_data_treatment_control_scaling(current_ipw)
                     # Save the donor units, weights and performance metrics of this viable solution.
@@ -749,8 +804,7 @@ def search(
                     data['error_post_intervention'] = error_post_intervention
                     data['impact_score'] = impact_score
                     data['num_units_bigger_min_weight'] = num_units_bigger_min_weight
-                    data['num_units_max_weight'] = num_units_max_weight
-                    columns = ['outcome', 'timeid', 'value', 'treatment', 'weight', 'unitid', 'valor_m_weight', 'id', 'cycle', 'trial', 'solution_id', 'error_train', 'error_valid', 'error_pre_intervention', 'error_post_intervention', 'impact_score', 'num_units_bigger_min_weight', 'num_units_max_weight']
+                    columns = ['outcome', 'timeid', 'value', 'treatment', 'weight', 'unitid', 'valor_m_weight', 'id', 'cycle', 'trial', 'solution_id', 'error_train', 'error_valid', 'error_pre_intervention', 'error_post_intervention', 'impact_score', 'num_units_bigger_min_weight']
                     data[columns].to_csv(scm_donor_selection_candidate_units_data_file_path, mode='a', header=False, index=False)
 
                     # Save the weights and performance metrics of this viable solution.
@@ -764,19 +818,17 @@ def search(
                     temp['error_post_intervention'] = error_post_intervention
                     temp['impact_score'] = impact_score                        
                     temp['num_units_bigger_min_weight'] = num_units_bigger_min_weight
-                    temp['num_units_max_weight'] = num_units_max_weight
                     temp.to_csv(scm_donor_selection_candidate_performance_file_path, mode='a', header=False, index=False)
 
                     solution_id = solution_id + 1
 
                 # Save in cache the current found solution and its simplified version
-                estimated_solutions[combination_tuple] = (error_valid, error_pre_intervention, impact_score)
-                if maximum_donor_pool_size > 1 and current_combination_tuple and combination_tuple != current_combination_tuple:
+                if current_combination_tuple and current_combination_tuple not in estimated_solutions:
                     estimated_solutions[current_combination_tuple] = (error_valid, error_pre_intervention, impact_score)
 
             attempt = attempt + 1
 
-            return error_valid, error_pre_intervention, impact_score #error_post_intervention
+            return error_valid, error_pre_intervention, impact_score
 
         def full_data_treatment_control_scaling(self, weight):
             """Prepares the full dataset with the final weights for saving if it is good enough."""
@@ -799,9 +851,6 @@ def search(
     solution_id = 0
     # EXECUTION CACHE
     estimated_solutions = dict()
-
-    possible_donor_pool_size = list(range(inferior_limit_maximum_donor_pool_size, superior_limit_maximum_donor_pool_size + 1))
-    possible_donor_pool_size_num_items = len(possible_donor_pool_size)
 
     timeid_train_indexes = [timeid_pre_intervention.index(x) + 1 for x in temporal_cross_search]
     for timeid_train_index in timeid_train_indexes:
