@@ -784,7 +784,7 @@ def search(
             # Select non multicollinearity control units
             donor_unitids = datat[datat['treatment'] == 0]['unitid'].unique()
             data2 = datat[datat['unitid'].isin([treatment_unitid] + list(donor_unitids))].copy()
-            donor_df = data2[(data2['treatment'] == 0) & (data2['timeid'].isin(self.timeid_train + self.timeid_valid))].copy()
+            donor_df = data2[(data2['treatment'] == 0) & (data2['timeid'].isin(self.timeid_train))].copy()
             pivot_donor = donor_df.pivot(index='timeid', columns=['unitid', 'outcome'], values='value')
             selected_donors = build_uncorrelated_set_iteratively(
                 X=pivot_donor.values,
@@ -807,7 +807,7 @@ def search(
 
                 # Estimate weights via traditional SCM
                 df = data2.sort_values(by=['treatment', 'timeid', 'unitid', 'outcome']).reset_index(drop=True)
-                df = df[df['timeid'].isin(self.timeid_train + self.timeid_valid)]
+                df = df[df['timeid'].isin(self.timeid_train)]
                 treated_outcome_df = df[df['treatment'] == 1].copy()
                 treated_outcome_pivot = treated_outcome_df.pivot_table(
                     index='timeid',
@@ -858,7 +858,7 @@ def search(
                         })
                     ).reset_index()
 
-                    gram_cond_df = calculate_gram_cond_by_shape(df = data[(data['treatment'] == 0) & (data['timeid'].isin(self.timeid_train + self.timeid_valid))])
+                    gram_cond_df = calculate_gram_cond_by_shape(df = data[(data['treatment'] == 0) & (data['timeid'].isin(self.timeid_train))])
                     gram_cond_max = gram_cond_df['gram_cond'].max()
 
                     # Save the donor units, weights and performance metrics of this viable solution.

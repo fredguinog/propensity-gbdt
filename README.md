@@ -94,7 +94,7 @@ donor_selection.search(
     value = "Value",
     treatment = "treatment",
     pre_intervention = "pre_intervention",
-    temporal_cross_search = ['2004', '2007', '2010'],
+    temporal_cross_search = ['2012', '2013', '2014'],
     workspace_folder = 'C:/test_propensitygbdt_scm_donor_selection/',
     # include_impact_score_in_optuna_objective = True
 )
@@ -124,9 +124,10 @@ bayesian_scm.estimate(
 ### Optional Parameters
 
 *   `seed` (int, optional): The random seed for reproducibility. Defaults to `111`.
-*   `maximum_num_units_on_support_first_filter` (int, optional): The maximum number of units to be considered "on support" in the first filtering stage. Defaults to `50`.
-*   `maximum_error_pre_intervention` (float, optional): The maximum allowable error in the pre-treatment period for a donor pool to be considered valid. Defaults to `0.15`.
-*   `gram_cond_max_acceptable` (float, optional): The maximum accetaple Gram condition between all outcome variables of the donor set candidate. Defaults to 100.0
+*   `maximum_num_units_on_support` (int, optional): The maximum number of units allowed in the on-support group during the first pruning step, used to penalize trivial solutions. Defaults to 50.
+*   `max_correlation_between_control_units` (float, optional): The maximum correlation between control units for a candidate donor pool to be saved. Defaults to 0.5,
+*   `maximum_control_unit_weight` (float, optional): The maximum acceptable control unit weight for a candidate donor pool to be saved. Defaults to 0.5
+*   `maximum_error_pre_intervention` (float, optional): The maximum acceptable error (e.g., RMSE or MAE) on the pre-treatment outcomes for a candidate donor pool to be saved. Defaults to 0.15.
 *   `include_impact_score_in_optuna_objective` (bool, optional): Flag to include or not the impact score in the Optuna's search criteria. Defaults to `False`.
 *   `number_optuna_trials` (int, optional): The number of trials for the Optuna hyperparameter optimization. Defaults to `300`.
 *   `timeout_optuna_cycle` (int, optional): The timeout in seconds for each Optuna optimization cycle. Defaults to `900`.
@@ -136,15 +137,16 @@ bayesian_scm.estimate(
 ### Main Parameters
 
 *   `timeid_previous_intervention` (str): The last time period before the intervention begins. This defines the end of the pre-treatment period.
-*   `workspace_folder` (str): The path to the folder where the output files will be saved.
+*   `workspace_folder` (str): The file path to the root directory that contains the input data file ('scm_donor_selection_candidate_units_data.csv') and will store all output files (CSVs, plots).
 
 ### Optional Parameters
 
-*   `solution_id` (int, optional): The specific ID for the set of control units (donor pool) to be used. If None, the function will automatically select the solution with the best trade-off between pre-intervention fit and impact score. Defaults to `None`.
+*   `solution_id` (int, optional): The specific ID for a pre-selected group of control units (the donor pool). If set to None, the function will automatically process all solutions saved in the input file. Defaults to None.
 *   `period_effect_format` (str): A format string for displaying numeric results in plot annotations of period results. Defaults to `'{:.2f}'`.
 *   `seed` (int, optional): A random seed to ensure reproducibility of the MCMC sampling and other random processes. Defaults to `222`.
-*   `cond_threshold` (int, optional): Max condition number. Defaults to `100`.
-*   `B` (int, optional): Bootstrap iterations for variance certificate. Defaults to `100`.
+*   `gram_cond_threshold` (float, optional): The maximum allowable value for the Gram matrix condition number. This is used as a threshold to detect multicollinearity among control units; solutions exceeding it are flagged. Defaults to 100.0.
+*   `max_weight_threshold` (float, optional): The maximum permissible weight for any single control unit in the synthetic control. This helps prevent the model from relying too heavily on one donor unit. Defaults to 0.5.
+*   `min_perc_chains_below_weight_threshold` (float, optional): The minimum percentage of MCMC chains where a donor unit's weight must be below the `max_weight_threshold`. This ensures the weight constraint is robustly met. Defaults to 0.67.
 
 ## Citation
 
