@@ -147,6 +147,7 @@ def build_uncorrelated_set_iteratively(X, n_outcomes, correlation_threshold=0.5)
     observations_per_donor = T * n_outcomes
     if observations_per_donor < 2:
         raise ValueError(f"Insufficient observations per donor ({observations_per_donor} < 2) for reliable correlation computation.")
+    current_min_max_corr = None
     # 1. Compute the absolute donor-donor correlation matrix
     X_reshaped = X.reshape(observations_per_donor, K)
     corr_matrix = np.corrcoef(X_reshaped.T)
@@ -182,6 +183,8 @@ def build_uncorrelated_set_iteratively(X, n_outcomes, correlation_threshold=0.5)
         # 4. Check the stopping condition
         if min_max_corr >= correlation_threshold:
             break
+        else:
+            current_min_max_corr = min_max_corr
        
         # Add the best found unit to the selected set
         if best_next_idx != -1:
@@ -190,7 +193,7 @@ def build_uncorrelated_set_iteratively(X, n_outcomes, correlation_threshold=0.5)
         else:
             # No more units can be added
             break
-    return sorted(list(selected_indices))
+    return sorted(list(selected_indices)), current_min_max_corr
 
 """
 Calculates a single set of optimal weights for a synthetic control group
@@ -401,20 +404,22 @@ workspace_folder : str
     The path to a directory where output files (candidate donors and performance) will be saved.
 seed : int, optional
     Random seed for reproducibility of the optimization process. Defaults to 111.
-maximum_num_units_on_support : int, optional
-    The maximum number of units allowed in the on-support group during the first pruning step,
-    used to penalize trivial solutions. Defaults to 50.
+maximum_num_units_on_attipw_support : int, optional
+    The maximum number of control units allowed in the on-support group, used to remove units
+    not ATT/IPW similar to the treatment unit. Defaults to 50.
 max_correlation_between_control_units : float, optional
     The maximum correlation between control units for a candidate donor pool to be saved.
     Defaults to 0.5,
 maximum_control_unit_weight : float, optional
     The maximum acceptable control unit weight for a candidate donor pool to be saved.
     Defaults to 0.5
-maximum_error_pre_intervention : float, optional
-    The maximum acceptable error (e.g., RMSE or MAE) on the pre-treatment outcomes for a
+error_criteria : str
+    Selects the type of error to be use find the best model. Defaults to "pre_intervention".
+maximum_error : float, optional
+    The maximum acceptable error (e.g., RMSE or MAE) on the outcomes for a
     candidate donor pool to be saved. Defaults to 0.15.
-include_impact_score_in_optuna_objective : bool, optional
-    Flag to include or not the impact score in the Optuna's search criteria. Defaults to False.
+alpha_exponential_decay : float, optional
+    Akpha of the exponential decay. Defaults to 0.05.
 number_optuna_trials : int, optional
     The number of hyperparameter optimization trials to run for each cross-temporal fold.
     Defaults to 300.
@@ -433,11 +438,12 @@ def search(
     temporal_cross_search,
     workspace_folder,
     seed=111,
-    maximum_num_units_on_support=50,
+    maximum_num_units_on_attipw_support=50,
     max_correlation_between_control_units=0.5,
     maximum_control_unit_weight=0.5,
-    maximum_error_pre_intervention=0.15,
-    include_impact_score_in_optuna_objective = False,
+    error_criteria = "pre_intervention",
+    maximum_error=0.15,
+    alpha_exponential_decay=0.00,
     number_optuna_trials=1000,
     timeout_optuna_cycle=900
 ):
@@ -486,18 +492,14 @@ def search(
         print(f"pre_intervention: {sorted(all_units[all_units['pre_intervention'] == 1]['timeid'].unique().tolist())}")
         sys.exit()
 
+    if error_criteria != 'pre_intervention' and error_criteria != 'validation_fold':
+        print("ERROR: error_criteria MUST BE 'pre_intervention' or 'validation_fold'")
+        sys.exit()
+
     # CHECH DIRECTORY EXISTS AND CREATE IT IF NOT
     if not os.path.exists(workspace_folder):
         os.makedirs(workspace_folder)
         print(f"Created workspace folder: {workspace_folder}")
-   
-    file_path = resources.files('propensitygbdt.data').joinpath('scm_donor_selection_candidate_performance.xlsx')
-    try:
-        with resources.as_file(file_path) as source_path:
-            shutil.copy(source_path, workspace_folder)
-    except (FileNotFoundError, ModuleNotFoundError):
-        print("Error: Could not find the source file or the 'propensitygbdt.data' package.")
-        print("Please ensure the package is correctly installed.")
 
     file_path = resources.files('propensitygbdt.data').joinpath('scm_donor_selection_candidate_units_data.xlsx')
     try:
@@ -536,6 +538,11 @@ def search(
     print(all_units.groupby(['timeid', 'outcome']).size().unstack(fill_value=0))
     print(all_units.head())
     print(all_units.info())
+    
+    all_units['timeid_relevance'] = pd.Categorical(all_units['timeid'])
+    mapping_timeid = all_units['timeid_relevance'].cat.categories
+    all_units['timeid_relevance'] = all_units['timeid_relevance'].cat.codes
+    all_units['timeid_relevance']= np.exp(-alpha_exponential_decay * (len(mapping_timeid) - all_units['timeid_relevance']))
 
     treatment_unitid = all_units[all_units['treatment'] == 1]['unitid'].iloc[0]
     outcomes = all_units['outcome'].sort_values().unique().tolist()
@@ -543,17 +550,9 @@ def search(
     timeid_pre_intervention = all_units[all_units['pre_intervention'] == 1]['timeid'].sort_values().unique().tolist()
     timeid_post_intervention = all_units[all_units['pre_intervention'] == 0]['timeid'].sort_values().unique().tolist()
 
-    hyperparameter_search_extra_criteria = []  
-    if include_impact_score_in_optuna_objective:
-        hyperparameter_search_extra_criteria.append('post_intervention_period')
-
     scm_donor_selection_candidate_units_data_file_path = workspace_folder + 'scm_donor_selection_candidate_units_data.csv'
     if os.path.exists(scm_donor_selection_candidate_units_data_file_path):
         os.remove(scm_donor_selection_candidate_units_data_file_path)
-
-    scm_donor_selection_candidate_performance_file_path = workspace_folder + 'scm_donor_selection_candidate_performance.csv'
-    if os.path.exists(scm_donor_selection_candidate_performance_file_path):
-        os.remove(scm_donor_selection_candidate_performance_file_path)
 
     all_units.sort_values(by=['unitid', 'timeid', 'outcome'], inplace=True)
     all_units['weight'] = 1.0
@@ -606,7 +605,7 @@ def search(
     treatment = all_units[all_units['treatment'] == 1]
     treatment.loc[:, 'unitid'] = treatment_unitid
 
-    # Initialize CSV files for storing performance results and the donor candidates data with headers.
+    # Initialize CSV files for storing the donor candidates data with headers.
     scm_donor_selection_candidate_units_data = treatment[['outcome', 'timeid', 'value', 'treatment', 'weight', 'unitid']].copy()
     scm_donor_selection_candidate_units_data['valor_m_weight'] = scm_donor_selection_candidate_units_data['value'] * scm_donor_selection_candidate_units_data['weight']
     scm_donor_selection_candidate_units_data['id'] = None
@@ -620,22 +619,9 @@ def search(
     scm_donor_selection_candidate_units_data['impact_score'] = None
     scm_donor_selection_candidate_units_data['gram_cond_max'] = None
     scm_donor_selection_candidate_units_data['num_units_bigger_min_weight'] = None
+    scm_donor_selection_candidate_units_data['max_used_corr'] = None
+    scm_donor_selection_candidate_units_data['max_weight'] = None
     scm_donor_selection_candidate_units_data.to_csv(scm_donor_selection_candidate_units_data_file_path, mode='w', header=True, index=False)
-
-    # Initialize CSV files for storing performance results with headers.
-    scm_donor_selection_candidate_performance = treatment[['outcome', 'timeid', 'treatment', 'value']].copy()
-    scm_donor_selection_candidate_performance['qtty'] = 1
-    scm_donor_selection_candidate_performance['cycle'] = None
-    scm_donor_selection_candidate_performance['trial'] = None
-    scm_donor_selection_candidate_performance['solution_id'] = None
-    scm_donor_selection_candidate_performance['error_train'] = None
-    scm_donor_selection_candidate_performance['error_valid'] = None
-    scm_donor_selection_candidate_performance['error_pre_intervention'] = None
-    scm_donor_selection_candidate_performance['error_post_intervention'] = None
-    scm_donor_selection_candidate_performance['impact_score'] = None
-    scm_donor_selection_candidate_performance['gram_cond_max'] = None
-    scm_donor_selection_candidate_performance['num_units_bigger_min_weight'] = None
-    scm_donor_selection_candidate_performance.to_csv(scm_donor_selection_candidate_performance_file_path, mode='w', header=True, index=False)
 
     class Dataset:
         """
@@ -675,11 +661,12 @@ def search(
             The article describes this as evaluating "Causal Fitness", which includes pre-intervention
             outcome balance, and post-intervention "null" balance.
             """
-            aggregated3 = data.groupby(['outcome', 'timeid', 'treatment'], dropna=False).apply(
+            aggregated3 = data.groupby(['outcome', 'timeid', 'treatment', 'timeid_relevance'], dropna=False).apply(
                 lambda x : pd.Series({
                     'value' : np.ma.filled(np.ma.average(np.ma.masked_invalid(x['value']), weights=x['weight']), fill_value=np.nan)
                 })
             ).reset_index()
+            aggregated3['value'] = aggregated3['value'] * aggregated3['timeid_relevance']
 
             # Calculate error on the training set.
             aggregated3_diff = aggregated3[aggregated3['timeid'].isin(self.timeid_train)].sort_values(['outcome', 'timeid', 'treatment'], ascending=True).groupby(['outcome', 'timeid']).agg({
@@ -689,17 +676,29 @@ def search(
             aggregated3_diff_normalized = pd.merge(aggregated3_diff, amplitude, on='outcome', how='left')
             aggregated3_diff_normalized['value'] = aggregated3_diff_normalized['value'] / aggregated3_diff_normalized['amplitude']
 
-            error_train = ((aggregated3_diff_normalized['value'] ** 2).mean()) ** 0.5
+            aggregated3_mean_outcome = aggregated3_diff_normalized.groupby(['outcome'], dropna=False).agg({
+                'value' : lambda x: ((x ** 2).mean()) ** 0.5
+            }).reset_index()
+
+            aggregated3_mean_outcome = aggregated3_mean_outcome.copy()
+            error_train = aggregated3_mean_outcome['value'].max()
+            # error_train = ((aggregated3_diff_normalized['value'] ** 2).mean()) ** 0.5
 
             # Calculate error on the validation set. This is crucial for early stopping and preventing overfitting.
             aggregated3_diff = aggregated3[aggregated3['timeid'].isin(self.timeid_valid)].sort_values(['outcome', 'timeid', 'treatment'], ascending=True).groupby(['outcome', 'timeid']).agg({
                 'value' : lambda x: x.iloc[0] - x.iloc[1]
             }).reset_index(level=['outcome', 'timeid'])
 
-            aggregated3_diff_normalized = pd.merge(aggregated3_diff, amplitude, on='outcome', how='left')
-            aggregated3_diff_normalized['value'] = aggregated3_diff_normalized['value'] / aggregated3_diff_normalized['amplitude']
+            aggregated3_diff_normalized_valid = pd.merge(aggregated3_diff, amplitude, on='outcome', how='left')
+            aggregated3_diff_normalized_valid['value'] = aggregated3_diff_normalized_valid['value'] / aggregated3_diff_normalized_valid['amplitude']
 
-            error_valid = ((aggregated3_diff_normalized['value'] ** 2).mean()) ** 0.5
+            aggregated3_mean_outcome = aggregated3_diff_normalized_valid.groupby(['outcome'], dropna=False).agg({
+                'value' : lambda x: ((x ** 2).mean()) ** 0.5
+            }).reset_index()
+
+            aggregated3_mean_outcome = aggregated3_mean_outcome.copy()
+            error_valid = aggregated3_mean_outcome['value'].max()
+            # error_valid = ((aggregated3_diff_normalized_valid['value'] ** 2).mean()) ** 0.5
 
             # Calculate error for the entire pre-treatment period.
             aggregated3_diff = aggregated3[aggregated3['timeid'].isin(self.timeid_train + self.timeid_valid)].sort_values(['outcome', 'timeid', 'treatment'], ascending=True).groupby(['outcome', 'timeid']).agg({
@@ -709,19 +708,15 @@ def search(
             aggregated3_diff_normalized_pre = pd.merge(aggregated3_diff, amplitude, on='outcome', how='left')
             aggregated3_diff_normalized_pre['value'] = aggregated3_diff_normalized_pre['value'] / aggregated3_diff_normalized_pre['amplitude']
 
-            error_pre_intervention = ((aggregated3_diff_normalized_pre['value'] ** 2).mean()) ** 0.5
+            aggregated3_mean_outcome = aggregated3_diff_normalized_pre.groupby(['outcome'], dropna=False).agg({
+                'value' : lambda x: ((x ** 2).mean()) ** 0.5
+            }).reset_index()
+
+            aggregated3_mean_outcome = aggregated3_mean_outcome.copy()
+            error_pre_intervention = aggregated3_mean_outcome['value'].max()
+            # error_pre_intervention = ((aggregated3_diff_normalized_pre['value'] ** 2).mean()) ** 0.5
 
             # Calculate error for the entire post-treatment period.
-            # --- Diagnostic tool, not a core component, and it is disabled by default ---
-            # To validate against bias from using post-treatment data, run this script twice:
-            #  - Run A (Unbiased): Without `error_post_intervention` in the Optuna objective.
-            #  - Run B (Biased):   With `error_post_intervention` included.
-            # --- How to Interpret the Results ---
-            # * If both runs agree on the donor pool -> The result is likely robust.
-            # * If both runs find good fits but disagree -> Bias is likely. Trust Run A.
-            # * If Run A fails but Run B succeeds -> Run B's result is suspect. Rerun Run A with more Optuna trials.
-            # * If both runs fail -> This indicates a more fundamental problem, such as no suitable donors in the pool
-            # or an insufficient Optuna trials, reduce the number of selected outcomes and rerun.
             aggregated3_diff = aggregated3[aggregated3['timeid'].isin(self.timeid_post_intervention)].sort_values(['outcome', 'timeid', 'treatment'], ascending=True).groupby(['outcome', 'timeid']).agg({
                 'value' : lambda x: x.iloc[0] - x.iloc[1]
             }).reset_index(level=['outcome', 'timeid'])
@@ -729,12 +724,25 @@ def search(
             aggregated3_diff_normalized_post = pd.merge(aggregated3_diff, amplitude, on='outcome', how='left')
             aggregated3_diff_normalized_post['value'] = aggregated3_diff_normalized_post['value'] / aggregated3_diff_normalized_post['amplitude']
 
-            error_post_intervention = ((aggregated3_diff_normalized_post['value'] ** 2).mean()) ** 0.5
+            aggregated3_mean_outcome = aggregated3_diff_normalized_post.groupby(['outcome'], dropna=False).agg({
+                'value' : lambda x: ((x ** 2).mean()) ** 0.5
+            }).reset_index()
 
-            if error_pre_intervention < maximum_error_pre_intervention:
+            aggregated3_mean_outcome = aggregated3_mean_outcome.copy()
+            error_post_intervention = aggregated3_mean_outcome['value'].max()
+            # error_post_intervention = ((aggregated3_diff_normalized_post['value'] ** 2).mean()) ** 0.5
+
+            if (error_criteria == "pre_intervention" and error_pre_intervention < maximum_error):
                 np.random.seed(attempt + seed) 
                 impact_score = block_bootstrap_rmspe_ratio_vectorized(
                     aggregated3_diff_normalized_pre,
+                    aggregated3_diff_normalized_post,
+                    n_bootstraps=1000
+                )
+            elif (error_criteria == "validation_fold" and error_valid < maximum_error):
+                np.random.seed(attempt + seed) 
+                impact_score = block_bootstrap_rmspe_ratio_vectorized(
+                    aggregated3_diff_normalized_valid,
                     aggregated3_diff_normalized_post,
                     n_bootstraps=1000
                 )
@@ -749,6 +757,13 @@ def search(
             It converts the XGBoost predictions (propensity scores) into weights and then selects N donors.
             """
             global attempt, solution_id, estimated_solutions
+            
+            if any(p == 1 for p in preds):
+                error_valid = float('inf')
+                error_pre_intervention = float('inf')
+                impact_score = float('inf')
+                return error_valid, error_pre_intervention, impact_score
+            
             # Calculate Inverse Probability Weights (IPW). The formula ps / (1 - ps) is used to rank control units.
             ipw = pd.DataFrame({
                 'id': self.dataset_train['id'],
@@ -767,7 +782,7 @@ def search(
             min_weight_observations = ipw[(ipw['treatment'] == 0) & (ipw['weight'] > min_weight)]
             num_units_bigger_min_weight = min_weight_observations.shape[0]
 
-            if num_units_bigger_min_weight > maximum_num_units_on_support or num_units_bigger_min_weight == 0:
+            if num_units_bigger_min_weight > maximum_num_units_on_attipw_support or num_units_bigger_min_weight == 0:
                 error_valid = float('inf')
                 error_pre_intervention = float('inf')
                 impact_score = float('inf')
@@ -783,10 +798,17 @@ def search(
 
             # Select non multicollinearity control units
             donor_unitids = datat[datat['treatment'] == 0]['unitid'].unique()
+            
+            if len(donor_unitids) <= 2:
+                error_valid = float('inf')
+                error_pre_intervention = float('inf')
+                impact_score = float('inf')
+                return error_valid, error_pre_intervention, impact_score
+            
             data2 = datat[datat['unitid'].isin([treatment_unitid] + list(donor_unitids))].copy()
             donor_df = data2[(data2['treatment'] == 0) & (data2['timeid'].isin(self.timeid_train))].copy()
             pivot_donor = donor_df.pivot(index='timeid', columns=['unitid', 'outcome'], values='value')
-            selected_donors = build_uncorrelated_set_iteratively(
+            selected_donors, max_used_corr = build_uncorrelated_set_iteratively(
                 X=pivot_donor.values,
                 n_outcomes=len(outcomes),
                 correlation_threshold=max_correlation_between_control_units
@@ -850,16 +872,16 @@ def search(
                 data = pre_intervention_scaling(data=data2, period=self.timeid_train + self.timeid_valid)
                 error_train, error_valid, error_pre_intervention, error_post_intervention, impact_score = self.evaluate_outcomes_metric(data=data)
 
-                if current_combination_tuple and len(current_combination_tuple) > 2 and current_maximum_control_unit_weight < maximum_control_unit_weight and error_pre_intervention < maximum_error_pre_intervention and current_combination_tuple not in estimated_solutions:
-                    temp = data.groupby(['outcome', 'timeid', 'treatment'], dropna=False).apply(
-                        lambda x : pd.Series({
-                            'value' : np.ma.filled(np.ma.average(np.ma.masked_invalid(x['value']), weights=x['weight']), fill_value=np.nan),
-                            'qtty' : np.ma.filled(np.ma.count(np.ma.masked_invalid(x['value'])), fill_value=np.nan)
-                        })
-                    ).reset_index()
+                if (current_combination_tuple and len(current_combination_tuple) > 2 and
+                    current_maximum_control_unit_weight < maximum_control_unit_weight and
+                    ((error_criteria == "pre_intervention" and error_pre_intervention < maximum_error) or
+                    (error_criteria == "validation_fold" and error_valid < maximum_error)) and
+                    current_combination_tuple not in estimated_solutions):
 
                     gram_cond_df = calculate_gram_cond_by_shape(df = data[(data['treatment'] == 0) & (data['timeid'].isin(self.timeid_train))])
                     gram_cond_max = gram_cond_df['gram_cond'].max()
+                    if gram_cond_max == float('inf'):
+                        gram_cond_max = 9999999.0
 
                     # Save the donor units, weights and performance metrics of this viable solution.
                     data = data[data['treatment'] == 0]
@@ -874,22 +896,10 @@ def search(
                     data['impact_score'] = round(impact_score, 4)
                     data['gram_cond_max'] = round(gram_cond_max, 0)
                     data['num_units_bigger_min_weight'] = num_units_bigger_min_weight
-                    columns = ['outcome', 'timeid', 'value', 'treatment', 'weight', 'unitid', 'valor_m_weight', 'id', 'cycle', 'trial', 'solution_id', 'error_train', 'error_valid', 'error_pre_intervention', 'error_post_intervention', 'impact_score', 'gram_cond_max', 'num_units_bigger_min_weight']
+                    data['max_used_corr'] = round(max_used_corr, 2)
+                    data['max_weight'] = round(current_maximum_control_unit_weight, 2)
+                    columns = ['outcome', 'timeid', 'value', 'treatment', 'weight', 'unitid', 'valor_m_weight', 'id', 'cycle', 'trial', 'solution_id', 'error_train', 'error_valid', 'error_pre_intervention', 'error_post_intervention', 'impact_score', 'gram_cond_max', 'num_units_bigger_min_weight', 'max_used_corr', 'max_weight']
                     data[columns].to_csv(scm_donor_selection_candidate_units_data_file_path, mode='a', header=False, index=False)
-
-                    # Save the weights and performance metrics of this viable solution.
-                    temp = temp[temp['treatment'] == 0]
-                    temp['cycle'] = cycle
-                    temp['trial'] = pruning_trial.number
-                    temp['solution_id'] = solution_id
-                    temp['error_train'] = round(error_train, 3)
-                    temp['error_valid'] = round(error_valid, 3)
-                    temp['error_pre_intervention'] = round(error_pre_intervention, 3)
-                    temp['error_post_intervention'] = round(error_post_intervention, 3)
-                    temp['impact_score'] = round(impact_score, 4)
-                    temp['gram_cond_max'] = round(gram_cond_max, 0)
-                    temp['num_units_bigger_min_weight'] = num_units_bigger_min_weight
-                    temp.to_csv(scm_donor_selection_candidate_performance_file_path, mode='a', header=False, index=False)
 
                     solution_id = solution_id + 1
 
@@ -912,10 +922,8 @@ def search(
 
     timeid_train_indexes = [timeid_pre_intervention.index(x) + 1 for x in temporal_cross_search]
     for timeid_train_index in timeid_train_indexes:
-        if include_impact_score_in_optuna_objective:
-            sampler = optuna.samplers.NSGAIIISampler(seed=cycle+seed)
-        else:
-            sampler = optuna.samplers.RandomSampler(seed=cycle+seed)
+        # sampler = optuna.samplers.RandomSampler(seed=cycle+seed)
+        sampler = optuna.samplers.TPESampler(seed=cycle+seed)
         
         print(f'train: {timeid_pre_intervention[0:timeid_train_index]}')
         print(f'valid: {timeid_pre_intervention[(timeid_train_index):len(timeid_pre_intervention)]}')
@@ -1034,23 +1042,17 @@ def search(
             except Exception as e:
                 # Handle other potential errors during xgb.train
                 print(f"An error occurred during xgb.train for trial {trial.number}: {e}")
-                if 'post_intervention_period' in hyperparameter_search_extra_criteria:
-                    return float('inf'), float('inf')
-                else:
-                    return float('inf')
-            
-            # The article describes a multi-objective optimization problem. 
-            # Optuna is configured to minimize, pre-treatment error, and post-intervention error (optional for diagnose).
-            if 'post_intervention_period' in hyperparameter_search_extra_criteria:
-                return current_error_pre_intervention, current_impact_score
-            else:
+                return float('inf')
+
+            if (error_criteria == "pre_intervention" and current_error_pre_intervention < maximum_error):
                 return current_error_pre_intervention
+            elif(error_criteria == "validation_fold" and current_error_valid < maximum_error):
+                return current_error_valid
+
+            return current_error_pre_intervention
 
         # --- 4. Run the Optuna Study ---
-        if 'post_intervention_period' in hyperparameter_search_extra_criteria:
-            directions=['minimize', 'minimize']
-        else:
-            directions=['minimize']
+        directions=['minimize']
 
         study = optuna.create_study(
             directions=directions,

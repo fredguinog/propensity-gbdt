@@ -36,6 +36,25 @@
 // for each outcome is standardized and rescaled using the statistics of the
 // corresponding treated unit's pre-treatment series before the likelihood is evaluated.
 // -----------------------------------------------------------------------------
+functions {
+  // Optimized vectorized Gini coefficient
+  real gini_simplex(vector y) {
+    int n = num_elements(y);
+    vector[n] y_sorted;
+    vector[n] idx;
+    
+    if (n == 0) reject("Gini requires n > 0");
+    if (n == 1) return 0.0;
+    
+    y_sorted = sort_asc(y);
+    for (i in 1:n) idx[i] = i;
+    
+    real sum_iy = dot_product(idx, y_sorted);
+    
+    return (2 * sum_iy / n) - ((n + 1.0) / n);
+  }
+}
+
 data {
   // --- Dimensions ---
   int<lower=1> N_pre;       // Number of pre-treatment train time periods
@@ -58,7 +77,7 @@ data {
   
   // --- Priors and Constraints ---
   vector<lower=0>[N_controls] dirichlet_alpha; // Hyperparameter for Dirichlet prior on weights. Sparsity requires a value smaller than 1
-  real<lower=0> tau_nrmse_scale;
+  vector<lower=0>[N_outcomes] tau_nrmse_prior;
 }
 
 transformed data {
@@ -84,7 +103,7 @@ parameters {
   // This captures how well the synthetic control can match the treated unit for each outcome.
   vector<lower=0>[N_outcomes] sigma;
   
-  real<lower=0> tau_nrmse;  // Hierarchical prior for NRMSE per outcome
+  vector<lower=0>[N_outcomes] tau_nrmse;  // Hierarchical prior for NRMSE per outcome
 }
 
 transformed parameters {
@@ -137,7 +156,7 @@ model {
   // A weakly informative prior on the error term for each outcome.
   sigma ~ cauchy(0, 2.5);
   
-  tau_nrmse ~ cauchy(0, tau_nrmse_scale);
+  tau_nrmse ~ cauchy(0, tau_nrmse_prior);
 
   // --- Likelihood and Constraints (applied per outcome) ---
   for (k in 1:N_outcomes) {
@@ -159,8 +178,8 @@ model {
     real nrmse_test = sqrt(mean(square(residuals_test / amplitude[k])));
 
     // 3. Add soft constraints by specifying tight priors on these nrmse
-    nrmse_pre ~ normal(0, tau_nrmse) T[0,];
-    nrmse_test ~ normal(0, tau_nrmse) T[0,];
+    nrmse_pre ~ normal(0, tau_nrmse[k]) T[0,];
+    nrmse_test ~ normal(0, tau_nrmse[k]) T[0,];
   }
 }
 
@@ -169,21 +188,29 @@ generated quantities {
   // Generate draws from the posterior predictive distribution for the effect of each outcome.
   // This incorporates the estimated model noise `sigma` into our prediction. 
   // Predictive residuals
+  matrix[N_pre, N_outcomes] predictive_pre;
+  matrix[N_test, N_outcomes] predictive_test;
+  matrix[N_post, N_outcomes] predictive_post;
   matrix[N_pre, N_outcomes] residuals_pre;
   matrix[N_test, N_outcomes] residuals_test;
   matrix[N_post, N_outcomes] effect_post;
   vector[N_outcomes] nrmse_pre;
   vector[N_outcomes] nrmse_test;
   vector[N_outcomes] nrmse_post;
+  real gini_weight = gini_simplex(w);
+  
   for (k in 1:N_outcomes) {
     for (t in 1:N_pre) {
-      residuals_pre[t, k] = Y_treated_pre[t, k] - normal_rng(y_synth_pre_scaled[t, k], sigma[k]);
+	  predictive_pre[t, k] = normal_rng(y_synth_pre_scaled[t, k], sigma[k]);
+      residuals_pre[t, k] = Y_treated_pre[t, k] - predictive_pre[t, k];
     }
     for (t in 1:N_test) {
-      residuals_test[t, k] = Y_treated_test[t, k] - normal_rng(y_synth_test_scaled[t, k], sigma[k]);
+	  predictive_test[t, k] = normal_rng(y_synth_test_scaled[t, k], sigma[k]);
+      residuals_test[t, k] = Y_treated_test[t, k] - predictive_test[t, k];
     }
     for (t in 1:N_post) {
-      effect_post[t, k] = Y_treated_post[t, k] - normal_rng(y_synth_post_scaled[t, k], sigma[k]);
+	  predictive_post[t, k] = normal_rng(y_synth_post_scaled[t, k], sigma[k]);
+      effect_post[t, k] = Y_treated_post[t, k] - predictive_post[t, k];
     }
 
     nrmse_pre[k] = sqrt(mean(square(residuals_pre[, k] / amplitude[k])));

@@ -146,14 +146,14 @@ Args:
                                          threshold to detect multicollinearity among
                                          control units; solutions exceeding it are flagged.
                                          Defaults to 100.0.
-    max_weight_threshold (float, optional): The maximum permissible weight for any
-                                            single control unit in the synthetic control.
-                                            This helps prevent the model from relying too
-                                            heavily on one donor unit. Defaults to 0.5.
-    min_perc_chains_below_weight_threshold (float, optional): The minimum percentage
-                                                              of MCMC chains where a donor
-                                                              unit's weight must be below
-                                                              the `max_weight_threshold`.
+    max_gini_threshold (float, optional): The maximum permissible gini of the weight distribution
+                                          for the synthetic control. This helps prevent the model
+                                          from relying too heavily on one control unit.
+                                          Defaults to 0.5.
+    min_perc_chains_below_gini_threshold (float, optional): The minimum percentage
+                                                              of MCMC chains where gini of
+                                                              the weight distribution must be below
+                                                              the `max_gini_threshold`.
                                                               This ensures the weight
                                                               constraint is robustly met.
                                                               Defaults to 0.67.
@@ -165,8 +165,8 @@ def estimate(
     period_effect_format='{:.2f}',
     seed=222,
     gram_cond_threshold=100.0,
-    max_weight_threshold=0.5,
-    min_perc_chains_below_weight_threshold=0.67
+    max_gini_threshold=0.4,
+    min_perc_chains_below_gini_threshold=0.67
 ):
     # Set the random seed for NumPy to ensure reproducibility of its random operations.
     np.random.seed(seed)
@@ -200,10 +200,18 @@ def estimate(
             # Select the 'solution_id' with the minimum distance to the origin (0,0) in the error-impact space.
             solutions_id = dataset_raw[['solution_id']].drop_duplicates()['solution_id']
             solutions_id = solutions_id[solutions_id.notna()].astype(int).to_list()
+            filtered_unitid = False
         else:
             # Filter the dataset to include only the treated unit and the control units from the specified 'solution_id'.
-            print(f"Using solution_id: {solution_id}")
-            solutions_id = [solution_id]
+            solutions_id = []
+            solutions_id_unitids = {}
+            for item in solution_id:
+                solutions_id.append(item["solution_id"])
+                if "unitids" in item:
+                    solutions_id_unitids[item["solution_id"]] = item["unitids"]
+                    filtered_unitid = True
+                else:
+                    filtered_unitid = False
             
     except FileNotFoundError:
         print("Error: 'scm_donor_selection_candidate_units_data.csv' not found.")
@@ -212,10 +220,20 @@ def estimate(
     temp_folder = f"temp_{datetime.now().strftime("%Y%m%d_%H%M%S")}"
 
     unacceptable_solutions = []
+    weight_solutions = pd.DataFrame()
     for solution_id in solutions_id:
         dataset = dataset_raw.copy()
         solution_has_problem = ""
         dataset = dataset[(dataset['treatment'] == 1) | (dataset['solution_id'] == solution_id)]
+        if filtered_unitid:
+            dataset = dataset[(dataset['treatment'] == 1) | (dataset['unitid'].isin(solutions_id_unitids[solution_id]))]
+            unitids = sorted(solutions_id_unitids[solution_id])
+        else:
+            # Get sorted lists of unique control unit IDs and outcome names.
+            unitids = sorted(dataset[dataset['treatment'] == 0]['unitid'].unique())
+        print(f"Using unitids: {unitids}")
+
+        impact_score = dataset[dataset['treatment'] == 0]['impact_score'].unique()[0]
 
         # Keep only the essential columns for the analysis.
         dataset = dataset[["outcome", "timeid", "value", "treatment", "unitid"]]
@@ -257,9 +275,6 @@ def estimate(
 
         # Separate the control unit data.
         control_df = dataset[dataset['treatment'] == 0]
-        # Get sorted lists of unique control unit IDs and outcome names.
-        unitids = sorted(control_df['unitid'].unique())
-        print(f"Using unitids: {unitids}")
         outcomes = sorted(dataset['outcome'].unique())
         N_outcomes = len(outcomes)
 
@@ -335,7 +350,7 @@ def estimate(
         'Y_control_test': Y_control_test,
         'Y_control_post': Y_control_post,
         'dirichlet_alpha': np.repeat(1.0, N_controls), # Hyperparameter for the Dirichlet prior on weights (uninformative).
-        'tau_nrmse_scale': 0.1 # Hyperparameter for the prior on the NRMSE noise term.
+        'tau_nrmse_prior': np.repeat(0.1, N_outcomes) # Hyperparameter for the prior on the NRMSE noise term.
         }
 
         # 4. FIT THE STAN MODEL
@@ -393,7 +408,7 @@ def estimate(
 
         r_hat = fit.summary()['R_hat'].mean()
         if 0.99 > r_hat or r_hat > 1.01:
-            solution_has_problem = solution_has_problem + 'O'
+            solution_has_problem = solution_has_problem + 'D'
             unacceptable_solutions.append(solution_id)
 
         # 5. POST-PROCESSING AND VISUALIZATION
@@ -404,7 +419,9 @@ def estimate(
         # Filter for variables related to the treatment effect (residuals and effects) and reshape the data.
         # The 'melt' function converts the DataFrame from wide format (one column per parameter instance)
         # to long format, which is more convenient for grouping and plotting.
-        vars_to_extract = ["residuals_pre", "residuals_test", "effect_post"]
+        vars_to_extract = ["residuals_pre", "residuals_test", "effect_post",
+                           "y_synth_pre_scaled", "y_synth_test_scaled", "y_synth_post_scaled",
+                           "predictive_pre", "predictive_test", "predictive_post"]
         chains_effect_df = draws_df.melt(
             id_vars=['chain__', 'iter__'],
             value_vars=[col for col in draws_df.columns if any(col.startswith(v) for v in vars_to_extract)],
@@ -422,11 +439,11 @@ def estimate(
         # Define a function to reconstruct the original 'timeid' from the Stan indices.
         # This requires knowing the structure of the pre, test, and post periods.
         def get_timeid(row):
-            if row['var_name'] == 'residuals_pre':
+            if row['var_name'] == 'residuals_pre' or row['var_name'] == 'y_synth_pre_scaled' or row['var_name'] == 'predictive_pre':
                 return row['index_1'] + timeid_inicio - 1
-            elif row['var_name'] == 'residuals_test':
+            elif row['var_name'] == 'residuals_test' or row['var_name'] == 'y_synth_test_scaled' or row['var_name'] == 'predictive_test':
                 return row['index_1'] + timeid_inicio + N_pre - 1
-            elif row['var_name'] == 'effect_post':
+            elif row['var_name'] == 'effect_post' or row['var_name'] == 'y_synth_post_scaled' or row['var_name'] == 'predictive_post':
                 return row['index_1'] + timeid_base
             return -1
 
@@ -436,6 +453,9 @@ def estimate(
         chains_effect_df['timeid'] = np.where(chains_effect_df['timeid'] == -1, np.nan, chains_effect_df['timeid'])
         # Map the second index back to the outcome name.
         chains_effect_df['outcome'] = chains_effect_df['index_2'].apply(lambda x: outcomes[x-1])
+        chains_effect_df['type'] = np.where((chains_effect_df['var_name'] == 'residuals_pre') | (chains_effect_df['var_name'] == 'residuals_test') | (chains_effect_df['var_name'] == 'effect_post'), 'relative',
+                                            np.where((chains_effect_df['var_name'] == 'y_synth_pre_scaled') | (chains_effect_df['var_name'] == 'y_synth_test_scaled') | (chains_effect_df['var_name'] == 'y_synth_post_scaled'), 'absolute_structural',
+                                                     np.where((chains_effect_df['var_name'] == 'predictive_pre') | (chains_effect_df['var_name'] == 'predictive_test') | (chains_effect_df['var_name'] == 'predictive_post'), 'absolute_predictive', 'error')))
         # Drop the now redundant columns.
         chains_effect_df.drop(columns=['variable', 'var_name', 'index_1', 'index_2'], inplace=True)
 
@@ -460,8 +480,21 @@ def estimate(
 
 
         # Initialize lists to store summary statistics from each outcome's plot.
+        absolute_structural_timeid_list = []
+        absolute_predictive_timeid_list = []
         att_period_list = []
         att_timeid_list = []
+
+        chains_relative_effect_df = chains_effect_df[chains_effect_df['type'] == 'relative']
+        chains_relative_effect_df.drop(['type'], axis=1, inplace=True)
+
+        treated_df['timeid'] = treated_df['timeid'].apply(lambda x: mapping_timeid[x-1] if x > 0 and pd.notna(x) else -1)
+
+        chains_absolute_structural_effect_df = chains_effect_df[chains_effect_df['type'] == 'absolute_structural']
+        chains_absolute_structural_effect_df.drop(['type'], axis=1, inplace=True)
+
+        chains_absolute_predictive_effect_df = chains_effect_df[chains_effect_df['type'] == 'absolute_predictive']
+        chains_absolute_predictive_effect_df.drop(['type'], axis=1, inplace=True)
 
         # Loop through each outcome to generate and save individual plots.
         for idx, current_indicator in enumerate(outcomes):
@@ -472,14 +505,98 @@ def estimate(
             indicator_info = std_avg_dt[std_avg_dt['outcome'] == current_indicator]
             avg_value = indicator_info['avg_value'].iloc[0]
             std_value = indicator_info['std_value'].iloc[0]
+
+            treated_subset = treated_df[treated_df['outcome'] == current_indicator].copy()
+            treated_subset['value'] = treated_subset['value'] * std_value + avg_value
+            treated_subset = treated_subset[['timeid', 'value']]
+            treated_subset.columns = ['timeid', 'treatment']
             
+            # ABSOLUTE STRUCTURAL
+            # Filter the time series data for the current outcome.
+            absolute_structural_subset = chains_absolute_structural_effect_df[chains_absolute_structural_effect_df['outcome'] == current_indicator].copy()
+            # Create a 'period' column to distinguish between pre- and post-treatment time points.
+            absolute_structural_subset['period'] = np.where(absolute_structural_subset['timeid'].astype(str) > str(mapping_timeid[timeid_base-1]), "Post", "Pre")
+            # Rescale the 'value' (the effect) back to the original units by multiplying by the standard deviation.
+            # The mean is not added back because we are looking at effects (differences), where the mean cancels out.
+            absolute_structural_subset['value'] = absolute_structural_subset['value'] * std_value + avg_value
+
+            absolute_structural_timeid = absolute_structural_subset.groupby(['timeid', 'period'])['value'].agg(
+                q2_5=lambda x: x.quantile(0.025),
+                mean='mean',
+                q97_5=lambda x: x.quantile(0.975)
+            ).reset_index()
+
+            absolute_structural_timeid = pd.merge(absolute_structural_timeid, treated_subset, on=['timeid'], how='left')
+
+            # Determine the tick marks for the time axis to avoid overcrowding.
+            num_unique_timeids = len(chains_absolute_structural_effect_df['timeid'].unique())
+            length_desired_breaks = math.ceil(num_unique_timeids / 40.0)
+            time_breaks = mapping_timeid[::length_desired_breaks]
+
+            p = (
+                ggplot(data=absolute_structural_timeid) +
+                geom_ribbon(aes(x="timeid", ymin="q2_5", ymax="q97_5", group=1, fill="'Uncertainty'"), alpha=0.2) +
+                scale_fill_manual(values={"Uncertainty": "gray"}) +
+                geom_vline(xintercept=timeid_base, linetype="dashed", color="red") + # Vertical line at the intervention point.
+                geom_line(aes(x="timeid", y="mean", group=1, color="'Synthetic Control'")) +
+                geom_line(aes(x="timeid", y="treatment", group=1, color="'Treatment'")) +
+                scale_color_manual(values={"Mean": "black", "Treatment": "blue"}) +
+                theme_classic() +
+                ggtitle(f"{current_indicator} - Low-Rank Trends - Structural View") +
+                ylab("Absolute Value") +
+                theme(axis_text_x=element_text(angle=45, hjust=1), legend_position="top", legend_title=element_blank(), plot_title=element_text(hjust=0)) +
+                scale_x_discrete(breaks=list(time_breaks), name="timeid")
+            )
+            # Save the plot to a file.
+            p.save(f"{workspace_folder}/{temp_folder}/solution_id_{solution_id}/{current_indicator}/absolute structural view.png", width=14, height=6, dpi=300)
+
+            # ABSOLUTE PREDICTIVE
+            # Filter the time series data for the current outcome.
+            absolute_predictive_subset = chains_absolute_predictive_effect_df[chains_absolute_predictive_effect_df['outcome'] == current_indicator].copy()
+            # Create a 'period' column to distinguish between pre- and post-treatment time points.
+            absolute_predictive_subset['period'] = np.where(absolute_predictive_subset['timeid'].astype(str) > str(mapping_timeid[timeid_base-1]), "Post", "Pre")
+            # Rescale the 'value' (the effect) back to the original units by multiplying by the standard deviation.
+            # The mean is not added back because we are looking at effects (differences), where the mean cancels out.
+            absolute_predictive_subset['value'] = absolute_predictive_subset['value'] * std_value + avg_value
+
+            absolute_predictive_timeid = absolute_predictive_subset.groupby(['timeid', 'period'])['value'].agg(
+                q2_5=lambda x: x.quantile(0.025),
+                mean='mean',
+                q97_5=lambda x: x.quantile(0.975)
+            ).reset_index()
+
+            absolute_predictive_timeid = pd.merge(absolute_predictive_timeid, treated_subset, on=['timeid'], how='left')
+
+            # Determine the tick marks for the time axis to avoid overcrowding.
+            num_unique_timeids = len(chains_absolute_predictive_effect_df['timeid'].unique())
+            length_desired_breaks = math.ceil(num_unique_timeids / 40.0)
+            time_breaks = mapping_timeid[::length_desired_breaks]
+
+            p = (
+                ggplot(data=absolute_predictive_timeid) +
+                geom_ribbon(aes(x="timeid", ymin="q2_5", ymax="q97_5", group=1, fill="'Uncertainty'"), alpha=0.2) +
+                scale_fill_manual(values={"Uncertainty": "gray"}) +
+                geom_vline(xintercept=timeid_base, linetype="dashed", color="red") + # Vertical line at the intervention point.
+                geom_line(aes(x="timeid", y="mean", group=1, color="'Synthetic Control'")) +
+                geom_line(aes(x="timeid", y="treatment", group=1, color="'Treatment'")) +
+                scale_color_manual(values={"Mean": "black", "Treatment": "blue"}) +
+                theme_classic() +
+                ggtitle(f"{current_indicator} - Strict Parallel Trends - Predictive View") +
+                ylab("Absolute Value") +
+                theme(axis_text_x=element_text(angle=45, hjust=1), legend_position="top", legend_title=element_blank(), plot_title=element_text(hjust=0)) +
+                scale_x_discrete(breaks=list(time_breaks), name="timeid")
+            )
+            # Save the plot to a file.
+            p.save(f"{workspace_folder}/{temp_folder}/solution_id_{solution_id}/{current_indicator}/absolute predictive view.png", width=14, height=6, dpi=300)
+
+            # RELATIVE 
             # Filter the effects data for the current outcome.
-            effect_subset = chains_effect_df[chains_effect_df['outcome'] == current_indicator].copy()
+            effect_subset = chains_relative_effect_df[chains_relative_effect_df['outcome'] == current_indicator].copy()
             # Create a 'period' column to distinguish between pre- and post-treatment time points.
             effect_subset['period'] = np.where(effect_subset['timeid'].astype(str) > str(mapping_timeid[timeid_base-1]), "Post", "Pre")
             # Rescale the 'value' (the effect) back to the original units by multiplying by the standard deviation.
             # The mean is not added back because we are looking at effects (differences), where the mean cancels out.
-            effect_subset['value'] *= std_value 
+            effect_subset['value'] *= std_value
             
             # Calculate the average effect per period for each MCMC iteration.
             att_chain_period = effect_subset.groupby(['iteration', 'chain', 'period'])['value'].agg(
@@ -501,7 +618,7 @@ def estimate(
             ).reset_index()
 
             # Determine the tick marks for the time axis to avoid overcrowding.
-            num_unique_timeids = len(chains_effect_df['timeid'].unique())
+            num_unique_timeids = len(chains_relative_effect_df['timeid'].unique())
             length_desired_breaks = math.ceil(num_unique_timeids / 40.0)
             time_breaks = mapping_timeid[::length_desired_breaks]
 
@@ -572,6 +689,12 @@ def estimate(
             plt.savefig(f"{workspace_folder}/{temp_folder}/solution_id_{solution_id}/{current_indicator}/structural_nrmse.png")
 
             # Store the summary results for the current outcome in the lists.
+            absolute_structural_timeid['outcome'] = current_indicator
+            absolute_structural_timeid_list.append(absolute_structural_timeid)
+
+            absolute_predictive_timeid['outcome'] = current_indicator
+            absolute_predictive_timeid_list.append(absolute_predictive_timeid)
+
             att_period['outcome'] = current_indicator
             att_period_list.append(att_period)
 
@@ -579,9 +702,13 @@ def estimate(
             att_timeid_list.append(att_timeid)
 
         # Combine the summary results from all outcomes into single DataFrames.
+        absolute_structural_timeid_df = pd.concat(absolute_structural_timeid_list)
+        absolute_predictive_timeid_df = pd.concat(absolute_predictive_timeid_list)
         att_period_df = pd.concat(att_period_list)
         att_timeid_df = pd.concat(att_timeid_list)
         # Save the summarized results and the full set of MCMC draws to CSV files for further analysis.
+        absolute_structural_timeid_df.to_csv(f"{workspace_folder}/{temp_folder}/solution_id_{solution_id}/absolute_structural_timeid_dt.csv", index=False)
+        absolute_predictive_timeid_df.to_csv(f"{workspace_folder}/{temp_folder}/solution_id_{solution_id}/absolute_predictive_timeid_dt.csv", index=False)
         att_period_df.to_csv(f"{workspace_folder}/{temp_folder}/solution_id_{solution_id}/att_period_dt.csv", index=False)
         att_timeid_df.to_csv(f"{workspace_folder}/{temp_folder}/solution_id_{solution_id}/att_timeid_dt.csv", index=False)
         draws_df.to_csv(f"{workspace_folder}/{temp_folder}/solution_id_{solution_id}/chains_all_parameters.csv", index=False)
@@ -599,7 +726,7 @@ def estimate(
         axes = az.plot_density(
             [inference_data.sel(chain=[0]), inference_data.sel(chain=[1]),
             inference_data.sel(chain=[2]), inference_data.sel(chain=[3])],
-            var_names=["w", "sigma", "tau_nrmse"],
+            var_names=["w", "sigma", "tau_nrmse", "gini_weight"],
             shade=0.0,
             hdi_prob=0.95,
             point_estimate="mean",
@@ -618,10 +745,14 @@ def estimate(
 
         # Create user-friendly titles for each subplot.
         plot_titles = [name for name in az.summary(inference_data).index.tolist() if name.startswith(("w", "sigma", "tau_nrmse"))]
-                                                            
+        new_w_names = {f"w[{index}]": f"w[{name}]" for index, name in enumerate(unitids)}
+        new_s_names = {f"sigma[{index}]": f"sigma[{name}]" for index, name in enumerate(outcomes)}
+        new_t_names = {f"tau_nrmse[{index}]": f"tau_nrmse[{name}]" for index, name in enumerate(outcomes)}
+        new_names = new_w_names | new_s_names | new_t_names
+        plot_titles = [new_names.get(name, name) for name in plot_titles]
+
         for i, ax in enumerate(axes.flatten()):
-            if i < len(plot_titles):
-                                    
+            if i < len(plot_titles):                                
                 ax.set_title(plot_titles[i], fontsize=12)
                 ax.tick_params(axis='x', labelsize=12)
 
@@ -647,9 +778,10 @@ def estimate(
             var_names="w",
             combined=True,
             figsize=(14, max(6, N_controls * 0.3)), # Adjust height based on number of controls.
-            hdi_prob=0.95
+            hdi_prob=0.95,
+            labeller=az.labels.MapLabeller(coord_map={"w_dim_0": {index: name for index, name in enumerate(unitids)}})
         )
-        plt.suptitle("Posterior Distribution of Donor Unit Weights (w)", fontsize=16, y=0.97)
+        plt.suptitle("Posterior Distribution of Control Unit Weights (w)", fontsize=16, y=0.97)
         plt.savefig(f"{workspace_folder}/{temp_folder}/solution_id_{solution_id}/unitid_weight_simultanous_distribution.png")
 
         chains_w_df = draws_df.melt(
@@ -658,10 +790,62 @@ def estimate(
             var_name='variable'
         )
         chains_w_df.rename(columns={'chain__': 'chain', 'iter__': 'iteration'}, inplace=True)
-        chains_w_df['acceptable'] = np.where(chains_w_df['value'] > max_weight_threshold, False, True)
 
-        if any(chains_w_df.groupby('variable')['acceptable'].mean() < min_perc_chains_below_weight_threshold):
+        # The variable names from Stan (e.g., "effect_post[1,2]") contain index information.
+        # This code extracts the variable name and its indices into separate columns.
+        extracted_info = chains_w_df['variable'].str.extract(r'(\w+)\[(\d+)\]')
+        chains_w_df['var_name'] = extracted_info[0]
+        chains_w_df['index_1'] = pd.to_numeric(extracted_info[1]) # Corresponds to unitid
+
+        # Map the first index back to the unitid name.
+        chains_w_df['unitid'] = chains_w_df['index_1'].apply(lambda x: unitids[x-1])
+
+        temp_weight_solutions = chains_w_df.groupby('unitid').agg({
+            'value' : 'mean'
+        }).reset_index()
+        temp_weight_solutions['impact_score'] = impact_score
+        temp_weight_solutions['solution_id'] = solution_id
+
+        weight_solutions = pd.concat([weight_solutions, temp_weight_solutions])
+
+        if (np.where(draws_df['gini_weight'] < max_gini_threshold, 1.0, 0.0).mean() < min_perc_chains_below_gini_threshold):
             solution_has_problem = solution_has_problem + 'W'
+            
+        # vars_to_extract = ["nrmse_pre", "nrmse_test", "struc_nrmse_pre", "struc_nrmse_test"]
+        # chains_error_df = draws_df.melt(
+        #     id_vars=['chain__', 'iter__'],
+        #     value_vars=[col for col in draws_df.columns if any(col.startswith(v) for v in vars_to_extract)],
+        #     var_name='variable'
+        # )
+        # chains_error_df.rename(columns={'chain__': 'chain', 'iter__': 'iteration'}, inplace=True)
+
+        # # The variable names from Stan (e.g., "effect_post[1,2]") contain index information.
+        # # This code extracts the variable name and its indices into separate columns.
+        # extracted_info = chains_error_df['variable'].str.extract(r'(\w+)\[(\d+)\]')
+        # chains_error_df['var_name'] = extracted_info[0]
+        # chains_error_df['index_1'] = pd.to_numeric(extracted_info[1]) # Corresponds to unitid
+
+        # # Map the first index back to the unitid name.
+        # chains_error_df['outcome'] = chains_error_df['index_1'].apply(lambda x: outcomes[x-1])
+        # temp_error_outcome = chains_error_df.groupby(['var_name', 'outcome']).agg({
+        #     'value' : 'mean'
+        # }).reset_index()
+
+        # temp_error_outcome['base_var'] = temp_error_outcome['var_name'].str.replace('_pre$|_test$', '', regex=True)
+        # temp_error_outcome['type'] = temp_error_outcome['var_name'].str.extract('(pre|test)$')
+
+        # # Filter out rows that are not 'pre' or 'test' (e.g., 'nrmse_pre_test')
+        # df_filtered = temp_error_outcome.dropna(subset=['type'])
+        # df_filtered = df_filtered[df_filtered['base_var'].isin(["nrmse", "struc_nrmse"])]
+
+        # # Pivot the table to have 'pre' and 'test' values in the same row
+        # df_pivot = df_filtered.pivot_table(index=['base_var', 'outcome'], columns='type', values='value').reset_index()
+
+        # # Calculate the absolute percentage difference
+        # df_pivot['absolute_percentage_error'] = abs((df_pivot['test'] - df_pivot['pre']) / df_pivot['pre']) * 100
+
+        # if any(abs((df_pivot['test'] - df_pivot['pre']) / df_pivot['pre']) * 100) > maximun_perc_diff_error_train_validation:
+        #     solution_has_problem = solution_has_problem + 'E'
 
         if solution_has_problem != "":
             os.rename(f"{workspace_folder}/{temp_folder}/solution_id_{solution_id}", f"{workspace_folder}/{temp_folder}/{solution_has_problem}_solution_id_{solution_id}")
@@ -669,16 +853,14 @@ def estimate(
 
     complemento = list(set(solutions_id) - set(np.unique(unacceptable_solutions)))
 
-
-    filtered_df = dataset_raw[(dataset_raw['solution_id'].isin(complemento)) &
-                              (dataset_raw['treatment'] == 0)][['solution_id', 'impact_score', 'unitid', 'weight']].drop_duplicates()
+    weight_solutions_filtred = weight_solutions[weight_solutions['solution_id'].isin(complemento)]
 
     # 2. Create the 'N' and 'sid' columns
-    filtered_df['N'] = filtered_df['weight'].round(2).astype(str)
-    filtered_df['impact_score_solution_id'] = filtered_df['impact_score'].astype(str) + '_' + filtered_df['solution_id'].astype(int).astype(str)
+    weight_solutions_filtred['N'] = weight_solutions_filtred['value'].round(2).astype(str)
+    weight_solutions_filtred['impact_score_solution_id'] = weight_solutions_filtred['impact_score'].astype(str) + '_' + weight_solutions_filtred['solution_id'].astype(int).astype(str)
 
     # 3. Reshape the data using pivot_table and fill missing values
-    result_df = filtered_df.pivot_table(
+    result_df = weight_solutions_filtred.pivot_table(
         index='unitid',
         columns='impact_score_solution_id',
         values='N',
