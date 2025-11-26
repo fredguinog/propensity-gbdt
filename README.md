@@ -94,7 +94,6 @@ donor_selection.search(
     value = "Value",
     treatment = "treatment",
     pre_intervention = "pre_intervention",
-    temporal_cross_search = ['2012', '2013', '2014'],
     workspace_folder = 'C:/test_propensitygbdt_scm_donor_selection/'
 )
 
@@ -110,26 +109,32 @@ bayesian_scm.estimate(
 
 ### Main Parameters
 
-*   `all_units` (pd.DataFrame): The input DataFrame containing the entire dataset.
-*   `yname` (str): The name of the column indicating the outcome variable.
-*   `unitname` (str): The name of the column for the unit identifier.
-*   `tname` (str): The name of the column for the time period.
-*   `value` (str): The name of the column for the value of the outcome variable.
-*   `treatment` (str): The name of the column indicating treatment status (1 for treated, 0 for control).
-*   `pre_intervention` (str): The name of the column indicating the pre-intervention period (1 for pre-intervention, 0 for post-intervention).
-*   `temporal_cross_search` (list): A list of pre-intervention splits to be used for cross-validation.
-*   `workspace_folder` (str): The path to the folder where the output files will be saved.
+*   `all_units` : pd.DataFrame. The panel data containing columns for time, unit, outcome, treatment indicator, and values.
+*   `yname` : str. Name of the column containing the outcome variable names/labels.
+*   `unitname` : str. Name of the column containing unit identifiers.
+*   `tname` : str. Name of the column containing time identifiers.
+*   `value` : str. Name of the column containing the metric values.
+*   `treatment` : str. Name of the column indicating treatment status (1 for treated unit, 0 for control).
+*   `pre_intervention` : str. Name of the column indicating the pre-intervention period (1 for pre, 0 for post).
+*   `workspace_folder` : str. Path to the directory where intermediate results and the solution CSV will be saved.
 
 ### Optional Parameters
 
-*   `seed` (int, optional): The random seed for reproducibility. Defaults to `111`.
-*   `maximum_num_units_on_attipw_support` (int, optional): The maximum number of control units allowed in the on-support group, used to remove units not ATT/IPW similar to the treatment unit. Defaults to 50.
-*   `max_correlation_between_control_units` (float, optional): The maximum correlation between control units maximizing the represetations of all low rank hidden trends of the treatment unit. It limits the selected control units from the previous filter. Defaults to 0.5.
-*   `maximum_control_unit_weight` (float, optional): The maximum permissible weight for any single control unit in the synthetic control for a candidate donor pool to be viable. This helps prevent the model from relying too heavily on one donor unit. Defaults to 0.5
-*   `maximum_error_pre_intervention` (float, optional): The maximum acceptable error RMSE on the pre-treatment outcomes for a candidate donor pool to be viable. Defaults to 0.15.
-*   `maximun_perc_diff_error_train_validation` (float, optional): The maximum acceptable absolut percentage difference between train error and validation error. Defaults to `0.2`.
-*   `number_optuna_trials` (int, optional): The number of trials for the Optuna hyperparameter optimization. Defaults to `300`.
-*   `timeout_optuna_cycle` (int, optional): The timeout in seconds for each Optuna optimization cycle. Defaults to `900`.
+*   `temporal_cross_search_splits` : list, optional. List of time-IDs defining the cutoffs for the expanding window cross-validation. If None, splits are calculated automatically based on ratios.
+*   `seed` : int, default=111. Random seed for reproducibility in sampling and model training.
+*   `maximum_control_sd_times_treatment_sd `: int, default=5.0. Threshold for filtering control units based on variance comparison with the treated unit.
+*   `maximum_num_units_on_attipw_support` : int, default=50. Maximum number of control units to select based on IPW ranking before fitting SCM.
+*   `maximum_gram_cond_train` : float, default=100.0. Maximum allowable condition number for the Gram matrix of selected donors to ensure linear independence (mitigates multicollinearity).
+*   `minimum_donor_selection` : int, default=3. Minimum number of donor units required to form a valid synthetic control.
+*   `maximum_control_unit_weight_train` : float, default=0.5. Constraint to ensure no single donor dominates the synthetic control (max weight < 0.5).
+*   `synthetic_control_bias_removal_period` : Literal, default='pre_intervention'. Strategy for centering/scaling control units relative to the treated unit (e.g., based on the full pre-period).
+*   `function_aggregate_outcomes_error` : Literal, default='mean'. Metric to aggregate errors across multiple outcomes ('mean' or 'max').
+*   `save_solution_period_error` : Literal, default='pre_intervention'. Determines which period's error is checked against `save_solution_maximum_error` to decide if a solution is saved.
+*   `save_solution_maximum_error` : float, default=0.15. The maximum allowable RMSPE (normalized) for a candidate solution to be saved to disk.
+*   `alpha_exponential_decay` : float, default=0.00. Decay factor for time-relevance weights; higher values give more weight to recent time periods.
+*   `optuna_optimization_target` : Literal, default='pre_intervention'. The error metric Optuna attempts to minimize ('pre_intervention' or 'validation_folder').
+*   `optuna_number_trials` : int, default=1000. Number of hyperparameter optimization trials to run per temporal split.
+*   `optuna_timeout_cycle` : int, default=900. Time limit (in seconds) for the Optuna optimization cycle.
 
 ## bayesian_scm.estimate Parameters
 

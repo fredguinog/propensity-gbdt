@@ -86,7 +86,7 @@ transformed data {
   vector[N_outcomes] mean_Y_treated_pre;
   vector[N_outcomes] sd_Y_treated_pre;
   for (k in 1:N_outcomes) {
-    mean_Y_treated_pre[k] = mean(Y_treated_pre[, k]);
+	mean_Y_treated_pre[k] = mean(Y_treated_test[, k]);
     sd_Y_treated_pre[k] = sd(Y_treated_pre[, k]);
   }
   
@@ -122,7 +122,7 @@ transformed parameters {
     vector[N_post] y_synth_post_k = Y_control_post[k] * w;
     
     // 2. Standardize this synthetic control using its OWN mean and sd.
-    real mean_Y_synth_pre_k = mean(y_synth_pre_k);
+	real mean_Y_synth_pre_k = mean(y_synth_test_k);
     real sd_Y_synth_pre_k = sd(y_synth_pre_k);
     vector[N_pre] y_synth_pre_std_k;
     vector[N_test] y_synth_test_std_k;

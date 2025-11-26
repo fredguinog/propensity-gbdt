@@ -50,6 +50,7 @@ import os
 import pandas as pd
 import numpy as np
 import cmdstanpy
+from scipy.linalg import qr
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 from plotnine import *
@@ -63,10 +64,11 @@ warnings.filterwarnings("ignore")
 
 """
 Calculates the Gram condition number of the shapes of time series for multiple outcomes.
-
 This function isolates the shape of the time series by taking the first difference.
-It then computes the condition number of the Gram matrix of these differenced series
+It then computes the condition number of the Gram matrix of these normalized differenced series
 for each outcome, providing a measure of shape multicollinearity among control units.
+Differencing removes levels; per-unit standardization of differences removes scales, focusing purely on shape.
+Uses QR orthogonalization with pivoting for robust condition number estimation.
 
 Args:
     df: A long format pandas DataFrame with the following columns:
@@ -79,17 +81,14 @@ Args:
 Returns:
     A pandas DataFrame with the Gram condition number for each outcome.
 """
-def calculate_gram_cond_by_shape(df: pd.DataFrame) -> pd.DataFrame:
+def calculate_gram_cond_by_shape(df: pd.DataFrame) -> float:
     # Ensure the DataFrame is sorted for differencing
     df = df.sort_values(by=['outcome', 'unitid', 'timeid']).reset_index(drop=True)
-
     # Isolate control units
     control_df = df[df['treatment'] == 0].copy()
-
     # Calculate the first difference of the 'value' for each unit and outcome
     # This transformation focuses on the shape of the time series
     control_df['value_diff'] = control_df.groupby(['unitid', 'outcome'])['value'].diff()
-
     # Pivot the table to have time series of control units as columns for each outcome
     # Drop rows with NaN values resulting from the differencing
     pivot_df = control_df.dropna().pivot_table(
@@ -97,22 +96,28 @@ def calculate_gram_cond_by_shape(df: pd.DataFrame) -> pd.DataFrame:
         columns='unitid',
         values='value_diff'
     )
-
     # Group by outcome to calculate the Gram condition number for each
     results = []
     for outcome, group_df in pivot_df.groupby(level='outcome'):
         # The matrix of differenced time series for the control units
         X = group_df.values
-        
-        # Calculate the condition number of the Gram matrix (X.T @ X)
-        # Using np.linalg.cond on X directly is more numerically stable and efficient
-        # as it computes the ratio of the largest to smallest singular values of X,
-        # the square of which is the condition number of X.T @ X.
+       
+        # Normalize to ignore scales: standardize per unit (column)
         if X.shape[1] > 0:
-            cond_number = np.linalg.cond(X) ** 2
+            stds = np.std(X, axis=0)
+            # Handle zero std (constant series after diff)
+            stds[stds == 0] = 1.0  # Treat as unit variance to avoid div-by-zero
+            X_normalized = X / stds[None, :]  # Unit-variance columns, pure shape
+           
+            # Robust cond via QR orthogonalization with pivoting
+            _, R, _ = qr(X_normalized, mode='economic', pivoting=True)
+            if R.size > 0:
+                cond_r = np.linalg.cond(R)
+                cond_number = cond_r ** 2
+            else:
+                cond_number = 1.0
             results.append({'outcome': outcome, 'gram_cond': cond_number})
-
-    return pd.DataFrame(results)
+    return pd.DataFrame(results)['gram_cond'].max()
 
 """
 Performs a comprehensive Bayesian Synthetic Control Method (BSCM) analysis.
@@ -141,22 +146,15 @@ Args:
     seed (int, optional): A random seed to ensure the reproducibility of the
                           MCMC sampling and any other stochastic processes.
                           Defaults to 222.
-    gram_cond_threshold (float, optional): The maximum allowable value for the Gram
+    maximum_gram_cond (float, optional): The maximum allowable value for the Gram
                                          matrix condition number. This is used as a
                                          threshold to detect multicollinearity among
                                          control units; solutions exceeding it are flagged.
                                          Defaults to 100.0.
-    max_gini_threshold (float, optional): The maximum permissible gini of the weight distribution
+    maximum_mean_gini_weights (float, optional): The maximum permissible mean gini of the weight distribution
                                           for the synthetic control. This helps prevent the model
                                           from relying too heavily on one control unit.
                                           Defaults to 0.5.
-    min_perc_chains_below_gini_threshold (float, optional): The minimum percentage
-                                                              of MCMC chains where gini of
-                                                              the weight distribution must be below
-                                                              the `max_gini_threshold`.
-                                                              This ensures the weight
-                                                              constraint is robustly met.
-                                                              Defaults to 0.67.
 """
 def estimate(
     timeid_previous_intervention,
@@ -164,9 +162,8 @@ def estimate(
     solution_id=None,
     period_effect_format='{:.2f}',
     seed=222,
-    gram_cond_threshold=100.0,
-    max_gini_threshold=0.4,
-    min_perc_chains_below_gini_threshold=0.67
+    maximum_gram_cond=100.0,
+    maximum_mean_gini_weights=0.5
 ):
     # Set the random seed for NumPy to ensure reproducibility of its random operations.
     np.random.seed(seed)
@@ -278,9 +275,8 @@ def estimate(
         outcomes = sorted(dataset['outcome'].unique())
         N_outcomes = len(outcomes)
 
-        gram_cond_df = calculate_gram_cond_by_shape(df = dataset[(dataset['treatment'] == 0) & (dataset['timeid'] <= timeid_base - test_period_size)])
-        gram_cond_max = gram_cond_df['gram_cond'].max()
-        if gram_cond_threshold < gram_cond_max:
+        gram_cond_max = calculate_gram_cond_by_shape(df = dataset[(dataset['treatment'] == 0) & (dataset['timeid'] <= timeid_base - test_period_size)])
+        if maximum_gram_cond < gram_cond_max:
             solution_has_problem = solution_has_problem + 'M'
             unacceptable_solutions.append(solution_id)
 
@@ -808,44 +804,8 @@ def estimate(
 
         weight_solutions = pd.concat([weight_solutions, temp_weight_solutions])
 
-        if (np.where(draws_df['gini_weight'] < max_gini_threshold, 1.0, 0.0).mean() < min_perc_chains_below_gini_threshold):
+        if (draws_df['gini_weight'].mean() > maximum_mean_gini_weights):
             solution_has_problem = solution_has_problem + 'W'
-            
-        # vars_to_extract = ["nrmse_pre", "nrmse_test", "struc_nrmse_pre", "struc_nrmse_test"]
-        # chains_error_df = draws_df.melt(
-        #     id_vars=['chain__', 'iter__'],
-        #     value_vars=[col for col in draws_df.columns if any(col.startswith(v) for v in vars_to_extract)],
-        #     var_name='variable'
-        # )
-        # chains_error_df.rename(columns={'chain__': 'chain', 'iter__': 'iteration'}, inplace=True)
-
-        # # The variable names from Stan (e.g., "effect_post[1,2]") contain index information.
-        # # This code extracts the variable name and its indices into separate columns.
-        # extracted_info = chains_error_df['variable'].str.extract(r'(\w+)\[(\d+)\]')
-        # chains_error_df['var_name'] = extracted_info[0]
-        # chains_error_df['index_1'] = pd.to_numeric(extracted_info[1]) # Corresponds to unitid
-
-        # # Map the first index back to the unitid name.
-        # chains_error_df['outcome'] = chains_error_df['index_1'].apply(lambda x: outcomes[x-1])
-        # temp_error_outcome = chains_error_df.groupby(['var_name', 'outcome']).agg({
-        #     'value' : 'mean'
-        # }).reset_index()
-
-        # temp_error_outcome['base_var'] = temp_error_outcome['var_name'].str.replace('_pre$|_test$', '', regex=True)
-        # temp_error_outcome['type'] = temp_error_outcome['var_name'].str.extract('(pre|test)$')
-
-        # # Filter out rows that are not 'pre' or 'test' (e.g., 'nrmse_pre_test')
-        # df_filtered = temp_error_outcome.dropna(subset=['type'])
-        # df_filtered = df_filtered[df_filtered['base_var'].isin(["nrmse", "struc_nrmse"])]
-
-        # # Pivot the table to have 'pre' and 'test' values in the same row
-        # df_pivot = df_filtered.pivot_table(index=['base_var', 'outcome'], columns='type', values='value').reset_index()
-
-        # # Calculate the absolute percentage difference
-        # df_pivot['absolute_percentage_error'] = abs((df_pivot['test'] - df_pivot['pre']) / df_pivot['pre']) * 100
-
-        # if any(abs((df_pivot['test'] - df_pivot['pre']) / df_pivot['pre']) * 100) > maximun_perc_diff_error_train_validation:
-        #     solution_has_problem = solution_has_problem + 'E'
 
         if solution_has_problem != "":
             os.rename(f"{workspace_folder}/{temp_folder}/solution_id_{solution_id}", f"{workspace_folder}/{temp_folder}/{solution_has_problem}_solution_id_{solution_id}")
