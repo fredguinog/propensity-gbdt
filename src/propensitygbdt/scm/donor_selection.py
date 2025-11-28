@@ -435,8 +435,8 @@ seed : int, default=111
 maximum_control_sd_times_treatment_sd : int, default=5.0
     Threshold for filtering control units based on variance comparison with the treated unit.
 maximum_num_units_on_attipw_support : int, default=50
-    Maximum number of control units to select based on IPW ranking before fitting SCM.
-maximum_gram_cond_train : float, default=100.0
+    Maximum number of control units to select based on IPW ranking before Gram condition selection then fitting SCM.
+maximum_gram_cond_train : float, default=500.0
     Maximum allowable condition number for the Gram matrix of selected donors to ensure 
     linear independence (mitigates multicollinearity).
 minimum_donor_selection : int, default=3
@@ -483,7 +483,7 @@ def search(
     seed: int = 111,
     maximum_control_sd_times_treatment_sd: int = 5.0,
     maximum_num_units_on_attipw_support: int = 50,
-    maximum_gram_cond_train: float = 100.0,
+    maximum_gram_cond_train: float = 500.0,
     minimum_donor_selection: int = 3,
     maximum_control_unit_weight_train: float = 0.5,
     synthetic_control_bias_removal_period: type_synthetic_control_bias_removal_period = 'pre_intervention',

@@ -123,8 +123,8 @@ bayesian_scm.estimate(
 *   `temporal_cross_search_splits` : list, optional. List of time-IDs defining the cutoffs for the expanding window cross-validation. If None, splits are calculated automatically based on ratios.
 *   `seed` : int, default=111. Random seed for reproducibility in sampling and model training.
 *   `maximum_control_sd_times_treatment_sd `: int, default=5.0. Threshold for filtering control units based on variance comparison with the treated unit.
-*   `maximum_num_units_on_attipw_support` : int, default=50. Maximum number of control units to select based on IPW ranking before fitting SCM.
-*   `maximum_gram_cond_train` : float, default=100.0. Maximum allowable condition number for the Gram matrix of selected donors to ensure linear independence (mitigates multicollinearity).
+*   `maximum_num_units_on_attipw_support` : int, default=50. Maximum number of control units to select based on IPW ranking before Gram condition selection then fitting SCM.
+*   `maximum_gram_cond_train` : float, default=500.0. Maximum allowable condition number for the Gram matrix of selected donors to ensure linear independence (mitigates multicollinearity).
 *   `minimum_donor_selection` : int, default=3. Minimum number of donor units required to form a valid synthetic control.
 *   `maximum_control_unit_weight_train` : float, default=0.5. Constraint to ensure no single donor dominates the synthetic control (max weight < 0.5).
 *   `synthetic_control_bias_removal_period` : Literal, default='pre_intervention'. Strategy for centering/scaling control units relative to the treated unit (e.g., based on the full pre-period).
@@ -140,17 +140,16 @@ bayesian_scm.estimate(
 
 ### Main Parameters
 
-*   `timeid_previous_intervention` (str): The last time period before the intervention begins. This defines the end of the pre-treatment period.
-*   `workspace_folder` (str): The file path to the root directory that contains the input data file ('scm_donor_selection_candidate_units_data.csv') and will store all output files (CSVs, plots).
+*   `timeid_previous_intervention` : str. The identifier for the final time period before the intervention starts. This value marks the end of the pre-treatment window.
+*   `workspace_folder` : str. The file path to the root directory that contains the input data file ('scm_donor_selection_candidate_units_data.csv') and will store all output files (CSVs, plots).
 
 ### Optional Parameters
 
-*   `solution_id` (int, optional): The specific ID for a pre-selected group of control units (the donor pool). If set to None, the function will automatically process all solutions saved in the input file. Defaults to None.
-*   `period_effect_format` (str): A format string for displaying numeric results in plot annotations of period results. Defaults to `'{:.2f}'`.
-*   `seed` (int, optional): A random seed to ensure reproducibility of the MCMC sampling and other random processes. Defaults to `222`.
-*   `gram_cond_threshold` (float, optional): The maximum allowable value for the Gram matrix condition number. This is used as a threshold to detect multicollinearity among control units; solutions exceeding it are flagged. Defaults to 100.0.
-*   `max_gini_threshold` (float, optional): The maximum permissible gini of the weight distribution for the synthetic control. This helps prevent the model from relying too heavily on one control unit. Defaults to 0.4.
-*   `min_perc_chains_below_gini_threshold` (float, optional): The minimum percentage of MCMC chains where gini of the weight distribution must be below the `max_gini_threshold`. This ensures the weight constraint is robustly met. Defaults to 0.67.
+*   `solution_id` : int, default=None.  The specific ID for a pre-selected group of control units (the donor pool). If set to None, the function will automatically choose the solution that demonstrates the best balance between pre-intervention fit and impact score.
+*   `period_effect_format` : str, default='{:.2f}'. A format string used to display numeric results in the plot annotations, such as the average treatment effect.
+*   `seed` : int, default=222. A random seed to ensure the reproducibility of the MCMC sampling and any other stochastic processes.
+*   `maximum_gram_cond` : float, default=100.0. The maximum allowable value for the Gram matrix condition number. This is used as a threshold to detect multicollinearity among control units; solutions exceeding it are flagged.
+*   `maximum_mean_gini_weights` : float, default=0.6. The maximum permissible mean gini of the weight distribution for the synthetic control. This helps prevent the model from relying too heavily on one control unit.
 
 ## Citation
 

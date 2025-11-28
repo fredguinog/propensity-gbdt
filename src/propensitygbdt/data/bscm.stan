@@ -37,21 +37,41 @@
 // corresponding treated unit's pre-treatment series before the likelihood is evaluated.
 // -----------------------------------------------------------------------------
 functions {
-  // Optimized vectorized Gini coefficient
-  real gini_simplex(vector y) {
+  // Optimized vectorized Normalized Gini coefficient (0 to 1 scale)
+  real normalized_gini_simplex(vector y) {
     int n = num_elements(y);
     vector[n] y_sorted;
     vector[n] idx;
     
     if (n == 0) reject("Gini requires n > 0");
-    if (n == 1) return 0.0;
+    if (n == 1) return 0.0; // A single unit has 100% weight, but variance is 0. Conventionally 0 or 1, but 0 is safer for penalty logic.
     
     y_sorted = sort_asc(y);
     for (i in 1:n) idx[i] = i;
     
     real sum_iy = dot_product(idx, y_sorted);
     
-    return (2 * sum_iy / n) - ((n + 1.0) / n);
+    return (2 * sum_iy - (n + 1.0)) / (n - 1.0);
+  }
+  
+  // Normalized Herfindahl-Hirschman Index (HHI)
+  // Scale: 0.0 (Perfectly Diversified) to 1.0 (Single Unit Concentration)
+  real normalized_hhi_simplex(vector w) {
+    int n = num_elements(w);
+    
+    // Safety check for single donor case
+    if (n <= 1) return 1.0; 
+    
+    // HHI is simply the sum of squared weights.
+    // In vector notation, this is the dot product of w with itself.
+    real raw_hhi = dot_product(w, w);
+    
+    // Calculate theoretical minimum HHI (1/N)
+    real min_hhi = 1.0 / n;
+    
+    // Normalize: (Val - Min) / (Max - Min)
+    // Max is always 1.0 for a simplex
+    return (raw_hhi - min_hhi) / (1.0 - min_hhi);
   }
 }
 
@@ -185,6 +205,11 @@ model {
 
 generated quantities {
   // This block generates quantities of interest for each outcome using the posterior draws.
+  
+  // We flatten the log-likelihoods into a vector of size (N_pre * N_outcomes)
+  vector[N_pre * N_outcomes] log_lik;
+  int idx = 1;
+  
   // Generate draws from the posterior predictive distribution for the effect of each outcome.
   // This incorporates the estimated model noise `sigma` into our prediction. 
   // Predictive residuals
@@ -197,52 +222,49 @@ generated quantities {
   vector[N_outcomes] nrmse_pre;
   vector[N_outcomes] nrmse_test;
   vector[N_outcomes] nrmse_post;
-  real gini_weight = gini_simplex(w);
+  real gini_weight = normalized_gini_simplex(w);
+  real hhi_weight = normalized_hhi_simplex(w);
   
-  for (k in 1:N_outcomes) {
-    for (t in 1:N_pre) {
-	  predictive_pre[t, k] = normal_rng(y_synth_pre_scaled[t, k], sigma[k]);
-      residuals_pre[t, k] = Y_treated_pre[t, k] - predictive_pre[t, k];
-    }
-    for (t in 1:N_test) {
-	  predictive_test[t, k] = normal_rng(y_synth_test_scaled[t, k], sigma[k]);
-      residuals_test[t, k] = Y_treated_test[t, k] - predictive_test[t, k];
-    }
-    for (t in 1:N_post) {
-	  predictive_post[t, k] = normal_rng(y_synth_post_scaled[t, k], sigma[k]);
-      effect_post[t, k] = Y_treated_post[t, k] - predictive_post[t, k];
-    }
-
-    nrmse_pre[k] = sqrt(mean(square(residuals_pre[, k] / amplitude[k])));
-    nrmse_test[k] = sqrt(mean(square(residuals_test[, k] / amplitude[k])));
-    nrmse_post[k] = sqrt(mean(square(effect_post[, k] / amplitude[k])));
-  }
-  
-  vector[N_outcomes] nrmse_pre_test = (nrmse_pre + nrmse_test) / 2;
-
   // Structural for raw trends
   matrix[N_pre, N_outcomes] struc_residuals_pre;
   matrix[N_test, N_outcomes] struc_residuals_test;
   matrix[N_post, N_outcomes] struc_effect_post;
   vector[N_outcomes] struc_nrmse_pre;
   vector[N_outcomes] struc_nrmse_test;
-  vector[N_outcomes] struc_nrmse_post;	
+  vector[N_outcomes] struc_nrmse_post;
+  
   for (k in 1:N_outcomes) {
     for (t in 1:N_pre) {
-      struc_residuals_pre[t, k] = Y_treated_pre[t, k] - y_synth_pre_scaled[t, k];
+		
+	  // Calculate the log-probability of the data point given the parameters
+	  log_lik[idx] = normal_lpdf(Y_treated_pre[t, k] | y_synth_pre_scaled[t, k], sigma[k]);
+	  idx += 1;
+		
+	  predictive_pre[t, k] = normal_rng(y_synth_pre_scaled[t, k], sigma[k]);
+      residuals_pre[t, k] = Y_treated_pre[t, k] - predictive_pre[t, k];
+	  struc_residuals_pre[t, k] = Y_treated_pre[t, k] - y_synth_pre_scaled[t, k];
     }
     for (t in 1:N_test) {
-      struc_residuals_test[t, k] = Y_treated_test[t, k] - y_synth_test_scaled[t, k];
+	  predictive_test[t, k] = normal_rng(y_synth_test_scaled[t, k], sigma[k]);
+      residuals_test[t, k] = Y_treated_test[t, k] - predictive_test[t, k];
+	  struc_residuals_test[t, k] = Y_treated_test[t, k] - y_synth_test_scaled[t, k];
     }
     for (t in 1:N_post) {
-      struc_effect_post[t, k] = Y_treated_post[t, k] - y_synth_post_scaled[t, k];
+	  predictive_post[t, k] = normal_rng(y_synth_post_scaled[t, k], sigma[k]);
+      effect_post[t, k] = Y_treated_post[t, k] - predictive_post[t, k];
+	  struc_effect_post[t, k] = Y_treated_post[t, k] - y_synth_post_scaled[t, k];
     }
+
+    nrmse_pre[k] = sqrt(mean(square(residuals_pre[, k] / amplitude[k])));
+    nrmse_test[k] = sqrt(mean(square(residuals_test[, k] / amplitude[k])));
+    nrmse_post[k] = sqrt(mean(square(effect_post[, k] / amplitude[k])));
 
     struc_nrmse_pre[k] = sqrt(mean(square(struc_residuals_pre[, k] / amplitude[k])));
     struc_nrmse_test[k] = sqrt(mean(square(struc_residuals_test[, k] / amplitude[k])));
     struc_nrmse_post[k] = sqrt(mean(square(struc_effect_post[, k] / amplitude[k])));
   }
-
+  
+  vector[N_outcomes] nrmse_pre_test = (nrmse_pre + nrmse_test) / 2;
   vector[N_outcomes] struc_nrmse_pre_test = (struc_nrmse_pre + struc_nrmse_test) / 2;
 
 }
