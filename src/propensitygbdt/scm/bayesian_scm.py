@@ -138,15 +138,16 @@ def calculate_gram_cond_by_shape(df: pd.DataFrame) -> float:
     return pd.DataFrame(results)['gram_cond'].max()
 
 """
-Classifies the structural uncertainty band into 4 types:
-1. Funnel (Good): Starts wide, narrows before intervention.
-2. Trumpet (Bad): Starts narrow, widens before intervention.
-3. Homogenous (Neutral): Roughly constant width.
-4. Breather (Noisy): Oscillates with no clear trend.
+Classifies the structural uncertainty band into 5 types:
+1. Tight (Ideal): Shape is irrelevant.
+2. Funnel (Good): Starts wide, narrows before intervention.
+3. Trumpet (Bad): Starts narrow, widens before intervention.
+4. Homogenous (Too Wide): Too width.
+5. Breather (Noisy): Oscillates with no clear trend.
 """
-def classify_structural_uncertainty_shape(df, outcome_col='outcome'):    
+def classify_structural_uncertainty_shape(df, outcome_col='outcome'):     
     results = []
-        
+    
     # Get list of outcomes
     outcomes = df[outcome_col].unique()
     
@@ -156,55 +157,57 @@ def classify_structural_uncertainty_shape(df, outcome_col='outcome'):
         # Sort by time to ensure correlation works
         subset = subset.sort_values('timeid')
         
-        # 2. Calculate the Width of the Gray Band
-        # Width = Upper Bound (q97_5) - Lower Bound (q2_5)
+        # Calculate the Width
         subset['band_width'] = subset['q97_5'] - subset['q2_5']
-        
         widths = subset['band_width'].values
         time_steps = np.arange(len(widths))
         
-        # 3. Calculate Metrics
+        # Calculate Data Scale (Average absolute value of the signal)
+        # We use this to normalize the width. 
+        # A width of 0.01 is huge if the data is 0.02, but tiny if data is 100.
+        avg_signal = np.mean(np.abs(subset['mean'])) 
+        if avg_signal == 0: avg_signal = 1e-6
+            
+        avg_width = np.mean(widths)
+        relative_width = avg_width / avg_signal
         
-        # A. Trend (Pearson Correlation)
-        # Is the width consistently growing or shrinking over time?
+        # --- METRICS ---
         corr, _ = pearsonr(time_steps, widths)
+        cv = np.std(widths) / np.mean(widths) if np.mean(widths) > 0 else 0
         
-        # B. Volatility (Coefficient of Variation)
-        # How much does the width fluctuate relative to its size?
-        # CV = Std_Dev / Mean
-        cv = np.std(widths) / np.mean(widths)
-        
-        # 4. Classification Logic (Thresholds can be tuned)
+        # --- CLASSIFICATION LOGIC ---
         shape_class = "Unknown"
-        quality_score = 0 # Simple score to help ranking (Higher is better)
+        quality_score = 0 
         
         # Thresholds
-        CORR_THRESHOLD = 0.5  # Strong enough trend to be called Funnel/Trumpet
-        CV_THRESHOLD = 0.5    # High enough volatility to be called Breather
+        THINNESS_THRESHOLD = 0.05
+        CORR_THRESHOLD = 0.5 
+        CV_THRESHOLD = 0.5        
         
-        if corr < -CORR_THRESHOLD:
-            shape_class = "Funnel (Ideal)"
-            # Good because uncertainty decreases near intervention
-            quality_score = 10 
+        # 1. NEW CRITERIA: THINNESS CHECK
+        if relative_width < THINNESS_THRESHOLD:
+            shape_class = "Tight (Ideal)"
+            quality_score = 10            
+        elif corr < -CORR_THRESHOLD:
+            shape_class = "Funnel (Good)"
+            quality_score = 9 
         elif corr > CORR_THRESHOLD:
             shape_class = "Trumpet (Risky)"
-            # Bad because uncertainty is highest right when we need precision
             quality_score = 1 
+        elif cv > CV_THRESHOLD:
+            shape_class = "Breather (Noisy)"
+            quality_score = 3
         else:
-            # If no strong trend, check volatility
-            if cv > CV_THRESHOLD:
-                shape_class = "Breather (Noisy)"
-                quality_score = 2
-            else:
-                shape_class = "Homogenous (Stable)"
-                quality_score = 7
+            shape_class = "Homogenous (Too Wide)"
+            quality_score = 2
 
         results.append({
             'outcome': outcome,
             'shape': shape_class,
             'correlation': round(corr, 3),
             'volatility_cv': round(cv, 3),
-            'avg_width': round(np.mean(widths), 4),
+            'avg_width': round(avg_width, 4),
+            'relative_width': round(relative_width, 4),
             'quality_score': quality_score
         })
         
@@ -245,7 +248,7 @@ Args:
     maximum_mean_gini_weights (float, optional): The maximum permissible mean gini of the weight distribution
                                           for the synthetic control. This helps prevent the model
                                           from relying too heavily on one control unit.
-                                          Defaults to 0.6.
+                                          Defaults to 0.75.
 """
 def estimate(
     timeid_previous_intervention,
@@ -254,7 +257,7 @@ def estimate(
     period_effect_format='{:.2f}',
     seed=222,
     maximum_gram_cond=100.0,
-    maximum_mean_gini_weights=0.6
+    maximum_mean_gini_weights=0.75
 ):
     # Set the random seed for NumPy to ensure reproducibility of its random operations.
     np.random.seed(seed)
@@ -368,6 +371,8 @@ def estimate(
         control_df = dataset[dataset['treatment'] == 0]
         outcomes = sorted(dataset['outcome'].unique())
         N_outcomes = len(outcomes)
+        
+        os.makedirs(f"{workspace_folder}/{temp_folder}/solution_id_{solution_id}", exist_ok=True)
 
         gram_cond_max = calculate_gram_cond_by_shape(df = dataset[(dataset['treatment'] == 0) & (dataset['timeid'] <= timeid_base - test_period_size)])
         if maximum_gram_cond < gram_cond_max:
@@ -454,8 +459,6 @@ def estimate(
             stan_file_path = f"{workspace_folder}/bscm.stan"
             print(f"Compiling/loading model from: {stan_file_path}")
             model = cmdstanpy.CmdStanModel(stan_file=stan_file_path)
-
-            os.makedirs(f"{workspace_folder}/{temp_folder}/solution_id_{solution_id}", exist_ok=True)
 
             # Fit the model using MCMC sampling.
             # 'data' is the input data dictionary.
@@ -554,7 +557,7 @@ def estimate(
             weight_solutions = pd.concat([weight_solutions, temp_weight_solutions])
 
             if (draws_df['gini_weight'].mean() > maximum_mean_gini_weights):
-                solution_has_problem = solution_has_problem + 'W'         
+                solution_has_problem = solution_has_problem + f"W{draws_df['gini_weight'].mean():.2f}"         
                 
             if solution_has_problem != "":
                 os.rename(f"{workspace_folder}/{temp_folder}/solution_id_{solution_id}", f"{workspace_folder}/{temp_folder}/{solution_has_problem}_solution_id_{solution_id}")
@@ -817,6 +820,7 @@ def estimate(
                     )
                     plt.suptitle("Strict Parallel Trends - Predictive RMSE (Normalized Root Mean Square Error)", fontsize=16, y=0.97)
                     plt.savefig(f"{workspace_folder}/{temp_folder}/solution_id_{solution_id}/{current_indicator}/predictive_nrmse.png")
+                    plt.close() # Close to free memory
 
                     # Assumption 3 (Low-Rank Trends)
                     # Generate and save forest plots for the Structural NRMSE (Normalized Root Mean Square Error) model fit statistics using ArviZ.
@@ -836,6 +840,7 @@ def estimate(
                     )
                     plt.suptitle("Low-Rank Trends - Structural RMSE (Normalized Root Mean Square Error)", fontsize=16, y=0.97)
                     plt.savefig(f"{workspace_folder}/{temp_folder}/solution_id_{solution_id}/{current_indicator}/structural_nrmse.png")
+                    plt.close() # Close to free memory
 
                     # Store the summary results for the current outcome in the lists.
                     absolute_structural_timeid['outcome'] = current_indicator
@@ -885,7 +890,7 @@ def estimate(
                 axes = az.plot_density(
                     [inference_data.sel(chain=[0]), inference_data.sel(chain=[1]),
                     inference_data.sel(chain=[2]), inference_data.sel(chain=[3])],
-                    var_names=["w", "sigma", "tau_nrmse", "gini_weight"],
+                    var_names=["w", "sigma", "tau_nrmse", "gini_weight", "hhi_weight"],
                     shade=0.0,
                     hdi_prob=0.95,
                     point_estimate="mean",
@@ -928,6 +933,7 @@ def estimate(
                     title_fontsize=12
                 )
                 plt.savefig(f"{workspace_folder}/{temp_folder}/solution_id_{solution_id}/unitid_weight_individual_distribution_sigma.png")
+                plt.close() # Close to free memory
 
                 # --- Create a forest plot for the donor weights (w) ---
                 # This plot shows the posterior distribution (mean and 95% HDI) for each control unit's weight.
@@ -942,6 +948,7 @@ def estimate(
                 )
                 plt.suptitle("Posterior Distribution of Control Unit Weights (w)", fontsize=16, y=0.97)
                 plt.savefig(f"{workspace_folder}/{temp_folder}/solution_id_{solution_id}/unitid_weight_simultanous_distribution.png")
+                plt.close() # Close to free memory
                 
                 if solution_has_problem == "":
                     if parallel_trends_violated:

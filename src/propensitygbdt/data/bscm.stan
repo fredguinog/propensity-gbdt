@@ -154,9 +154,9 @@ transformed parameters {
       y_synth_test_std_k = (y_synth_test_k - mean_Y_synth_pre_k) / sd_Y_synth_pre_k;
       y_synth_post_std_k = (y_synth_post_k - mean_Y_synth_pre_k) / sd_Y_synth_pre_k;
     } else {
-      y_synth_pre_std_k = rep_vector(0.0, N_pre);
-      y_synth_test_std_k = rep_vector(0.0, N_test);
-      y_synth_post_std_k = rep_vector(0.0, N_post);
+	  y_synth_pre_std_k = (y_synth_pre_k - mean_Y_synth_pre_k) / (sd_Y_synth_pre_k + 1e-6);
+	  y_synth_test_std_k = (y_synth_test_k - mean_Y_synth_pre_k) / (sd_Y_synth_pre_k + 1e-6);
+	  y_synth_post_std_k = (y_synth_post_k - mean_Y_synth_pre_k) / (sd_Y_synth_pre_k + 1e-6);
     }
     
     // 3. Rescale the standardized synthetic control to the scale of the TREATED unit's outcome.

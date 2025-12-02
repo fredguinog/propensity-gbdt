@@ -149,7 +149,7 @@ bayesian_scm.estimate(
 *   `period_effect_format` : str, default='{:.2f}'. A format string used to display numeric results in the plot annotations, such as the average treatment effect.
 *   `seed` : int, default=222. A random seed to ensure the reproducibility of the MCMC sampling and any other stochastic processes.
 *   `maximum_gram_cond` : float, default=100.0. The maximum allowable value for the Gram matrix condition number. This is used as a threshold to detect multicollinearity among control units; solutions exceeding it are flagged.
-*   `maximum_mean_gini_weights` : float, default=0.6. The maximum permissible mean gini of the weight distribution for the synthetic control. This helps prevent the model from relying too heavily on one control unit.
+*   `maximum_mean_gini_weights` : float, default=0.75. The maximum permissible mean gini of the weight distribution for the synthetic control. This helps prevent the model from relying too heavily on one control unit.
 
 ## Citation
 
