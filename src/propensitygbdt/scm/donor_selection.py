@@ -432,8 +432,8 @@ temporal_cross_search_splits : list, optional
     If None, splits are calculated automatically based on ratios.
 seed : int, default=111
     Random seed for reproducibility in sampling and model training.
-maximum_control_sd_times_treatment_sd : int, default=5.0
-    Threshold for filtering control units based on variance comparison with the treated unit.
+maximum_ratio_var_treated_var_donor : int, default=10.0
+    The max ratio (Var_Treated / Var_Donor) allowed.
 maximum_num_units_on_attipw_support : int, default=50
     Maximum number of control units to select based on IPW ranking before Gram condition selection then fitting SCM.
 maximum_gram_cond_train : float, default=500.0
@@ -451,6 +451,8 @@ save_solution_period_error : Literal, default='pre_intervention'
     Determines which period's error is checked against `save_solution_maximum_error` to decide if a solution is saved.
 save_solution_maximum_error : float, default=0.15
     The maximum allowable RMSPE (normalized) for a candidate solution to be saved to disk.
+maximum_gram_cond_pre : float, Defaults to 100.0. The maximum allowable value for the Gram matrix condition number.
+    This is used as a threshold to detect multicollinearity among control units; solutions exceeding it are flagged.
 alpha_exponential_decay : float, default=0.00
     Decay factor for time-relevance weights; higher values give more weight to recent time periods.
 optuna_optimization_target : Literal, default='pre_intervention'
@@ -481,7 +483,7 @@ def search(
     workspace_folder: str,
     temporal_cross_search_splits: list = None,
     seed: int = 111,
-    maximum_control_sd_times_treatment_sd: int = 5.0,
+    maximum_ratio_var_treated_var_donor: int = 10.0,
     maximum_num_units_on_attipw_support: int = 50,
     maximum_gram_cond_train: float = 500.0,
     minimum_donor_selection: int = 3,
@@ -490,6 +492,7 @@ def search(
     function_aggregate_outcomes_error: type_function_aggregate_outcomes_error = 'mean',
     save_solution_period_error: type_save_solution_period_error = 'pre_intervention',
     save_solution_maximum_error: float = 0.15,
+    maximum_gram_cond_pre: float = 100.0,
     alpha_exponential_decay: float = 0.00,
     optuna_optimization_target: type_optuna_optimization_target = 'pre_intervention',
     optuna_number_trials: int = 1000,
@@ -558,8 +561,8 @@ def search(
     if save_solution_period_error != 'pre_intervention' and save_solution_period_error != 'validation_folder':
         raise ValueError("ERROR: save_solution_period_error MUST BE 'pre_intervention' or 'validation_folder'")
 
-    if not isinstance(maximum_control_sd_times_treatment_sd, float) or maximum_control_sd_times_treatment_sd <= 0:
-        raise ValueError(f"maximum_control_sd_times_treatment_sd must be a positive real, got {maximum_control_sd_times_treatment_sd}")
+    if not isinstance(maximum_ratio_var_treated_var_donor, float) or maximum_ratio_var_treated_var_donor <= 0:
+        raise ValueError(f"maximum_ratio_var_treated_var_donor must be a positive real, got {maximum_ratio_var_treated_var_donor}")
 
     if not isinstance(maximum_num_units_on_attipw_support, int) or maximum_num_units_on_attipw_support <= 0:
         raise ValueError(f"maximum_num_units_on_attipw_support must be a positive integer, got {maximum_num_units_on_attipw_support}")
@@ -588,6 +591,9 @@ def search(
     if not isinstance(save_solution_maximum_error, float) or save_solution_maximum_error <= 0:
         raise ValueError(f"save_solution_maximum_error must be a positive real, got {save_solution_maximum_error}")
         
+    if not isinstance(maximum_gram_cond_pre, float) or maximum_gram_cond_pre <= 0:
+        raise ValueError(f"maximum_gram_cond_pre must be a positive real, got {maximum_gram_cond_pre}")
+        
     if not isinstance(alpha_exponential_decay, float) or alpha_exponential_decay < 0:
         raise ValueError(f"alpha_exponential_decay must be zero or a positive real, got {alpha_exponential_decay}")
 
@@ -611,15 +617,14 @@ def search(
 
     all_units = all_units[['timeid', 'pre_intervention', 'unitid', 'treatment', 'outcome', 'value']]
     
-    # all_units_std = all_units.groupby(['unitid', 'treatment', 'outcome']).agg({'value': 'std'}).reset_index()
-    # control_units_std = pd.merge(all_units_std[all_units_std['treatment'] == 0], all_units_std[all_units_std['treatment'] == 1], how='left', on='outcome')
-    # control_units_std['accep_varaince'] = np.where(
-        # (control_units_std['value_x'] > control_units_std['value_y'] / maximum_control_sd_times_treatment_sd) &
-        # (control_units_std['value_x'] < control_units_std['value_y'] * maximum_control_sd_times_treatment_sd),
-        # 1,
-        # 0
-    # )
-    # all_units = all_units[(all_units['treatment'] == 1) | (all_units['unitid'].isin(control_units_std[control_units_std['accep_varaince']  == 1]['unitid_x'].tolist()))]
+    all_units_std = all_units.groupby(['unitid', 'treatment', 'outcome']).agg({'value': 'var'}).reset_index()
+    control_units_std = pd.merge(all_units_std[all_units_std['treatment'] == 1], all_units_std[all_units_std['treatment'] == 0], how='left', on='outcome')
+    control_units_std['acceptable_ratio_var_treated_var_donor'] = np.where(
+        (control_units_std['value_x'] / control_units_std['value_y']) <= maximum_ratio_var_treated_var_donor,
+        1,
+        0
+    )
+    all_units = all_units[(all_units['treatment'] == 1) | (all_units['unitid'].isin(control_units_std[control_units_std['acceptable_ratio_var_treated_var_donor']  == 1]['unitid_y'].tolist()))]
 
     # MAKE THE PANEL DATA BALANCED BY REMOVING ALL UNITS WHICH HAVE NOT THE SAME NUMBER OF timeids PER outcome EQUAL TO THEN TREATMENT UNIT
     print(all_units.shape)
@@ -1008,16 +1013,17 @@ def search(
                         # Evaluate the performance of this candidate donor pool.
                         data = pre_intervention_scaling(data=data2, train_period=self.timeid_train, valid_period=self.timeid_valid)
                         error_train, error_valid, error_pre_intervention, error_post_intervention, impact_score = self.evaluate_outcomes_metric(data=data)
-
+                        
+                        gram_cond_max = calculate_gram_cond_by_shape(df = data[(data['treatment'] == 0) & (data['timeid'].isin(self.timeid_train + self.timeid_valid))])
+                        if gram_cond_max == float('inf'):
+                            gram_cond_max = 9999999.0
+                            
                         if (current_combination_tuple and len(current_combination_tuple) >= minimum_donor_selection and
                             current_maximum_control_unit_weight_train < maximum_control_unit_weight_train and
+                            gram_cond_max < maximum_gram_cond_pre and
                             ((save_solution_period_error == "pre_intervention" and error_pre_intervention < save_solution_maximum_error) or
                             (save_solution_period_error == "validation_folder" and error_valid < save_solution_maximum_error)) and
                             current_combination_tuple not in estimated_solutions):
-
-                            gram_cond_max = calculate_gram_cond_by_shape(df = data[(data['treatment'] == 0) & (data['timeid'].isin(self.timeid_train + self.timeid_valid))])
-                            if gram_cond_max == float('inf'):
-                                gram_cond_max = 9999999.0
 
                             # Save the donor units, weights and performance metrics of this viable solution.
                             data = data[data['treatment'] == 0]

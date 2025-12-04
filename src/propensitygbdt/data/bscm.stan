@@ -98,6 +98,9 @@ data {
   // --- Priors and Constraints ---
   vector<lower=0>[N_controls] dirichlet_alpha; // Hyperparameter for Dirichlet prior on weights. Sparsity requires a value smaller than 1
   vector<lower=0>[N_outcomes] tau_nrmse_prior;
+  
+  // The fraction of treated volatility to use as the noise floor (e.g., 0.1)
+  real<lower=0> noise_floor_fraction; 
 }
 
 transformed data {
@@ -105,9 +108,14 @@ transformed data {
   // This is efficient as it only needs to be done once.
   vector[N_outcomes] mean_Y_treated_pre;
   vector[N_outcomes] sd_Y_treated_pre;
+  vector[N_outcomes] nu; // The statistical noise floor per outcome
+  
   for (k in 1:N_outcomes) {
 	mean_Y_treated_pre[k] = mean(Y_treated_test[, k]);
     sd_Y_treated_pre[k] = sd(Y_treated_pre[, k]);
+	
+    // Calculate nu based on treated unit volatility
+    nu[k] = sd_Y_treated_pre[k] * noise_floor_fraction;
   }
   
   // Create a time index vector for trend calculation
@@ -148,16 +156,14 @@ transformed parameters {
     vector[N_test] y_synth_test_std_k;
     vector[N_post] y_synth_post_std_k;
 
-    // Handle case where synthetic control is constant (sd=0)
-    if (sd_Y_synth_pre_k > 1e-9) {
-      y_synth_pre_std_k = (y_synth_pre_k - mean_Y_synth_pre_k) / sd_Y_synth_pre_k;
-      y_synth_test_std_k = (y_synth_test_k - mean_Y_synth_pre_k) / sd_Y_synth_pre_k;
-      y_synth_post_std_k = (y_synth_post_k - mean_Y_synth_pre_k) / sd_Y_synth_pre_k;
-    } else {
-	  y_synth_pre_std_k = (y_synth_pre_k - mean_Y_synth_pre_k) / (sd_Y_synth_pre_k + 1e-6);
-	  y_synth_test_std_k = (y_synth_test_k - mean_Y_synth_pre_k) / (sd_Y_synth_pre_k + 1e-6);
-	  y_synth_post_std_k = (y_synth_post_k - mean_Y_synth_pre_k) / (sd_Y_synth_pre_k + 1e-6);
-    }
+    // --- Noise Floor Implementation (INA Fix) ---
+    // We use the statistical noise floor `nu` calculated in transformed data.
+    // Denominator = sqrt(sd_synth^2 + nu^2)    
+    real denominator = sqrt(square(sd_Y_synth_pre_k) + square(nu[k]));
+    
+    y_synth_pre_std_k = (y_synth_pre_k - mean_Y_synth_pre_k) / denominator;
+    y_synth_test_std_k = (y_synth_test_k - mean_Y_synth_pre_k) / denominator;
+    y_synth_post_std_k = (y_synth_post_k - mean_Y_synth_pre_k) / denominator;
     
     // 3. Rescale the standardized synthetic control to the scale of the TREATED unit's outcome.
     y_synth_pre_scaled[, k] = (y_synth_pre_std_k * sd_Y_treated_pre[k]) + mean_Y_treated_pre[k];
