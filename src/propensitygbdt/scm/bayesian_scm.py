@@ -288,14 +288,14 @@ def estimate(
         timeid_base = np.where(mapping_timeid == timeid_previous_intervention)[0][0] + 1
         timeid_fim = dataset['timeid'].max()
 
-        # Define a "test" period using the last 20% of the pre-treatment data with minimum of 2. This period is used for model validation (e.g., calculating NRMSE).
-        test_period_size = max(2, int(0.2 * timeid_base))
+        # Define a validation period using the last 20% of the pre-treatment data with minimum of 2. This period is used for model validation (e.g., calculating NRMSE).
+        val_period_size = max(2, int(0.2 * timeid_base))
 
         # Standardize the 'value' for each outcome (e.g., indicator) independently using only the pre-intervention period.
         # This is done by subtracting the mean and dividing by the standard deviation, calculated per outcome.
         # This puts all outcomes on a similar scale, which can improve model stability and performance.
-        treated_pre_df = dataset[dataset['timeid'] <= timeid_base - test_period_size]
-        std_avg_dt = treated_pre_df.groupby('outcome')['value'].agg(['mean', 'std']).reset_index()
+        treated_train_df = dataset[dataset['timeid'] <= timeid_base - val_period_size]
+        std_avg_dt = treated_train_df.groupby('outcome')['value'].agg(['mean', 'std']).reset_index()
         std_avg_dt.rename(columns={'mean': 'avg_value', 'std': 'std_value'}, inplace=True)
         std_avg_dt['std_value'] = std_avg_dt['std_value'].clip(lower=1e-10)  # Avoid div0
 
@@ -331,33 +331,33 @@ def estimate(
         Y_treated_post = pivot_and_extract(treated_df, range(timeid_base + 1, timeid_fim + 1))
         N_post = len(Y_treated_post)
 
-        # Create data matrices for the treated unit for the pre-treatment training period and the test period.
-        Y_treated_pre = pivot_and_extract(treated_df, range(timeid_inicio, timeid_base - test_period_size + 1))
-        Y_treated_test = pivot_and_extract(treated_df, range(timeid_base - test_period_size + 1, timeid_base + 1))
+        # Create data matrices for the treated unit for the pre-treatment training period and the validation period.
+        Y_treated_train = pivot_and_extract(treated_df, range(timeid_inicio, timeid_base - val_period_size + 1))
+        Y_treated_val = pivot_and_extract(treated_df, range(timeid_base - val_period_size + 1, timeid_base + 1))
 
-        # Create the control data matrices for the pre-treatment, test, and post-treatment periods.
-        Y_control_pre = get_control_matrices_by_outcome(control_df, range(timeid_inicio, timeid_base - test_period_size + 1), outcomes, unitids)
-        Y_control_test = get_control_matrices_by_outcome(control_df, range(timeid_base - test_period_size + 1, timeid_base + 1), outcomes, unitids)
+        # Create the control data matrices for the trainning, validation, and post-treatment periods.
+        Y_control_train = get_control_matrices_by_outcome(control_df, range(timeid_inicio, timeid_base - val_period_size + 1), outcomes, unitids)
+        Y_control_val = get_control_matrices_by_outcome(control_df, range(timeid_base - val_period_size + 1, timeid_base + 1), outcomes, unitids)
         Y_control_post = get_control_matrices_by_outcome(control_df, range(timeid_base + 1, timeid_fim + 1), outcomes, unitids)
 
-        # Get counts of control units, pre-treatment periods, and test periods.
+        # Get counts of control units, trainning periods, and validation periods.
         N_controls = len(unitids)
-        N_pre = len(Y_treated_pre)
-        N_test = len(Y_treated_test)
+        N_train = len(Y_treated_train)
+        N_val = len(Y_treated_val)
 
         # Assemble all the data into a dictionary, which is the required format for input to a Stan model via CmdStanPy.
         # This dictionary contains all the data, dimensions, and hyperparameters for the model.
         stan_data = {
-        'N_pre': N_pre,
-        'N_test': N_test,
+        'N_train': N_train,
+        'N_val': N_val,
         'N_post': N_post,
         'N_controls': N_controls,
         'N_outcomes': N_outcomes,
-        'Y_treated_pre': Y_treated_pre.to_numpy(),
-        'Y_treated_test': Y_treated_test.to_numpy(),
+        'Y_treated_train': Y_treated_train.to_numpy(),
+        'Y_treated_val': Y_treated_val.to_numpy(),
         'Y_treated_post': Y_treated_post.to_numpy(),
-        'Y_control_pre': Y_control_pre,
-        'Y_control_test': Y_control_test,
+        'Y_control_train': Y_control_train,
+        'Y_control_val': Y_control_val,
         'Y_control_post': Y_control_post,
         'dirichlet_alpha': np.repeat(1.0, N_controls), # Hyperparameter for the Dirichlet prior on weights (uninformative).
         'tau_nrmse_prior': np.repeat(0.1, N_outcomes), # Hyperparameter for the prior on the NRMSE noise term.
@@ -412,10 +412,11 @@ def estimate(
 
         # Print a summary of the R-hat diagnostic statistic. R-hat values close to 1.0
         # indicate that the MCMC chains have converged to the same posterior distribution.
-        print(fit.summary()['R_hat'].describe())
-        fit.summary().to_csv(f"{workspace_folder}/{temp_folder}/solution_id_{solution_id}/all_parameters_summary.csv", index=True)
+        fit_dt = fit.summary()
+        print(fit_dt['R_hat'].describe())
+        fit_dt.to_csv(f"{workspace_folder}/{temp_folder}/solution_id_{solution_id}/all_parameters_summary.csv", index=True)
 
-        r_hat = fit.summary()['R_hat'].mean()
+        r_hat = fit_dt['R_hat'].mean()
         if 0.99 > r_hat or r_hat > 1.01:
             solution_has_problem = solution_has_problem + 'D'
             unacceptable_solutions.append(solution_id)
@@ -499,9 +500,9 @@ def estimate(
             # Filter for variables related to the treatment effect (residuals and effects) and reshape the data.
             # The 'melt' function converts the DataFrame from wide format (one column per parameter instance)
             # to long format, which is more convenient for grouping and plotting.
-            vars_to_extract = ["residuals_pre", "residuals_test", "effect_post",
-                               "y_synth_pre_scaled", "y_synth_test_scaled", "y_synth_post_scaled",
-                               "predictive_pre", "predictive_test", "predictive_post"]
+            vars_to_extract = ["residuals_train", "residuals_val", "effect_post",
+                               "y_synth_train_scaled", "y_synth_val_scaled", "y_synth_post_scaled",
+                               "predictive_train", "predictive_val", "predictive_post"]
             chains_effect_df = draws_df.melt(
                 id_vars=['chain__', 'iter__'],
                 value_vars=[col for col in draws_df.columns if any(col.startswith(v) for v in vars_to_extract)],
@@ -517,12 +518,12 @@ def estimate(
             chains_effect_df['index_2'] = pd.to_numeric(extracted_info[2]) # Corresponds to outcome
 
             # Define a function to reconstruct the original 'timeid' from the Stan indices.
-            # This requires knowing the structure of the pre, test, and post periods.
+            # This requires knowing the structure of the trainning, validation, and post periods.
             def get_timeid(row):
-                if row['var_name'] == 'residuals_pre' or row['var_name'] == 'y_synth_pre_scaled' or row['var_name'] == 'predictive_pre':
+                if row['var_name'] == 'residuals_train' or row['var_name'] == 'y_synth_train_scaled' or row['var_name'] == 'predictive_train':
                     return row['index_1'] + timeid_inicio - 1
-                elif row['var_name'] == 'residuals_test' or row['var_name'] == 'y_synth_test_scaled' or row['var_name'] == 'predictive_test':
-                    return row['index_1'] + timeid_inicio + N_pre - 1
+                elif row['var_name'] == 'residuals_val' or row['var_name'] == 'y_synth_val_scaled' or row['var_name'] == 'predictive_val':
+                    return row['index_1'] + timeid_inicio + N_train - 1
                 elif row['var_name'] == 'effect_post' or row['var_name'] == 'y_synth_post_scaled' or row['var_name'] == 'predictive_post':
                     return row['index_1'] + timeid_base
                 return -1
@@ -533,9 +534,9 @@ def estimate(
             chains_effect_df['timeid'] = np.where(chains_effect_df['timeid'] == -1, np.nan, chains_effect_df['timeid'])
             # Map the second index back to the outcome name.
             chains_effect_df['outcome'] = chains_effect_df['index_2'].apply(lambda x: outcomes[x-1])
-            chains_effect_df['type'] = np.where((chains_effect_df['var_name'] == 'residuals_pre') | (chains_effect_df['var_name'] == 'residuals_test') | (chains_effect_df['var_name'] == 'effect_post'), 'relative',
-                                                np.where((chains_effect_df['var_name'] == 'y_synth_pre_scaled') | (chains_effect_df['var_name'] == 'y_synth_test_scaled') | (chains_effect_df['var_name'] == 'y_synth_post_scaled'), 'absolute_structural',
-                                                         np.where((chains_effect_df['var_name'] == 'predictive_pre') | (chains_effect_df['var_name'] == 'predictive_test') | (chains_effect_df['var_name'] == 'predictive_post'), 'absolute_predictive', 'error')))
+            chains_effect_df['type'] = np.where((chains_effect_df['var_name'] == 'residuals_train') | (chains_effect_df['var_name'] == 'residuals_val') | (chains_effect_df['var_name'] == 'effect_post'), 'relative',
+                                                np.where((chains_effect_df['var_name'] == 'y_synth_train_scaled') | (chains_effect_df['var_name'] == 'y_synth_val_scaled') | (chains_effect_df['var_name'] == 'y_synth_post_scaled'), 'absolute_structural',
+                                                         np.where((chains_effect_df['var_name'] == 'predictive_train') | (chains_effect_df['var_name'] == 'predictive_val') | (chains_effect_df['var_name'] == 'predictive_post'), 'absolute_predictive', 'error')))
             # Drop the now redundant columns.
             chains_effect_df.drop(columns=['variable', 'var_name', 'index_1', 'index_2'], inplace=True)
 
@@ -740,15 +741,14 @@ def estimate(
                 # These plots help diagnose how well the synthetic control complies with the strict parallel trends assumption.
                 az.plot_forest(
                     fit,
-                    var_names=["nrmse_pre", "nrmse_test", "nrmse_post", "nrmse_pre_test"],
+                    var_names=["nrmse_train", "nrmse_val_minus_one", "nrmse_terminal"],
                     combined=True,
-                    figsize=(14, 6),
+                    figsize=(25, 10),
                     hdi_prob=0.95,
                     coords={ # 'coords' is used to select only the NRMSE for the current outcome (indexed by 'idx').
-                        "nrmse_pre_dim_0": [idx],
-                        "nrmse_test_dim_0": [idx],
-                        "nrmse_post_dim_0": [idx],
-                        "nrmse_pre_test_dim_0": [idx]
+                        "nrmse_train_dim_0": [idx],
+                        "nrmse_val_minus_one_dim_0": [idx],
+                        "nrmse_terminal_dim_0": [idx]
                     }
                 )
                 plt.suptitle("Strict Parallel Trends - Predictive RMSE (Normalized Root Mean Square Error)", fontsize=16, y=0.97)
@@ -760,15 +760,14 @@ def estimate(
                 # These plots help diagnose how well the synthetic control complies with the low-rank trends assumption.
                 az.plot_forest(
                     fit,
-                    var_names=["struc_nrmse_pre", "struc_nrmse_test", "struc_nrmse_post", "struc_nrmse_pre_test"],
+                    var_names=["struc_nrmse_train", "struc_nrmse_val_minus_one", "struc_nrmse_terminal"],
                     combined=True,
-                    figsize=(20, 6),
+                    figsize=(25, 10),
                     hdi_prob=0.95,
                     coords={ # 'coords' is used to select only the NRMSE for the current outcome (indexed by 'idx').
-                        "struc_nrmse_pre_dim_0": [idx],
-                        "struc_nrmse_test_dim_0": [idx],
-                        "struc_nrmse_post_dim_0": [idx],
-                        "struc_nrmse_pre_test_dim_0": [idx]
+                        "struc_nrmse_train_dim_0": [idx],
+                        "struc_nrmse_val_minus_one_dim_0": [idx],
+                        "struc_nrmse_terminal_dim_0": [idx]
                     }
                 )
                 plt.suptitle("Low-Rank Trends - Structural RMSE (Normalized Root Mean Square Error)", fontsize=16, y=0.97)

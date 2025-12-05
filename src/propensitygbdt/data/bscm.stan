@@ -77,19 +77,19 @@ functions {
 
 data {
   // --- Dimensions ---
-  int<lower=1> N_pre;       // Number of pre-treatment train time periods
-  int<lower=1> N_test;      // Number of pre-treatment test time periods
+  int<lower=1> N_train;       // Number of pre-treatment train time periods
+  int<lower=1> N_val;      // Number of pre-treatment validation time periods
   int<lower=0> N_post;      // Number of post-treatment time periods
   int<lower=1> N_controls;  // Number of control units in the donor pool
   int<lower=1> N_outcomes;  // Number of outcome variables to fit simultaneously
 
   // --- Pre-treatment Train Data ---
-  matrix[N_pre, N_outcomes] Y_treated_pre;     // Outcomes for the treated unit
-  array[N_outcomes] matrix[N_pre, N_controls] Y_control_pre; // Control unit outcomes for each outcome variable
+  matrix[N_train, N_outcomes] Y_treated_train;     // Outcomes for the treated unit
+  array[N_outcomes] matrix[N_train, N_controls] Y_control_train; // Control unit outcomes for each outcome variable
 
-  // --- Pre-treatment Test Data ---
-  matrix[N_test, N_outcomes] Y_treated_test;     // Test outcomes for the treated unit
-  array[N_outcomes] matrix[N_test, N_controls] Y_control_test; // Test control unit outcomes for each outcome variable
+  // --- Pre-treatment Validation Data ---
+  matrix[N_val, N_outcomes] Y_treated_val;     // Validation outcomes for the treated unit
+  array[N_outcomes] matrix[N_val, N_controls] Y_control_val; // Validation control unit outcomes for each outcome variable
 
   // --- Post-treatment Data ---
   matrix[N_post, N_outcomes] Y_treated_post;    // Outcomes for the treated unit
@@ -106,20 +106,20 @@ data {
 transformed data {
   // Pre-calculate statistics for each outcome of the treated unit.
   // This is efficient as it only needs to be done once.
-  vector[N_outcomes] mean_Y_treated_pre;
-  vector[N_outcomes] sd_Y_treated_pre;
+  vector[N_outcomes] mean_Y_treated_train;
+  vector[N_outcomes] sd_Y_treated_train;
   vector[N_outcomes] nu; // The statistical noise floor per outcome
   
   for (k in 1:N_outcomes) {
-	mean_Y_treated_pre[k] = mean(Y_treated_test[, k]);
-    sd_Y_treated_pre[k] = sd(Y_treated_pre[, k]);
+	mean_Y_treated_train[k] = mean(Y_treated_val[, k]);
+    sd_Y_treated_train[k] = sd(Y_treated_train[, k]);
 	
     // Calculate nu based on treated unit volatility
-    nu[k] = sd_Y_treated_pre[k] * noise_floor_fraction;
+    nu[k] = sd_Y_treated_train[k] * noise_floor_fraction;
   }
   
   // Create a time index vector for trend calculation
-  vector[N_pre] time_index_pre = linspaced_vector(N_pre, 1, N_pre);
+  vector[N_train] time_index_train = linspaced_vector(N_train, 1, N_train);
 }
 
 parameters {
@@ -138,39 +138,39 @@ transformed parameters {
   // This block is executed for every MCMC sample of the parameters `w` and `sigma`.
   
   // This matrix will hold the final, rescaled synthetic control for each outcome.
-  matrix[N_pre, N_outcomes] y_synth_pre_scaled;
-  matrix[N_test, N_outcomes] y_synth_test_scaled;
+  matrix[N_train, N_outcomes] y_synth_train_scaled;
+  matrix[N_val, N_outcomes] y_synth_val_scaled;
   matrix[N_post, N_outcomes] y_synth_post_scaled;
   vector[N_outcomes] amplitude;
   
   for (k in 1:N_outcomes) {
     // 1. Create the pre-treatment synthetic control for the current outcome `k` using the shared weights `w`.
-    vector[N_pre] y_synth_pre_k = Y_control_pre[k] * w;
-    vector[N_test] y_synth_test_k = Y_control_test[k] * w;
+    vector[N_train] y_synth_train_k = Y_control_train[k] * w;
+    vector[N_val] y_synth_val_k = Y_control_val[k] * w;
     vector[N_post] y_synth_post_k = Y_control_post[k] * w;
     
     // 2. Standardize this synthetic control using its OWN mean and sd.
-	real mean_Y_synth_pre_k = mean(y_synth_test_k);
-    real sd_Y_synth_pre_k = sd(y_synth_pre_k);
-    vector[N_pre] y_synth_pre_std_k;
-    vector[N_test] y_synth_test_std_k;
+	real mean_Y_synth_train_k = mean(y_synth_val_k);
+    real sd_Y_synth_train_k = sd(y_synth_train_k);
+    vector[N_train] y_synth_train_std_k;
+    vector[N_val] y_synth_val_std_k;
     vector[N_post] y_synth_post_std_k;
 
     // --- Noise Floor Implementation (INA Fix) ---
     // We use the statistical noise floor `nu` calculated in transformed data.
     // Denominator = sqrt(sd_synth^2 + nu^2)    
-    real denominator = sqrt(square(sd_Y_synth_pre_k) + square(nu[k]));
+    real denominator = sqrt(square(sd_Y_synth_train_k) + square(nu[k]));
     
-    y_synth_pre_std_k = (y_synth_pre_k - mean_Y_synth_pre_k) / denominator;
-    y_synth_test_std_k = (y_synth_test_k - mean_Y_synth_pre_k) / denominator;
-    y_synth_post_std_k = (y_synth_post_k - mean_Y_synth_pre_k) / denominator;
+    y_synth_train_std_k = (y_synth_train_k - mean_Y_synth_train_k) / denominator;
+    y_synth_val_std_k = (y_synth_val_k - mean_Y_synth_train_k) / denominator;
+    y_synth_post_std_k = (y_synth_post_k - mean_Y_synth_train_k) / denominator;
     
     // 3. Rescale the standardized synthetic control to the scale of the TREATED unit's outcome.
-    y_synth_pre_scaled[, k] = (y_synth_pre_std_k * sd_Y_treated_pre[k]) + mean_Y_treated_pre[k];
-    y_synth_test_scaled[, k] = (y_synth_test_std_k * sd_Y_treated_pre[k]) + mean_Y_treated_pre[k];
-    y_synth_post_scaled[, k] = (y_synth_post_std_k * sd_Y_treated_pre[k]) + mean_Y_treated_pre[k];
+    y_synth_train_scaled[, k] = (y_synth_train_std_k * sd_Y_treated_train[k]) + mean_Y_treated_train[k];
+    y_synth_val_scaled[, k] = (y_synth_val_std_k * sd_Y_treated_train[k]) + mean_Y_treated_train[k];
+    y_synth_post_scaled[, k] = (y_synth_post_std_k * sd_Y_treated_train[k]) + mean_Y_treated_train[k];
     
-    amplitude[k] = max(Y_treated_pre[, k]) - min(Y_treated_pre[, k]);
+    amplitude[k] = max(Y_treated_train[, k]) - min(Y_treated_train[, k]);
   }
 }
 
@@ -190,70 +190,72 @@ model {
     // The model's likelihood for outcome k is defined on the treatment scale.
     // It states that the pre-treatment outcome of the treated unit is normally
     // distributed around the rescaled pre-treatment synthetic control.
-    Y_treated_pre[, k] ~ normal(y_synth_pre_scaled[, k], sigma[k]);
+    Y_treated_train[, k] ~ normal(y_synth_train_scaled[, k], sigma[k]);
   
     // --- CONSTRAINTS / PENALTIES ---
     // These terms penalize the log-posterior if the residuals for this outcome have bad properties.
     
     // 1. Calculate pre-treatment residuals (on the original, un-standardized scale)
-    vector[N_pre] residuals_pre = Y_treated_pre[, k] - y_synth_pre_scaled[, k];
-    vector[N_test] residuals_test = Y_treated_test[, k] - y_synth_test_scaled[, k];
+    vector[N_train] residuals_train = Y_treated_train[, k] - y_synth_train_scaled[, k];
+    vector[N_val] residuals_val = Y_treated_val[, k] - y_synth_val_scaled[, k];
 
     // 2. Calculate diagnostic correlations and nrmse
-    real nrmse_pre = sqrt(mean(square(residuals_pre / amplitude[k])));
-    real nrmse_test = sqrt(mean(square(residuals_test / amplitude[k])));
+    real nrmse_train = sqrt(mean(square(residuals_train / amplitude[k])));
+    real nrmse_val = sqrt(mean(square(residuals_val / amplitude[k])));
 
     // 3. Add soft constraints by specifying tight priors on these nrmse
-    nrmse_pre ~ normal(0, tau_nrmse[k]) T[0,];
-    nrmse_test ~ normal(0, tau_nrmse[k]) T[0,];
+    nrmse_train ~ normal(0, tau_nrmse[k]) T[0,];
+    nrmse_val ~ normal(0, tau_nrmse[k]) T[0,];
   }
 }
 
 generated quantities {
   // This block generates quantities of interest for each outcome using the posterior draws.
   
-  // We flatten the log-likelihoods into a vector of size (N_pre * N_outcomes)
-  vector[N_pre * N_outcomes] log_lik;
+  // We flatten the log-likelihoods into a vector of size (N_train * N_outcomes)
+  vector[N_train * N_outcomes] log_lik;
   int idx = 1;
   
   // Generate draws from the posterior predictive distribution for the effect of each outcome.
   // This incorporates the estimated model noise `sigma` into our prediction. 
   // Predictive residuals
-  matrix[N_pre, N_outcomes] predictive_pre;
-  matrix[N_test, N_outcomes] predictive_test;
+  matrix[N_train, N_outcomes] predictive_train;
+  matrix[N_val, N_outcomes] predictive_val;
   matrix[N_post, N_outcomes] predictive_post;
-  matrix[N_pre, N_outcomes] residuals_pre;
-  matrix[N_test, N_outcomes] residuals_test;
+  matrix[N_train, N_outcomes] residuals_train;
+  matrix[N_val, N_outcomes] residuals_val;
   matrix[N_post, N_outcomes] effect_post;
-  vector[N_outcomes] nrmse_pre;
-  vector[N_outcomes] nrmse_test;
+  vector[N_outcomes] nrmse_train;
+  vector[N_outcomes] nrmse_val_minus_one;
+  vector[N_outcomes] nrmse_terminal;
   vector[N_outcomes] nrmse_post;
   real gini_weight = normalized_gini_simplex(w);
   real hhi_weight = normalized_hhi_simplex(w);
   
   // Structural for raw trends
-  matrix[N_pre, N_outcomes] struc_residuals_pre;
-  matrix[N_test, N_outcomes] struc_residuals_test;
+  matrix[N_train, N_outcomes] struc_residuals_train;
+  matrix[N_val, N_outcomes] struc_residuals_val;
   matrix[N_post, N_outcomes] struc_effect_post;
-  vector[N_outcomes] struc_nrmse_pre;
-  vector[N_outcomes] struc_nrmse_test;
+  vector[N_outcomes] struc_nrmse_train;
+  vector[N_outcomes] struc_nrmse_val_minus_one;
+  vector[N_outcomes] struc_nrmse_terminal;
   vector[N_outcomes] struc_nrmse_post;
   
   for (k in 1:N_outcomes) {
-    for (t in 1:N_pre) {
+    for (t in 1:N_train) {
 		
 	  // Calculate the log-probability of the data point given the parameters
-	  log_lik[idx] = normal_lpdf(Y_treated_pre[t, k] | y_synth_pre_scaled[t, k], sigma[k]);
+	  log_lik[idx] = normal_lpdf(Y_treated_train[t, k] | y_synth_train_scaled[t, k], sigma[k]);
 	  idx += 1;
 		
-	  predictive_pre[t, k] = normal_rng(y_synth_pre_scaled[t, k], sigma[k]);
-      residuals_pre[t, k] = Y_treated_pre[t, k] - predictive_pre[t, k];
-	  struc_residuals_pre[t, k] = Y_treated_pre[t, k] - y_synth_pre_scaled[t, k];
+	  predictive_train[t, k] = normal_rng(y_synth_train_scaled[t, k], sigma[k]);
+      residuals_train[t, k] = Y_treated_train[t, k] - predictive_train[t, k];
+	  struc_residuals_train[t, k] = Y_treated_train[t, k] - y_synth_train_scaled[t, k];
     }
-    for (t in 1:N_test) {
-	  predictive_test[t, k] = normal_rng(y_synth_test_scaled[t, k], sigma[k]);
-      residuals_test[t, k] = Y_treated_test[t, k] - predictive_test[t, k];
-	  struc_residuals_test[t, k] = Y_treated_test[t, k] - y_synth_test_scaled[t, k];
+    for (t in 1:N_val) {
+	  predictive_val[t, k] = normal_rng(y_synth_val_scaled[t, k], sigma[k]);
+      residuals_val[t, k] = Y_treated_val[t, k] - predictive_val[t, k];
+	  struc_residuals_val[t, k] = Y_treated_val[t, k] - y_synth_val_scaled[t, k];
     }
     for (t in 1:N_post) {
 	  predictive_post[t, k] = normal_rng(y_synth_post_scaled[t, k], sigma[k]);
@@ -261,16 +263,14 @@ generated quantities {
 	  struc_effect_post[t, k] = Y_treated_post[t, k] - y_synth_post_scaled[t, k];
     }
 
-    nrmse_pre[k] = sqrt(mean(square(residuals_pre[, k] / amplitude[k])));
-    nrmse_test[k] = sqrt(mean(square(residuals_test[, k] / amplitude[k])));
+    nrmse_train[k] = sqrt(mean(square(residuals_train[, k] / amplitude[k])));
+    nrmse_val_minus_one[k] = sqrt(mean(square(residuals_val[1:(N_val-1), k] / amplitude[k])));
+	nrmse_terminal[k] = abs(residuals_val[N_val, k]) / amplitude[k];
     nrmse_post[k] = sqrt(mean(square(effect_post[, k] / amplitude[k])));
 
-    struc_nrmse_pre[k] = sqrt(mean(square(struc_residuals_pre[, k] / amplitude[k])));
-    struc_nrmse_test[k] = sqrt(mean(square(struc_residuals_test[, k] / amplitude[k])));
-    struc_nrmse_post[k] = sqrt(mean(square(struc_effect_post[, k] / amplitude[k])));
+    struc_nrmse_train[k] = sqrt(mean(square(struc_residuals_train[, k] / amplitude[k])));
+    struc_nrmse_val_minus_one[k] = sqrt(mean(square(struc_residuals_val[1:(N_val-1), k] / amplitude[k])));
+    struc_nrmse_terminal[k] = abs(struc_residuals_val[N_val, k]) / amplitude[k];
+	struc_nrmse_post[k] = sqrt(mean(square(struc_effect_post[, k] / amplitude[k])));
   }
-  
-  vector[N_outcomes] nrmse_pre_test = (nrmse_pre + nrmse_test) / 2;
-  vector[N_outcomes] struc_nrmse_pre_test = (struc_nrmse_pre + struc_nrmse_test) / 2;
-
 }

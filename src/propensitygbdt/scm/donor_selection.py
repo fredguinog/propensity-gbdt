@@ -449,7 +449,7 @@ function_aggregate_outcomes_error : Literal, default='mean'
     Metric to aggregate errors across multiple outcomes ('mean' or 'max').
 save_solution_period_error : Literal, default='pre_intervention'
     Determines which period's error is checked against `save_solution_maximum_error` to decide if a solution is saved.
-save_solution_maximum_error : float, default=0.15
+save_solution_maximum_error : float, default=None
     The maximum allowable RMSPE (normalized) for a candidate solution to be saved to disk.
 maximum_gram_cond_pre : float, Defaults to 100.0. The maximum allowable value for the Gram matrix condition number.
     This is used as a threshold to detect multicollinearity among control units; solutions exceeding it are flagged.
@@ -491,7 +491,7 @@ def search(
     synthetic_control_bias_removal_period: type_synthetic_control_bias_removal_period = 'pre_intervention',
     function_aggregate_outcomes_error: type_function_aggregate_outcomes_error = 'mean',
     save_solution_period_error: type_save_solution_period_error = 'pre_intervention',
-    save_solution_maximum_error: float = 0.15,
+    save_solution_maximum_error: float = None,
     maximum_gram_cond_pre: float = 100.0,
     alpha_exponential_decay: float = 0.00,
     optuna_optimization_target: type_optuna_optimization_target = 'pre_intervention',
@@ -588,7 +588,7 @@ def search(
     if save_solution_period_error not in valid_options:
         raise ValueError(f"Invalid mode: '{save_solution_period_error}'. Expected one of: {valid_options}")
     
-    if not isinstance(save_solution_maximum_error, float) or save_solution_maximum_error <= 0:
+    if save_solution_maximum_error is not None and not isinstance(save_solution_maximum_error, float) and save_solution_maximum_error <= 0:
         raise ValueError(f"save_solution_maximum_error must be a positive real, got {save_solution_maximum_error}")
         
     if not isinstance(maximum_gram_cond_pre, float) or maximum_gram_cond_pre <= 0:
@@ -677,6 +677,50 @@ def search(
             'amplitude': 1 if x['value'].max() == x['value'].min() else x['value'].max() - x['value'].min()
         })
     ).reset_index()
+
+    # ==============================================================================
+    # START CHANGE: Noise-Adaptive NRMSE Threshold (Proposal 1)
+    # ==============================================================================
+    # 1. Estimate Intrinsic Noise (Sigma_Hat) using MAD of first differences
+    #    Formula: median(|diff - median(diff)|) * 1.4826 (Robust estimator of sigma)
+    def calculate_robust_noise(x):
+        vals = x.values
+        if len(vals) < 2: return 0.0
+        diff = np.diff(vals)
+        mad = np.median(np.abs(diff - np.median(diff)))
+        return mad * 1.4826
+
+    if save_solution_maximum_error is None:
+        noise_estimates = all_units[
+            (all_units['treatment'] == 1) & 
+            (all_units['pre_intervention'] == 1)
+        ].groupby('outcome')['value'].apply(calculate_robust_noise).reset_index(name='sigma_hat')
+
+        # 2. Merge with amplitude to calculate the Noise Ratio (eta)
+        adaptive_df = pd.merge(amplitude, noise_estimates, on='outcome')
+        
+        # 3. Calculate Adaptive Threshold (tau) per outcome
+        #    Formula: tau = sqrt(0.10^2 + (2 * eta)^2)
+        #    This allows a base error of 0.10 plus a tolerance for 2x the intrinsic noise.
+        adaptive_df['eta'] = adaptive_df['sigma_hat'] / adaptive_df['amplitude']
+        adaptive_df['tau'] = np.sqrt(0.10**2 + (2 * adaptive_df['eta'])**2)
+
+        # 4. Aggregate to a single scalar threshold based on the user's config
+        if function_aggregate_outcomes_error == 'mean':
+            adaptive_threshold = adaptive_df['tau'].mean()
+        elif function_aggregate_outcomes_error == 'max':
+            adaptive_threshold = adaptive_df['tau'].max()
+        else:
+            adaptive_threshold = adaptive_df['tau'].mean() # Default fallback
+
+        print("\n--- Adaptive NRMSE Threshold Calculation ---")
+        print(adaptive_df[['outcome', 'amplitude', 'sigma_hat', 'eta', 'tau']])
+        print(f"User Configured Threshold: {save_solution_maximum_error}")
+        print(f"Calculated Adaptive Threshold: {adaptive_threshold}")
+        print("--------------------------------------------\n")
+
+        # 5. Overwrite the threshold variable used in the optimization loop
+        save_solution_maximum_error = adaptive_threshold
 
     all_units.drop('pre_intervention', axis=1, inplace=True)
 
