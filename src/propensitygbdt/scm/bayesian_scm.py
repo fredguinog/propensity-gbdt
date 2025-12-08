@@ -105,14 +105,11 @@ def classify_structural_uncertainty_shape(df, outcome_col='outcome'):
         widths = subset['band_width'].values
         time_steps = np.arange(len(widths))
         
-        # Calculate Data Scale (Average absolute value of the signal)
-        # We use this to normalize the width. 
-        # A width of 0.01 is huge if the data is 0.02, but tiny if data is 100.
-        avg_signal = np.mean(np.abs(subset['mean'])) 
-        if avg_signal == 0: avg_signal = 1e-6
-            
-        avg_width = np.mean(widths)
-        relative_width = avg_width / avg_signal
+        amp_signal = np.max(subset['mean']) - np.min(subset['mean'])
+        if amp_signal == 0: amp_signal = 1e-6
+        
+        max_width = np.max(widths)
+        relative_width = max_width / amp_signal
         
         # --- METRICS ---
         corr, _ = pearsonr(time_steps, widths)
@@ -123,9 +120,9 @@ def classify_structural_uncertainty_shape(df, outcome_col='outcome'):
         quality_score = 0 
         
         # Thresholds
-        THINNESS_THRESHOLD = 0.1
-        CORR_THRESHOLD = 0.5 
-        CV_THRESHOLD = 0.5        
+        THINNESS_THRESHOLD = 0.35
+        CORR_THRESHOLD = 0.4
+        CV_THRESHOLD = 0.4      
         
         # 1. NEW CRITERIA: THINNESS CHECK
         if relative_width < THINNESS_THRESHOLD:
@@ -149,7 +146,7 @@ def classify_structural_uncertainty_shape(df, outcome_col='outcome'):
             'shape': shape_class,
             'correlation': round(corr, 3),
             'volatility_cv': round(cv, 3),
-            'avg_width': round(avg_width, 4),
+            'max_width': round(max_width, 4),
             'relative_width': round(relative_width, 4),
             'quality_score': quality_score
         })
@@ -183,18 +180,17 @@ Args:
     seed (int, optional): A random seed to ensure the reproducibility of the
                           MCMC sampling and any other stochastic processes.
                           Defaults to 222.
-    maximum_mean_gini_weights (float, optional): The maximum permissible mean gini of the weight distribution
-                                          for the synthetic control. This helps prevent the model
-                                          from relying too heavily on one control unit.
-                                          Defaults to 0.75.
+    nrmse_terminal_over_train (float, optional): Tolerance for overfitting on the last time
+                      point befor the intervention. This check is needed because when 
+                      assumes low rank hidden trends and we don't require a perfect fit
 """
 def estimate(
-    timeid_previous_intervention,
-    workspace_folder,
-    solution_id=None,
-    period_effect_format='{:.2f}',
-    seed=222,
-    maximum_mean_gini_weights=0.75
+    timeid_previous_intervention: str,
+    workspace_folder: str,
+    solution_id: int = None,
+    period_effect_format: str = '{:.2f}',
+    seed: int = 222,
+    nrmse_terminal_over_train: float = 2.0
 ):
     # Set the random seed for NumPy to ensure reproducibility of its random operations.
     np.random.seed(seed)
@@ -308,8 +304,6 @@ def estimate(
         control_df = dataset[dataset['treatment'] == 0]
         outcomes = sorted(dataset['outcome'].unique())
         N_outcomes = len(outcomes)
-        
-        os.makedirs(f"{workspace_folder}/{temp_folder}/solution_id_{solution_id}", exist_ok=True)
 
         # 3. PREPARE DATA FOR STAN
         # -----------------------------------------------------------------------------
@@ -361,7 +355,7 @@ def estimate(
         'Y_control_post': Y_control_post,
         'dirichlet_alpha': np.repeat(1.0, N_controls), # Hyperparameter for the Dirichlet prior on weights (uninformative).
         'tau_nrmse_prior': np.repeat(0.1, N_outcomes), # Hyperparameter for the prior on the NRMSE noise term.
-        'noise_floor_fraction': 0.1
+        'noise_floor_fraction': 0.01
         }
 
         # 4. FIT THE STAN MODEL
@@ -410,6 +404,8 @@ def estimate(
             refresh=500
         )
 
+        os.makedirs(f"{workspace_folder}/{temp_folder}/solution_id_{solution_id}", exist_ok=True)
+
         # Print a summary of the R-hat diagnostic statistic. R-hat values close to 1.0
         # indicate that the MCMC chains have converged to the same posterior distribution.
         fit_dt = fit.summary()
@@ -427,10 +423,7 @@ def estimate(
         
         # 1. Calculate LOO using ArviZ
         # pointwise=True allows us to inspect specific data points that might be outliers
-        loo_results = az.loo(inference_data, pointwise=True)
-        
-        if (loo_results.warning):
-            solution_has_problem = solution_has_problem + 'O'  
+        loo_results = az.loo(inference_data, pointwise=True) 
 
         # 2. Save LOO Summary statistics
         # Converts the LOO object to a series/dataframe for saving
@@ -488,11 +481,13 @@ def estimate(
         temp_weight_solutions['impact_score'] = impact_score
         temp_weight_solutions['solution_id'] = solution_id
 
-        weight_solutions = pd.concat([weight_solutions, temp_weight_solutions])
+        weight_solutions = pd.concat([weight_solutions, temp_weight_solutions])     
 
-        if (draws_df['gini_weight'].mean() > maximum_mean_gini_weights):
-            solution_has_problem = solution_has_problem + f"W{draws_df['gini_weight'].mean():.2f}"         
-            
+        for idx, _ in enumerate(outcomes):
+            if (draws_df[f'struc_nrmse_terminal[{idx+1}]'].quantile(0.975) / draws_df[f'struc_nrmse_train[{idx+1}]'].quantile(0.975) > nrmse_terminal_over_train):
+                solution_has_problem = solution_has_problem + "L"
+                break
+
         if solution_has_problem != "":
             os.rename(f"{workspace_folder}/{temp_folder}/solution_id_{solution_id}", f"{workspace_folder}/{temp_folder}/{solution_has_problem}_solution_id_{solution_id}")
             unacceptable_solutions.append(solution_id)
@@ -792,10 +787,6 @@ def estimate(
             
             shape_report = classify_structural_uncertainty_shape(absolute_structural_timeid_df)
 
-            if shape_report['quality_score'].min() < 5:
-                solution_has_problem = solution_has_problem + 'S'
-                unacceptable_solutions.append(solution_id)
-
             # Save the report
             shape_report.to_csv(f"{workspace_folder}/{temp_folder}/solution_id_{solution_id}/structural_uncertainty_shape_report.csv", index=False)                
             
@@ -887,7 +878,12 @@ def estimate(
                     os.rename(f"{workspace_folder}/{temp_folder}/solution_id_{solution_id}", f"{workspace_folder}/{temp_folder}/P_solution_id_{solution_id}")
                     unacceptable_solutions.append(solution_id)
                 else:
-                    os.rename(f"{workspace_folder}/{temp_folder}/solution_id_{solution_id}", f"{workspace_folder}/{temp_folder}/B{loo_results.elpd_loo:3.1f}_W{draws_df['gini_weight'].mean():.2f}_H{draws_df['hhi_weight'].mean():.2f}_solution_id_{solution_id}")
+                    predictive_reliability_score = -1
+                    for idx, _ in enumerate(outcomes):
+                        predictive_reliability_score_temp = draws_df[f'struc_nrmse_val_minus_one[{idx+1}]'].quantile(0.975) + abs(draws_df[f'struc_nrmse_val_minus_one[{idx+1}]'].quantile(0.975) - draws_df[f'struc_nrmse_train[{idx+1}]'].quantile(0.975))
+                        if predictive_reliability_score_temp > predictive_reliability_score:
+                            predictive_reliability_score = predictive_reliability_score_temp                   
+                    os.rename(f"{workspace_folder}/{temp_folder}/solution_id_{solution_id}", f"{workspace_folder}/{temp_folder}/R{predictive_reliability_score:1.3f}_S{shape_report['relative_width'].max():1.3f}_W{draws_df['gini_weight'].mean():.2f}_H{draws_df['hhi_weight'].mean():.2f}_solution_id_{solution_id}")
             else:
                 if parallel_trends_violated:
                     os.rename(f"{workspace_folder}/{temp_folder}/solution_id_{solution_id}", f"{workspace_folder}/{temp_folder}/{solution_has_problem}P_solution_id_{solution_id}")

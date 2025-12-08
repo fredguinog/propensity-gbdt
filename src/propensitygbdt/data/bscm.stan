@@ -99,7 +99,7 @@ data {
   vector<lower=0>[N_controls] dirichlet_alpha; // Hyperparameter for Dirichlet prior on weights. Sparsity requires a value smaller than 1
   vector<lower=0>[N_outcomes] tau_nrmse_prior;
   
-  // The fraction of treated volatility to use as the noise floor (e.g., 0.1)
+  // The fraction of treated volatility to use as the noise floor (e.g., 0.01)
   real<lower=0> noise_floor_fraction; 
 }
 
@@ -109,10 +109,15 @@ transformed data {
   vector[N_outcomes] mean_Y_treated_train;
   vector[N_outcomes] sd_Y_treated_train;
   vector[N_outcomes] nu; // The statistical noise floor per outcome
+  real nu_T = 1.0 / log(N_train + N_val);
+  // defensive clamp to avoid extreme values for tiny Tpre:
+  if (nu_T < 1e-6) nu_T = 1e-6;
+  if (nu_T > 0.5) nu_T = 0.5; // optional upper limit to avoid pure-standardization for tiny samples
   
   for (k in 1:N_outcomes) {
-	mean_Y_treated_train[k] = mean(Y_treated_val[, k]);
-    sd_Y_treated_train[k] = sd(Y_treated_train[, k]);
+	vector[N_train + N_val] Y_treated_pre = append_row(Y_treated_train[, k], Y_treated_val[, k]);
+	mean_Y_treated_train[k] = mean(Y_treated_pre);
+    sd_Y_treated_train[k] = sd(Y_treated_pre);
 	
     // Calculate nu based on treated unit volatility
     nu[k] = sd_Y_treated_train[k] * noise_floor_fraction;
@@ -129,7 +134,7 @@ parameters {
 
   // The standard deviation of the model's error term for EACH outcome.
   // This captures how well the synthetic control can match the treated unit for each outcome.
-  vector<lower=0>[N_outcomes] sigma;
+  vector<lower=1e-6>[N_outcomes] sigma;
   
   vector<lower=0>[N_outcomes] tau_nrmse;  // Hierarchical prior for NRMSE per outcome
 }
@@ -144,31 +149,52 @@ transformed parameters {
   vector[N_outcomes] amplitude;
   
   for (k in 1:N_outcomes) {
-    // 1. Create the pre-treatment synthetic control for the current outcome `k` using the shared weights `w`.
+    // 1. raw synthetic controls (pre-treatment train/val/post)
     vector[N_train] y_synth_train_k = Y_control_train[k] * w;
-    vector[N_val] y_synth_val_k = Y_control_val[k] * w;
-    vector[N_post] y_synth_post_k = Y_control_post[k] * w;
-    
-    // 2. Standardize this synthetic control using its OWN mean and sd.
-	real mean_Y_synth_train_k = mean(y_synth_val_k);
-    real sd_Y_synth_train_k = sd(y_synth_train_k);
-    vector[N_train] y_synth_train_std_k;
-    vector[N_val] y_synth_val_std_k;
-    vector[N_post] y_synth_post_std_k;
+    vector[N_val]   y_synth_val_k   = Y_control_val[k]   * w;
+    vector[N_post]  y_synth_post_k  = Y_control_post[k]  * w;
 
-    // --- Noise Floor Implementation (INA Fix) ---
-    // We use the statistical noise floor `nu` calculated in transformed data.
-    // Denominator = sqrt(sd_synth^2 + nu^2)    
-    real denominator = sqrt(square(sd_Y_synth_train_k) + square(nu[k]));
-    
-    y_synth_train_std_k = (y_synth_train_k - mean_Y_synth_train_k) / denominator;
-    y_synth_val_std_k = (y_synth_val_k - mean_Y_synth_train_k) / denominator;
-    y_synth_post_std_k = (y_synth_post_k - mean_Y_synth_train_k) / denominator;
-    
-    // 3. Rescale the standardized synthetic control to the scale of the TREATED unit's outcome.
-    y_synth_train_scaled[, k] = (y_synth_train_std_k * sd_Y_treated_train[k]) + mean_Y_treated_train[k];
-    y_synth_val_scaled[, k] = (y_synth_val_std_k * sd_Y_treated_train[k]) + mean_Y_treated_train[k];
-    y_synth_post_scaled[, k] = (y_synth_post_std_k * sd_Y_treated_train[k]) + mean_Y_treated_train[k];
+    // 2. compute means and pooled sd for synth pre-period (train+val)
+    int N1 = N_train;
+    int N2 = N_val;
+    int Ntot = N1 + N2;
+    real m1 = mean(y_synth_train_k);
+    real m2 = mean(y_synth_val_k);
+    // pooled variance (numerically stable)
+    real ss1 = (N1 - 1) * variance(y_synth_train_k);
+    real ss2 = (N2 - 1) * variance(y_synth_val_k);
+    real ss_total = ss1 + ss2 + (N1 * N2 * square(m1 - m2)) / (Ntot);
+    real mean_Y_synth_train_k = (N1 * m1 + N2 * m2) / (Ntot);
+    real sd_Y_synth_train_k = sqrt( ss_total / (Ntot - 1) );
+
+    // 3. per-outcome noise floor (keep your original logic; treat as epsilon_k)
+    real epsilon_k = nu[k]; // nu[k] computed in transformed data as sd_treated * noise_floor_fraction
+    // defensive lower bound
+    if (epsilon_k < 1e-8) epsilon_k = 1e-8;
+
+    // 4. Standardized synthetic control (shape), using variance floor inside denominator
+    real denom_std = sqrt(square(sd_Y_synth_train_k) + square(epsilon_k)); 
+    vector[N_train] y_synth_train_std_k = (y_synth_train_k - mean_Y_synth_train_k) / denom_std;
+    vector[N_val]   y_synth_val_std_k   = (y_synth_val_k   - mean_Y_synth_train_k) / denom_std;
+    vector[N_post]  y_synth_post_std_k  = (y_synth_post_k  - mean_Y_synth_train_k) / denom_std;
+
+    // 5. Rescale standardized synth to the treated unit's scale (treated mean & sd)
+    real mu_treated = mean_Y_treated_train[k];
+    real sd_treated = sd_Y_treated_train[k];
+    vector[N_train] std_rescaled_train = y_synth_train_std_k * sd_treated + mu_treated;
+    vector[N_val]   std_rescaled_val   = y_synth_val_std_k   * sd_treated + mu_treated;
+    vector[N_post]  std_rescaled_post  = y_synth_post_std_k  * sd_treated + mu_treated;
+
+    // 6. Raw rescaled: shift synthetic series to treated mean (no variance normalization)
+    // This aligns scales by mean only and leaves variance of donors untouched.
+    vector[N_train] raw_rescaled_train = (y_synth_train_k - mean_Y_synth_train_k) + mu_treated;
+    vector[N_val]   raw_rescaled_val   = (y_synth_val_k   - mean_Y_synth_train_k) + mu_treated;
+    vector[N_post]  raw_rescaled_post  = (y_synth_post_k  - mean_Y_synth_train_k) + mu_treated;
+
+    // 7. Final mixture: (1 - nu_T) * raw + nu_T * standardized-rescaled
+    y_synth_train_scaled[, k] = (1.0 - nu_T) * raw_rescaled_train + nu_T * std_rescaled_train;
+    y_synth_val_scaled[, k]   = (1.0 - nu_T) * raw_rescaled_val   + nu_T * std_rescaled_val;
+    y_synth_post_scaled[, k]  = (1.0 - nu_T) * raw_rescaled_post  + nu_T * std_rescaled_post;
     
     amplitude[k] = max(Y_treated_train[, k]) - min(Y_treated_train[, k]);
   }
@@ -201,11 +227,13 @@ model {
 
     // 2. Calculate diagnostic correlations and nrmse
     real nrmse_train = sqrt(mean(square(residuals_train / amplitude[k])));
-    real nrmse_val = sqrt(mean(square(residuals_val / amplitude[k])));
-
+    real nrmse_val_minus_one = sqrt(mean(square(residuals_val[1:(N_val-1)] / amplitude[k])));
+	real nrmse_terminal = abs(residuals_val[N_val] / amplitude[k]);
+	
     // 3. Add soft constraints by specifying tight priors on these nrmse
     nrmse_train ~ normal(0, tau_nrmse[k]) T[0,];
-    nrmse_val ~ normal(0, tau_nrmse[k]) T[0,];
+    nrmse_val_minus_one ~ normal(0, tau_nrmse[k]) T[0,];
+	nrmse_terminal ~ normal(0, tau_nrmse[k]) T[0,];
   }
 }
 
