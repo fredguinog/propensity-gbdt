@@ -148,8 +148,8 @@ bayesian_scm.estimate(
 *   `solution_id` : int, default=None.  The specific ID for a pre-selected group of control units (the donor pool). If set to None, the function will automatically choose the solution that demonstrates the best balance between pre-intervention fit and impact score.
 *   `period_effect_format` : str, default='{:.2f}'. A format string used to display numeric results in the plot annotations, such as the average treatment effect.
 *   `seed` : int, default=222. A random seed to ensure the reproducibility of the MCMC sampling and any other stochastic processes.
-*   `maximum_gram_cond` : float, default=100.0. The maximum allowable value for the Gram matrix condition number. This is used as a threshold to detect multicollinearity among control units; solutions exceeding it are flagged.
-*   `maximum_mean_gini_weights` : float, default=0.75. The maximum permissible mean gini of the weight distribution for the synthetic control. This helps prevent the model from relying too heavily on one control unit.
+*   `nrmse_terminal_over_train` : float, default=2.0. Tolerance for overfitting on the last time point befor the intervention. This check is needed because when assumes low rank hidden trends and we don't require a perfect fit.
+*   `length_post_intervention_period` : int, default=None (All available). Defines the length of the post intervention period.
 
 ## Citation
 

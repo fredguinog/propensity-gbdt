@@ -182,7 +182,10 @@ Args:
                           Defaults to 222.
     nrmse_terminal_over_train (float, optional): Tolerance for overfitting on the last time
                       point befor the intervention. This check is needed because when 
-                      assumes low rank hidden trends and we don't require a perfect fit
+                      assumes low rank hidden trends and we don't require a perfect fit.
+                      Defaults to 2.0.
+    length_post_intervention_period (int, optional): Defines the length of the post
+                      intervention period. Defaults to None (All available).
 """
 def estimate(
     timeid_previous_intervention: str,
@@ -190,7 +193,8 @@ def estimate(
     solution_id: int = None,
     period_effect_format: str = '{:.2f}',
     seed: int = 222,
-    nrmse_terminal_over_train: float = 2.0
+    nrmse_terminal_over_train: float = 2.0,
+    length_post_intervention_period: int = None
 ):
     # Set the random seed for NumPy to ensure reproducibility of its random operations.
     np.random.seed(seed)
@@ -200,6 +204,9 @@ def estimate(
     # Remove the last char from workspace_folder if it is /
     if workspace_folder.endswith('/') or workspace_folder.endswith('\\'):
         workspace_folder = workspace_folder[:-1]
+        
+    if length_post_intervention_period is not None and not isinstance(length_post_intervention_period, int) and length_post_intervention_period <= 0:
+        raise ValueError(f"length_post_intervention_period must be a positive int, got {length_post_intervention_period}")
 
     # Check if CmdStanPy is installed and can find the CmdStan command-line interface.
     # This is a crucial dependency for running the Bayesian models.
@@ -245,6 +252,7 @@ def estimate(
 
     temp_folder = f"temp_{datetime.now().strftime("%Y%m%d_%H%M%S")}"
 
+    summary_data_collection = []
     unacceptable_solutions = []
     weight_solutions = pd.DataFrame()
     for solution_id in solutions_id:
@@ -260,10 +268,13 @@ def estimate(
             unitids = sorted(dataset[dataset['treatment'] == 0]['unitid'].unique())
         print(f"Using unitids: {unitids}")
 
-        impact_score = dataset[dataset['treatment'] == 0]['impact_score'].unique()[0]
-
         # Keep only the essential columns for the analysis.
         dataset = dataset[["outcome", "timeid", "value", "treatment", "unitid"]]
+        
+        if not set([timeid_previous_intervention]).issubset(set(dataset['timeid'].unique().tolist())):
+            print(f"timeid_previous_intervention: {timeid_previous_intervention}")
+            print(f"pre_intervention: {sorted(dataset['timeid'].unique().tolist())}")
+            raise ValueError("ERROR: timeid_previous_intervention MUST BE A SUBSET OF pre_intervention")
 
         # Ensure that the analysis only uses time periods where data is available for all outcomes.
         # This avoids issues with missing data in the model.
@@ -282,7 +293,16 @@ def estimate(
         # Define the start, base (end of pre-treatment), and end time periods using the integer codes.
         timeid_inicio = 1
         timeid_base = np.where(mapping_timeid == timeid_previous_intervention)[0][0] + 1
-        timeid_fim = dataset['timeid'].max()
+        if length_post_intervention_period is None:
+            timeid_fim = dataset['timeid'].max()
+        elif len(mapping_timeid) >= timeid_base + length_post_intervention_period:
+            timeid_fim = timeid_base + length_post_intervention_period
+        else:
+            raise ValueError(f"length_post_intervention_period maust be equal or smaller than the available time points after the pre_intervention")
+            
+        mapping_timeid = mapping_timeid[:timeid_fim]
+        
+        dataset = dataset[dataset['timeid'].isin(range(0, len(mapping_timeid) + 1))]
 
         # Define a validation period using the last 20% of the pre-treatment data with minimum of 2. This period is used for model validation (e.g., calculating NRMSE).
         val_period_size = max(2, int(0.2 * timeid_base))
@@ -473,15 +493,7 @@ def estimate(
         chains_w_df['index_1'] = pd.to_numeric(extracted_info[1]) # Corresponds to unitid
 
         # Map the first index back to the unitid name.
-        chains_w_df['unitid'] = chains_w_df['index_1'].apply(lambda x: unitids[x-1])
-
-        temp_weight_solutions = chains_w_df.groupby('unitid').agg({
-            'value' : 'mean'
-        }).reset_index()
-        temp_weight_solutions['impact_score'] = impact_score
-        temp_weight_solutions['solution_id'] = solution_id
-
-        weight_solutions = pd.concat([weight_solutions, temp_weight_solutions])     
+        chains_w_df['unitid'] = chains_w_df['index_1'].apply(lambda x: unitids[x-1])  
 
         for idx, _ in enumerate(outcomes):
             if (draws_df[f'struc_nrmse_terminal[{idx+1}]'].quantile(0.975) / draws_df[f'struc_nrmse_train[{idx+1}]'].quantile(0.975) > nrmse_terminal_over_train):
@@ -813,7 +825,7 @@ def estimate(
             axes = az.plot_density(
                 [inference_data.sel(chain=[0]), inference_data.sel(chain=[1]),
                 inference_data.sel(chain=[2]), inference_data.sel(chain=[3])],
-                var_names=["w", "sigma", "tau_nrmse", "gini_weight", "hhi_weight"],
+                var_names=["w", "sigma", "tau_nrmse", "hhi_weight"],
                 shade=0.0,
                 hdi_prob=0.95,
                 point_estimate="mean",
@@ -883,7 +895,7 @@ def estimate(
                         predictive_reliability_score_temp = draws_df[f'struc_nrmse_val_minus_one[{idx+1}]'].quantile(0.975) + abs(draws_df[f'struc_nrmse_val_minus_one[{idx+1}]'].quantile(0.975) - draws_df[f'struc_nrmse_train[{idx+1}]'].quantile(0.975))
                         if predictive_reliability_score_temp > predictive_reliability_score:
                             predictive_reliability_score = predictive_reliability_score_temp                   
-                    os.rename(f"{workspace_folder}/{temp_folder}/solution_id_{solution_id}", f"{workspace_folder}/{temp_folder}/R{predictive_reliability_score:1.3f}_S{shape_report['relative_width'].max():1.3f}_W{draws_df['gini_weight'].mean():.2f}_H{draws_df['hhi_weight'].mean():.2f}_solution_id_{solution_id}")
+                    os.rename(f"{workspace_folder}/{temp_folder}/solution_id_{solution_id}", f"{workspace_folder}/{temp_folder}/R{predictive_reliability_score:1.3f}_S{shape_report['relative_width'].max():1.3f}_H{draws_df['hhi_weight'].mean():.2f}_K{max(loo_results.pareto_k.values):.2f}_solution_id_{solution_id}")
             else:
                 if parallel_trends_violated:
                     os.rename(f"{workspace_folder}/{temp_folder}/solution_id_{solution_id}", f"{workspace_folder}/{temp_folder}/{solution_has_problem}P_solution_id_{solution_id}")
@@ -891,18 +903,98 @@ def estimate(
                 else:
                     os.rename(f"{workspace_folder}/{temp_folder}/solution_id_{solution_id}", f"{workspace_folder}/{temp_folder}/{solution_has_problem}_solution_id_{solution_id}")
 
+            temp_weight_solutions = chains_w_df.groupby('unitid').agg({
+                'value' : 'mean'
+            }).reset_index()
+            temp_weight_solutions['Unrmse'] = predictive_reliability_score
+            temp_weight_solutions['solution_id'] = solution_id
+
+            weight_solutions = pd.concat([weight_solutions, temp_weight_solutions])
+
+            # 1. Metrics
+            nrmse_score = predictive_reliability_score # Calculated previously in your code
+            synth_score = shape_report['relative_width'].max()
+            hhi_score = draws_df['hhi_weight'].mean()
+
+            # 2. Effects (Formatting helper)
+            def format_effect_string(mean, lower, upper):
+                # Check significance (0 not in interval)
+                sig = "*" if (lower > 0 or upper < 0) else ""
+                return f"{mean:1.2f}{sig} [{lower:1.2f} {upper:1.2f}]"
+
+            effect_rows = []
+            
+            # Group outcomes by category if they have prefixes (e.g., "Limited service - average wage")
+            # Assuming outcome names in data are like "Limited service - average weekly wage"
+            for outcome_name in outcomes:
+                # Parse Category and Metric from outcome name if possible, else use defaults
+                parts = outcome_name.split(' - ')
+                if len(parts) >= 2:
+                    category, metric_name = parts[0], parts[1]
+                else:
+                    category, metric_name = outcome_name, "ATT"
+
+                # A. Post-Intervention Average
+                # Filter att_period_df calculated previously
+                post_data = att_period_df[(att_period_df['outcome'] == outcome_name) & (att_period_df['period'] == 'Post')].iloc[0]
+                val_post = format_effect_string(post_data['mean'], post_data['q2_5'], post_data['q97_5'])
+                
+                effect_rows.append({
+                    'Category': category, 'Item': metric_name, 
+                    'Description': 'ATT post-intervention', 'Value': val_post
+                })
+
+                # B. Spot Check Date (e.g., 2016Q1)
+                # Filter att_timeid_df calculated previously
+                # We need to map the string 'spot_check_timeid' to the integer/mapped ID used in att_timeid_df
+                
+                # Check if the specific date exists in the results
+                spot_check_timeid = att_timeid_df['timeid'].iloc[-1]
+                spot_data = att_timeid_df[(att_timeid_df['outcome'] == outcome_name) & (att_timeid_df['timeid'] == spot_check_timeid)]
+                
+                if not spot_data.empty:
+                    row = spot_data.iloc[0]
+                    val_spot = format_effect_string(row['effect'], row['q2_5'], row['q97_5'])
+                    effect_rows.append({
+                        'Category': category, 'Item': metric_name, 
+                        'Description': f'ATT {spot_check_timeid}', 'Value': val_spot
+                    })
+                else:
+                    # Fallback if date not found
+                    effect_rows.append({
+                        'Category': category, 'Item': metric_name, 
+                        'Description': f'ATT {spot_check_timeid}', 'Value': "N/A"
+                    })
+
+            # 3. Weights
+            # Filter weights for this solution
+            weights_data = chains_w_df.groupby('unitid')['value'].mean().reset_index()
+            weights_dict = weights_data.set_index('unitid')['value'].to_dict()
+
+            # Store everything
+            summary_data_collection.append({
+                'solution_id': solution_id,
+                'metrics': {
+                    'NRMSE': nrmse_score,
+                    'Synth': synth_score,
+                    'HHI': hhi_score
+                },
+                'effects': effect_rows,
+                'weights': weights_dict
+            })
+
     complemento = list(set(solutions_id) - set(np.unique(unacceptable_solutions)))
 
     weight_solutions_filtred = weight_solutions[weight_solutions['solution_id'].isin(complemento)]
 
     # 2. Create the 'N' and 'sid' columns
     weight_solutions_filtred['N'] = weight_solutions_filtred['value'].round(2).astype(str)
-    weight_solutions_filtred['impact_score_solution_id'] = weight_solutions_filtred['impact_score'].astype(str) + '_' + weight_solutions_filtred['solution_id'].astype(int).astype(str)
+    weight_solutions_filtred['Unrmse_solution_id'] = weight_solutions_filtred['Unrmse'].round(3).astype(str) + '_' + weight_solutions_filtred['solution_id'].astype(int).astype(str)
 
     # 3. Reshape the data using pivot_table and fill missing values
     result_df = weight_solutions_filtred.pivot_table(
         index='unitid',
-        columns='impact_score_solution_id',
+        columns='Unrmse_solution_id',
         values='N',
         aggfunc='first',  # Use 'first' as we expect one value per cell
         fill_value=""
@@ -910,3 +1002,83 @@ def estimate(
 
     print(result_df)
     result_df.to_csv(f"{workspace_folder}/{temp_folder}/weight_solutions.csv", mode='w', header=True, index=False)
+
+    # Define the rows structure as per the image
+    final_rows = []
+
+    # 1. Header Metrics Rows
+    metric_defs = [
+        ('NRMSE', 'Predictive Upper Bound', 'Uval + abs(Uval - Utrain)', 'NRMSE', '{:.3f}'),
+        ('Synth', 'Structural Alignment', 'Max Relative Width', 'Synth', '{:.3f}'),
+        ('HHI', 'Weight Concentration', 'Mean', 'HHI', '{:.3f}')
+    ]
+
+    # Get valid solution IDs (those that weren't filtered out by unacceptable_solutions if applicable, 
+    # though the image shows all provided IDs). Let's use all collected data.
+    
+    # Sort collected data by solution_id to match columns or custom sort
+    # The image implies no specific sort, but we usually sort by ID or NRMSE. 
+    # Let's keep input order.
+    
+    # Extract unique Solution IDs for columns
+    sol_ids = [d['solution_id'] for d in summary_data_collection]
+
+    # --- Section 1: Standard Metrics ---
+    for cat, met, sub, key, fmt in metric_defs:
+        row = {'Category': cat, 'Item': met, 'Description': sub}
+        for data in summary_data_collection:
+            val = data['metrics'][key]
+            row[data['solution_id']] = fmt.format(val)
+        final_rows.append(row)
+
+    # --- Section 2: Effects (ATT) ---
+    # We need to extract the structure from the first solution to know the rows
+    if summary_data_collection:
+        first_sol_effects = summary_data_collection[0]['effects']
+        for eff_def in first_sol_effects:
+            row = {
+                'Category': eff_def['Category'], 
+                'Item': eff_def['Item'], 
+                'Description': eff_def['Description']
+            }
+            # Fill values for all solutions
+            for data in summary_data_collection:
+                # Find matching effect for this solution
+                match = next((x for x in data['effects'] 
+                              if x['Category'] == eff_def['Category'] 
+                              and x['Item'] == eff_def['Item']
+                              and x['Description'] == eff_def['Description']), None)
+                row[data['solution_id']] = match['Value'] if match else ""
+            final_rows.append(row)
+
+    # --- Section 3: Weights ---
+    # Get all unique unitids across all solutions
+    all_unitids = sorted(list(set().union(*[d['weights'].keys() for d in summary_data_collection])))
+    
+    for uid in all_unitids:
+        row = {'Category': 'unitid', 'Item': uid, 'Description': ''}
+        has_val = False
+        for data in summary_data_collection:
+            w_val = data['weights'].get(uid, 0.0)
+            # Only show weight if > threshold (e.g. 0.01) or per image logic (blanks for very small?)
+            # Image shows empty cells. Let's assume threshold of 0.01
+            if w_val >= 0.01:
+                row[data['solution_id']] = "{:.2f}".format(w_val)
+                has_val = True
+            else:
+                row[data['solution_id']] = ""
+        
+        # Only add row if at least one solution uses this unit (optional, but cleaner)
+        if has_val:
+            final_rows.append(row)
+
+    # Create DataFrame
+    final_df = pd.DataFrame(final_rows)
+
+    # Reorder columns: Category, Metric, Description, then Solution IDs
+    cols = ['Category', 'Item', 'Description'] + sol_ids
+    final_df = final_df[cols]
+
+    # Save
+    final_csv_path = f"{workspace_folder}/{temp_folder}/final_summary_table.csv"
+    final_df.to_csv(final_csv_path, index=False)
