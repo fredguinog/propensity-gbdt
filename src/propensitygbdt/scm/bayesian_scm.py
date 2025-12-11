@@ -1062,7 +1062,19 @@ def estimate(
         # Reorder columns: Category, Metric, Description, then Solution IDs
         cols = ['Category', 'Item', 'Description'] + sol_ids
         final_df = final_df[cols]
-
+        
+        row_index_to_sort_by = 0
+        ascending_order = True
+        fixed_cols = final_df.columns[:3].tolist()
+        sortable_cols_df = final_df.iloc[[row_index_to_sort_by], 3:]
+        sorted_columns = sortable_cols_df.sort_values(
+            by=row_index_to_sort_by, 
+            axis=1, 
+            ascending=ascending_order
+        ).columns.tolist()
+        new_column_order = fixed_cols + sorted_columns
+        final_df = final_df[new_column_order]
+        
         # Save
         final_csv_path = f"{workspace_folder}/{temp_folder}/final_summary_table.csv"
         final_df.to_csv(final_csv_path, index=False)
