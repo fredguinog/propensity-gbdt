@@ -251,10 +251,37 @@ def estimate(
         exit()
 
     temp_folder = f"temp_{datetime.now().strftime("%Y%m%d_%H%M%S")}"
+    
+    # Check file already exists in destination
+    if not os.path.exists(f"{workspace_folder}/bscm.stan"):
+        # Specify the path to the Stan model file.
+        # Resolve path to the source code in the package's data folder
+        file_path = resources.files('propensitygbdt.data').joinpath('bscm.stan')
+
+        # Copy the Stan model file to the workspace folder (writable)
+        try:
+            with resources.as_file(file_path) as source_path:
+                shutil.copy(source_path, workspace_folder)
+            print(f"Copied {file_path} to {workspace_folder}/bscm.stan")
+        except (FileNotFoundError, ModuleNotFoundError) as e:
+            print(f"Error: Could not find or copy the source file: {e}")
+            print("Please ensure the package is correctly installed with package_data including 'data/*.stan'.")
+            raise
+
+    # Verify toolchain accessibility (debug: check if mingw32-make is in PATH)
+    make_in_path = shutil.which('mingw32-make') is not None
+    print(f"mingw32-make available in PATH: {make_in_path}")
+    if not make_in_path:
+        raise RuntimeError(f"Add directory {cmdstan_path}\\RTools40\\mingw64\\bin to PATH.")
+
+    # Load the model (compiles to workspace_folder/bscm.exe, then caches)
+    stan_file_path = f"{workspace_folder}/bscm.stan"
+    print(f"Compiling/loading model from: {stan_file_path}")
+    model = cmdstanpy.CmdStanModel(stan_file=stan_file_path)
 
     summary_data_collection = []
     unacceptable_solutions = []
-    weight_solutions = pd.DataFrame()
+    weight_solutions_list = []
     for solution_id in solutions_id:
         parallel_trends_violated = False
         dataset = dataset_raw.copy()
@@ -380,33 +407,6 @@ def estimate(
 
         # 4. FIT THE STAN MODEL
         # -----------------------------------------------------------------------------
-        # Check file already exists in destination
-        if not os.path.exists(f"{workspace_folder}/bscm.stan"):
-            # Specify the path to the Stan model file.
-            # Resolve path to the source code in the package's data folder
-            file_path = resources.files('propensitygbdt.data').joinpath('bscm.stan')
-
-            # Copy the Stan model file to the workspace folder (writable)
-            try:
-                with resources.as_file(file_path) as source_path:
-                    shutil.copy(source_path, workspace_folder)
-                print(f"Copied {file_path} to {workspace_folder}/bscm.stan")
-            except (FileNotFoundError, ModuleNotFoundError) as e:
-                print(f"Error: Could not find or copy the source file: {e}")
-                print("Please ensure the package is correctly installed with package_data including 'data/*.stan'.")
-                raise
-
-        # Verify toolchain accessibility (debug: check if mingw32-make is in PATH)
-        make_in_path = shutil.which('mingw32-make') is not None
-        print(f"mingw32-make available in PATH: {make_in_path}")
-        if not make_in_path:
-            raise RuntimeError(f"Add directory {cmdstan_path}\\RTools40\\mingw64\\bin to PATH.")
-
-        # Load the model (compiles to workspace_folder/bscm.exe, then caches)
-        stan_file_path = f"{workspace_folder}/bscm.stan"
-        print(f"Compiling/loading model from: {stan_file_path}")
-        model = cmdstanpy.CmdStanModel(stan_file=stan_file_path)
-
         # Fit the model using MCMC sampling.
         # 'data' is the input data dictionary.
         # 'seed' ensures reproducibility of the sampling process.
@@ -472,7 +472,6 @@ def estimate(
         plt.title(f"PSIS-LOO Pareto k Diagnostics\n(Values > 0.7 indicate influential outliers)")
         plt.tight_layout()
         plt.savefig(f"{workspace_folder}/{temp_folder}/solution_id_{solution_id}/loo_pareto_k_plot.png")
-        plt.close() # Close to free memory
         
         # 5. POST-PROCESSING AND VISUALIZATION
         # -----------------------------------------------------------------------------
@@ -760,7 +759,6 @@ def estimate(
                 )
                 plt.suptitle("Strict Parallel Trends - Predictive RMSE (Normalized Root Mean Square Error)", fontsize=16, y=0.97)
                 plt.savefig(f"{workspace_folder}/{temp_folder}/solution_id_{solution_id}/{current_indicator}/predictive_nrmse.png")
-                plt.close() # Close to free memory
 
                 # Assumption 3 (Low-Rank Trends)
                 # Generate and save forest plots for the Structural NRMSE (Normalized Root Mean Square Error) model fit statistics using ArviZ.
@@ -779,7 +777,6 @@ def estimate(
                 )
                 plt.suptitle("Low-Rank Trends - Structural RMSE (Normalized Root Mean Square Error)", fontsize=16, y=0.97)
                 plt.savefig(f"{workspace_folder}/{temp_folder}/solution_id_{solution_id}/{current_indicator}/structural_nrmse.png")
-                plt.close() # Close to free memory
 
                 # Store the summary results for the current outcome in the lists.
                 absolute_structural_timeid['outcome'] = current_indicator
@@ -868,7 +865,6 @@ def estimate(
                 title_fontsize=12
             )
             plt.savefig(f"{workspace_folder}/{temp_folder}/solution_id_{solution_id}/unitid_weight_individual_distribution_sigma.png")
-            plt.close() # Close to free memory
 
             # --- Create a forest plot for the donor weights (w) ---
             # This plot shows the posterior distribution (mean and 95% HDI) for each control unit's weight.
@@ -883,7 +879,9 @@ def estimate(
             )
             plt.suptitle("Posterior Distribution of Control Unit Weights (w)", fontsize=16, y=0.97)
             plt.savefig(f"{workspace_folder}/{temp_folder}/solution_id_{solution_id}/unitid_weight_simultanous_distribution.png")
-            plt.close() # Close to free memory
+            
+            
+            plt.close('all') # Close to free memory
             
             if solution_has_problem == "":
                 if parallel_trends_violated:
@@ -909,7 +907,7 @@ def estimate(
             temp_weight_solutions['Unrmse'] = predictive_reliability_score
             temp_weight_solutions['solution_id'] = solution_id
 
-            weight_solutions = pd.concat([weight_solutions, temp_weight_solutions])
+            weight_solutions_list.append(temp_weight_solutions)
 
             # 1. Metrics
             nrmse_score = predictive_reliability_score # Calculated previously in your code
@@ -983,102 +981,88 @@ def estimate(
                 'weights': weights_dict
             })
 
-    complemento = list(set(solutions_id) - set(np.unique(unacceptable_solutions)))
+    if weight_solutions_list:
+        weight_solutions = pd.concat(weight_solutions_list, ignore_index=True)
+    else:
+        weight_solutions = pd.DataFrame()
 
-    weight_solutions_filtred = weight_solutions[weight_solutions['solution_id'].isin(complemento)]
+    if weight_solutions.shape[0] > 0:
+        # Define the rows structure as per the image
+        final_rows = []
 
-    # 2. Create the 'N' and 'sid' columns
-    weight_solutions_filtred['N'] = weight_solutions_filtred['value'].round(2).astype(str)
-    weight_solutions_filtred['Unrmse_solution_id'] = weight_solutions_filtred['Unrmse'].round(3).astype(str) + '_' + weight_solutions_filtred['solution_id'].astype(int).astype(str)
+        # 1. Header Metrics Rows
+        metric_defs = [
+            ('NRMSE', 'Predictive Upper Bound', 'Uval + abs(Uval - Utrain)', 'NRMSE', '{:.3f}'),
+            ('Synth', 'Structural Alignment', 'Max Relative Width', 'Synth', '{:.3f}'),
+            ('HHI', 'Weight Concentration', 'Mean', 'HHI', '{:.3f}')
+        ]
 
-    # 3. Reshape the data using pivot_table and fill missing values
-    result_df = weight_solutions_filtred.pivot_table(
-        index='unitid',
-        columns='Unrmse_solution_id',
-        values='N',
-        aggfunc='first',  # Use 'first' as we expect one value per cell
-        fill_value=""
-    ).reset_index()
-
-    print(result_df)
-    result_df.to_csv(f"{workspace_folder}/{temp_folder}/weight_solutions.csv", mode='w', header=True, index=False)
-
-    # Define the rows structure as per the image
-    final_rows = []
-
-    # 1. Header Metrics Rows
-    metric_defs = [
-        ('NRMSE', 'Predictive Upper Bound', 'Uval + abs(Uval - Utrain)', 'NRMSE', '{:.3f}'),
-        ('Synth', 'Structural Alignment', 'Max Relative Width', 'Synth', '{:.3f}'),
-        ('HHI', 'Weight Concentration', 'Mean', 'HHI', '{:.3f}')
-    ]
-
-    # Get valid solution IDs (those that weren't filtered out by unacceptable_solutions if applicable, 
-    # though the image shows all provided IDs). Let's use all collected data.
-    
-    # Sort collected data by solution_id to match columns or custom sort
-    # The image implies no specific sort, but we usually sort by ID or NRMSE. 
-    # Let's keep input order.
-    
-    # Extract unique Solution IDs for columns
-    sol_ids = [d['solution_id'] for d in summary_data_collection]
-
-    # --- Section 1: Standard Metrics ---
-    for cat, met, sub, key, fmt in metric_defs:
-        row = {'Category': cat, 'Item': met, 'Description': sub}
-        for data in summary_data_collection:
-            val = data['metrics'][key]
-            row[data['solution_id']] = fmt.format(val)
-        final_rows.append(row)
-
-    # --- Section 2: Effects (ATT) ---
-    # We need to extract the structure from the first solution to know the rows
-    if summary_data_collection:
-        first_sol_effects = summary_data_collection[0]['effects']
-        for eff_def in first_sol_effects:
-            row = {
-                'Category': eff_def['Category'], 
-                'Item': eff_def['Item'], 
-                'Description': eff_def['Description']
-            }
-            # Fill values for all solutions
-            for data in summary_data_collection:
-                # Find matching effect for this solution
-                match = next((x for x in data['effects'] 
-                              if x['Category'] == eff_def['Category'] 
-                              and x['Item'] == eff_def['Item']
-                              and x['Description'] == eff_def['Description']), None)
-                row[data['solution_id']] = match['Value'] if match else ""
-            final_rows.append(row)
-
-    # --- Section 3: Weights ---
-    # Get all unique unitids across all solutions
-    all_unitids = sorted(list(set().union(*[d['weights'].keys() for d in summary_data_collection])))
-    
-    for uid in all_unitids:
-        row = {'Category': 'unitid', 'Item': uid, 'Description': ''}
-        has_val = False
-        for data in summary_data_collection:
-            w_val = data['weights'].get(uid, 0.0)
-            # Only show weight if > threshold (e.g. 0.01) or per image logic (blanks for very small?)
-            # Image shows empty cells. Let's assume threshold of 0.01
-            if w_val >= 0.01:
-                row[data['solution_id']] = "{:.2f}".format(w_val)
-                has_val = True
-            else:
-                row[data['solution_id']] = ""
+        # Get valid solution IDs (those that weren't filtered out by unacceptable_solutions if applicable, 
+        # though the image shows all provided IDs). Let's use all collected data.
         
-        # Only add row if at least one solution uses this unit (optional, but cleaner)
-        if has_val:
+        # Sort collected data by solution_id to match columns or custom sort
+        # The image implies no specific sort, but we usually sort by ID or NRMSE. 
+        # Let's keep input order.
+        
+        # Extract unique Solution IDs for columns
+        sol_ids = [d['solution_id'] for d in summary_data_collection]
+
+        # --- Section 1: Standard Metrics ---
+        for cat, met, sub, key, fmt in metric_defs:
+            row = {'Category': cat, 'Item': met, 'Description': sub}
+            for data in summary_data_collection:
+                val = data['metrics'][key]
+                row[data['solution_id']] = fmt.format(val)
             final_rows.append(row)
 
-    # Create DataFrame
-    final_df = pd.DataFrame(final_rows)
+        # --- Section 2: Effects (ATT) ---
+        # We need to extract the structure from the first solution to know the rows
+        if summary_data_collection:
+            first_sol_effects = summary_data_collection[0]['effects']
+            for eff_def in first_sol_effects:
+                row = {
+                    'Category': eff_def['Category'], 
+                    'Item': eff_def['Item'], 
+                    'Description': eff_def['Description']
+                }
+                # Fill values for all solutions
+                for data in summary_data_collection:
+                    # Find matching effect for this solution
+                    match = next((x for x in data['effects'] 
+                                  if x['Category'] == eff_def['Category'] 
+                                  and x['Item'] == eff_def['Item']
+                                  and x['Description'] == eff_def['Description']), None)
+                    row[data['solution_id']] = match['Value'] if match else ""
+                final_rows.append(row)
 
-    # Reorder columns: Category, Metric, Description, then Solution IDs
-    cols = ['Category', 'Item', 'Description'] + sol_ids
-    final_df = final_df[cols]
+        # --- Section 3: Weights ---
+        # Get all unique unitids across all solutions
+        all_unitids = sorted(list(set().union(*[d['weights'].keys() for d in summary_data_collection])))
+        
+        for uid in all_unitids:
+            row = {'Category': 'unitid', 'Item': uid, 'Description': ''}
+            has_val = False
+            for data in summary_data_collection:
+                w_val = data['weights'].get(uid, 0.0)
+                # Only show weight if > threshold (e.g. 0.01) or per image logic (blanks for very small?)
+                # Image shows empty cells. Let's assume threshold of 0.01
+                if w_val >= 0.01:
+                    row[data['solution_id']] = "{:.2f}".format(w_val)
+                    has_val = True
+                else:
+                    row[data['solution_id']] = ""
+            
+            # Only add row if at least one solution uses this unit (optional, but cleaner)
+            if has_val:
+                final_rows.append(row)
 
-    # Save
-    final_csv_path = f"{workspace_folder}/{temp_folder}/final_summary_table.csv"
-    final_df.to_csv(final_csv_path, index=False)
+        # Create DataFrame
+        final_df = pd.DataFrame(final_rows)
+
+        # Reorder columns: Category, Metric, Description, then Solution IDs
+        cols = ['Category', 'Item', 'Description'] + sol_ids
+        final_df = final_df[cols]
+
+        # Save
+        final_csv_path = f"{workspace_folder}/{temp_folder}/final_summary_table.csv"
+        final_df.to_csv(final_csv_path, index=False)
