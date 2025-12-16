@@ -56,6 +56,7 @@ import math
 import random
 from scipy.optimize import minimize
 from scipy.linalg import qr
+from scipy.linalg import svd
 import sys
 from typing import Literal, get_args
 import xgboost as xgb
@@ -123,6 +124,60 @@ def calculate_gram_cond_by_shape(df: pd.DataFrame) -> float:
     return pd.DataFrame(results)['gram_cond'].max()
 
 """
+Estimates the latent rank r of the donor matrix via the Eigenvalue Ratio (ER) method,
+robust to noise. Standardizes each series to mean 0, variance 1 before estimation to
+focus on correlations. The ER method detects the largest gap in sorted singular values,
+identifying the point where signal drops to noise level.
+
+Parameters:
+-----------
+X : array-like, shape (T, K*M)
+    Donor time series matrix (pre-intervention).
+n_outcomes : int
+    Number of outcomes (M) per donor.
+kmax : int, optional
+    Maximum rank to consider (default: min(T, total_cols) // 2).
+
+Returns:
+--------
+r_hat : int
+    Estimated rank r.
+"""
+def estimate_rank_robust(X, n_outcomes, kmax=None):
+    T, total_cols = X.shape
+    if total_cols % n_outcomes != 0:
+        raise ValueError(f"Total columns in X ({total_cols}) must be divisible by n_outcomes ({n_outcomes}).")
+    
+    # Standardize each series: mean 0, std 1
+    X_std = np.zeros_like(X)
+    for col in range(total_cols):
+        series = X[:, col]
+        mean = np.mean(series)
+        std = np.std(series)
+        if std == 0:
+            std = 1.0
+        X_std[:, col] = (series - mean) / std
+    
+    # SVD for singular values (decreasing order)
+    _, S, _ = svd(X_std, full_matrices=False)
+    
+    m = len(S)
+    if kmax is None:
+        kmax = m // 2
+    kmax = min(kmax, m - 1)
+    
+    if kmax < 1:
+        return 0
+    
+    # Compute eigenvalue ratios (using squared singular values as eigenvalues of cov)
+    ratios = (S[:kmax]**2) / (S[1:kmax+1]**2)
+    
+    # Estimated r is argmax of ratios + 1 (1-based)
+    r_hat = np.argmax(ratios) + 1
+    
+    return r_hat
+
+"""
 Builds a low-condition-number donor set via greedy forward selection (scale-invariant robust version).
 Iteratively adds the donor minimizing the prospective max Gram cond (across outcomes)
 on normalized differenced series, using QR orthogonalization for stable cond estimation.
@@ -152,6 +207,8 @@ final_max_cond : float
 def build_low_cond_set_greedy_robust(X, n_outcomes, gram_threshold=100.0, max_donors=None, seed=None):
     if seed is not None:
         np.random.seed(seed)
+    if max_donors is None:
+        max_donors = estimate_rank_robust(X, n_outcomes)
     T, total_cols = X.shape
     if total_cols % n_outcomes != 0:
         raise ValueError(f"Total columns in X ({total_cols}) must be divisible by n_outcomes ({n_outcomes}).")
