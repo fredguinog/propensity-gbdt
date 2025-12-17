@@ -57,7 +57,7 @@ import random
 from scipy.optimize import minimize
 from scipy.linalg import qr
 from scipy.linalg import svd
-from scipy.ndimage import median_filter
+from scipy.signal import medfilt
 import sys
 from typing import Literal, get_args
 import xgboost as xgb
@@ -188,6 +188,10 @@ normalized by the median absolute residual. The scaling factor 1.4826 ensures co
 standard deviation under Gaussian assumptions. Results are averaged across outcomes for a single
 scalar estimate.
 
+Fixed: Calculates Noise / Signal.
+Signal = Median of the Trend.
+Noise = MAD of the Residuals.
+
 Parameters:
 treatment_ts : array-like, shape (T_pre, n_outcomes). Pre-treatment time series for the treated
     unit (one column per outcome).
@@ -200,23 +204,41 @@ robust_cv : float. The average robust CV across all outcomes, used as a noise pr
     in max_donors calculation to add buffers for high-noise data).
 """
 def estimate_robust_cv(treatment_ts, n_outcomes, window_fraction=0.1):
-    # Handle treatment_ts: ensure 2D
-    treatment_ts = np.atleast_2d(treatment_ts)  # (T_pre, n_outcomes) or (1, T_pre) if 1D
+    """
+
+    """
+    treatment_ts = np.atleast_2d(treatment_ts)
     T_pre, M = treatment_ts.shape
-    if M != n_outcomes:
-        raise ValueError(f"treatment_ts shape {treatment_ts.shape} incompatible with n_outcomes={n_outcomes}.")
     
-    # Estimate robust_cv: per outcome, then average
     robust_cvs = []
-    window = max(3, min(101, 2 * int(window_fraction * T_pre) + 1))  # Adaptive odd window
+    # Ensure window is odd and at least 3
+    window = int(window_fraction * T_pre)
+    if window % 2 == 0: window += 1
+    window = max(3, window)
+    
     for m in range(n_outcomes):
         ts = treatment_ts[:, m]
-        trend = median_filter(ts, size=window)
+        
+        # 1. Extract Trend (Signal)
+        trend = medfilt(ts, kernel_size=window)
+        
+        # 2. Extract Noise
         residuals = ts - trend
-        mad = np.median(np.abs(residuals - np.median(residuals)))
-        median_abs = np.median(np.abs(residuals))
-        rcv = 1.4826 * (mad / median_abs) if median_abs > 0 else 0
-        robust_cvs.append(rcv)
+        
+        # 3. Calculate Robust Sigma (Noise Level)
+        # 1.4826 converts MAD to Sigma for Gaussian distribution
+        median_resid = np.median(residuals)
+        mad = np.median(np.abs(residuals - median_resid))
+        sigma_robust = 1.4826 * mad
+        
+        # 4. Calculate Signal Magnitude
+        # Use median of absolute TREND, not residuals
+        signal_mag = np.median(np.abs(trend))
+        
+        if signal_mag > 1e-9:
+            robust_cvs.append(sigma_robust / signal_mag)
+        else:
+            robust_cvs.append(np.inf)
     
     return np.mean(robust_cvs)
 
@@ -251,7 +273,6 @@ def build_low_cond_set_greedy_robust(treatment_ts, X, n_outcomes, gram_threshold
     if seed is not None:
         np.random.seed(seed)
     if max_donors is None:
-        # max_donors = 2 * estimate_rank_robust(X, n_outcomes) + 1
         robust_cv = estimate_robust_cv(treatment_ts, n_outcomes)
         estimated_rank = estimate_rank_robust(X, n_outcomes)
         base_need = estimated_rank + 1
@@ -543,7 +564,7 @@ maximum_ratio_var_treated_var_donor : int, default=10.0
     The max ratio (Var_Treated / Var_Donor) allowed.
 maximum_num_units_on_attipw_support : int, default=50
     Maximum number of control units to select based on IPW ranking before Gram condition selection then fitting SCM.
-maximum_gram_cond_train : float, default=500.0
+maximum_gram_cond_train : float, default=100.0
     Maximum allowable condition number for the Gram matrix of selected donors to ensure 
     linear independence (mitigates multicollinearity).
 minimum_donor_selection : int, default=3

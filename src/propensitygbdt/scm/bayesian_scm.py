@@ -714,7 +714,7 @@ def estimate(
                     sig = "" if low < 0.0 < upp else "*"
                     if p_name == "Pre" and sig != "": parallel_trends_violated = True
                     prefix = "Parallel Trends: " if p_name == "Pre" else "ATT: "
-                    return f"{prefix}{fmt.format(mn)} [{fmt.format(low)}, {fmt.format(upp)}]{sig}"
+                    return f"{prefix}{fmt.format(mn)}{sig} [{fmt.format(low)}, {fmt.format(upp)}]"
 
                 x_pre_annotation = (timeid_base + 1) / 2
                 x_post_annotation = (timeid_base + 1) + ((len(mapping_timeid) - (timeid_base + 1)) / 2)
