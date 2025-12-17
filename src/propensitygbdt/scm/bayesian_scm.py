@@ -428,19 +428,22 @@ def estimate(
 
         # Print a summary of the R-hat diagnostic statistic. R-hat values close to 1.0
         # indicate that the MCMC chains have converged to the same posterior distribution.
-        fit_dt = fit.summary()
-        print(fit_dt['R_hat'].describe())
-        fit_dt.to_csv(f"{workspace_folder}/{temp_folder}/solution_id_{solution_id}/all_parameters_summary.csv", index=True)
-
-        r_hat = fit_dt['R_hat'].mean()
-        if 0.99 > r_hat or r_hat > 1.01:
-            solution_has_problem = solution_has_problem + 'D'
-            unacceptable_solutions.append(solution_id)
+        # fit_dt = fit.summary()
 
         # Convert the CmdStanPy fit object to an ArviZ InferenceData object.
         # EXPLICITLY specify the log_likelihood variable name so ArviZ can find it.
         inference_data = az.from_cmdstanpy(fit, log_likelihood="log_lik")
         
+        fit_dt = az.summary(inference_data, var_names=["w", "sigma", "tau_nrmse", "hhi_weight"])
+        
+        print(fit_dt['r_hat'].describe())
+        fit_dt.to_csv(f"{workspace_folder}/{temp_folder}/solution_id_{solution_id}/all_parameters_summary.csv", index=True)
+
+        r_hat = fit_dt['r_hat'].mean()
+        if 0.99 > r_hat or r_hat > 1.01:
+            solution_has_problem = solution_has_problem + 'D'
+            unacceptable_solutions.append(solution_id)
+
         # 1. Calculate LOO using ArviZ
         # pointwise=True allows us to inspect specific data points that might be outliers
         loo_results = az.loo(inference_data, pointwise=True) 
@@ -475,161 +478,205 @@ def estimate(
         
         # 5. POST-PROCESSING AND VISUALIZATION
         # -----------------------------------------------------------------------------
-        # Extract the MCMC draws (posterior samples) into a pandas DataFrame for easier manipulation.
-        draws_df = fit.draws_pd()
         
-        chains_w_df = draws_df.melt(
-            id_vars=['chain__', 'iter__'],
-            value_vars=[col for col in draws_df.columns if any(col.startswith(v) for v in "w")],
-            var_name='variable'
-        )
-        chains_w_df.rename(columns={'chain__': 'chain', 'iter__': 'iteration'}, inplace=True)
+        # EXTRACT SAMPLES AS NUMPY ARRAYS (Fast, no Regex, no Melt)
+        # stan_vars is a dict where keys are variable names and values are ndarrays 
+        # Shape: (N_draws, Dim1, Dim2, ...)
+        stan_vars = fit.stan_variables()
+        
+        # Save full draws if strictly necessary (this is I/O bound, slows things down if kept)
+        # If you don't need the raw debug CSV, comment the next line out for more speed.
+        fit.save_csvfiles(dir=f"{workspace_folder}/{temp_folder}/solution_id_{solution_id}")
 
-        # The variable names from Stan (e.g., "effect_post[1,2]") contain index information.
-        # This code extracts the variable name and its indices into separate columns.
-        extracted_info = chains_w_df['variable'].str.extract(r'(\w+)\[(\d+)\]')
-        chains_w_df['var_name'] = extracted_info[0]
-        chains_w_df['index_1'] = pd.to_numeric(extracted_info[1]) # Corresponds to unitid
-
-        # Map the first index back to the unitid name.
-        chains_w_df['unitid'] = chains_w_df['index_1'].apply(lambda x: unitids[x-1])  
-
-        for idx, _ in enumerate(outcomes):
-            if (draws_df[f'struc_nrmse_terminal[{idx+1}]'].quantile(0.975) / draws_df[f'struc_nrmse_train[{idx+1}]'].quantile(0.975) > nrmse_terminal_over_train):
-                solution_has_problem = solution_has_problem + "L"
-                break
+        # --- VALIDATION CHECKS (Vectorized) ---
+        # Check NRMSE Terminal vs Train ratio
+        # struc_nrmse_* shapes are (N_draws, N_outcomes)
+        term_q975 = np.quantile(stan_vars['struc_nrmse_terminal'], 0.975, axis=0)
+        train_q975 = np.quantile(stan_vars['struc_nrmse_train'], 0.975, axis=0)
+        
+        # Check if any outcome violates the NRMSE threshold
+        ratio = term_q975 / train_q975
+        if np.any(ratio > nrmse_terminal_over_train):
+            solution_has_problem += "L"
 
         if solution_has_problem != "":
-            os.rename(f"{workspace_folder}/{temp_folder}/solution_id_{solution_id}", f"{workspace_folder}/{temp_folder}/{solution_has_problem}_solution_id_{solution_id}")
+            os.rename(f"{workspace_folder}/{temp_folder}/solution_id_{solution_id}", 
+                      f"{workspace_folder}/{temp_folder}/{solution_has_problem}_solution_id_{solution_id}")
             unacceptable_solutions.append(solution_id)
         else:
-            # Filter for variables related to the treatment effect (residuals and effects) and reshape the data.
-            # The 'melt' function converts the DataFrame from wide format (one column per parameter instance)
-            # to long format, which is more convenient for grouping and plotting.
-            vars_to_extract = ["residuals_train", "residuals_val", "effect_post",
-                               "y_synth_train_scaled", "y_synth_val_scaled", "y_synth_post_scaled",
-                               "predictive_train", "predictive_val", "predictive_post"]
-            chains_effect_df = draws_df.melt(
-                id_vars=['chain__', 'iter__'],
-                value_vars=[col for col in draws_df.columns if any(col.startswith(v) for v in vars_to_extract)],
-                var_name='variable'
-            )
-            chains_effect_df.rename(columns={'chain__': 'chain', 'iter__': 'iteration'}, inplace=True)
+            # --- PREPARE DATA FOR PLOTTING (Vectorized) ---
+            
+            # Helper to process time-series variables (concatenating Train, Val, Post)
+            def process_time_series(var_train, var_val, var_post):
+                # Concatenate along time axis (axis 1) -> (Draws, Total_Time, Outcomes)
+                arr = np.concatenate([stan_vars[var_train], stan_vars[var_val], stan_vars[var_post]], axis=1)
+                # Compute stats: (3, Total_Time, Outcomes) -> Indices: 0=2.5%, 1=Mean, 2=97.5%
+                stats = np.percentile(arr, [2.5, 50, 97.5], axis=0) 
+                # Replace 50% percentile with strict Mean to match original logic
+                stats[1] = np.mean(arr, axis=0)
+                return stats
 
-            # The variable names from Stan (e.g., "effect_post[1,2]") contain index information.
-            # This code extracts the variable name and its indices into separate columns.
-            extracted_info = chains_effect_df['variable'].str.extract(r'(\w+)\[(\d+),(\d+)\]')
-            chains_effect_df['var_name'] = extracted_info[0]
-            chains_effect_df['index_1'] = pd.to_numeric(extracted_info[1]) # Corresponds to time
-            chains_effect_df['index_2'] = pd.to_numeric(extracted_info[2]) # Corresponds to outcome
+            # 1. Structural (Absolute)
+            stats_struct = process_time_series('y_synth_train_scaled', 'y_synth_val_scaled', 'y_synth_post_scaled')
+            
+            # 2. Predictive (Absolute)
+            stats_pred = process_time_series('predictive_train', 'predictive_val', 'predictive_post')
+            
+            # 3. Effects (Relative)
+            # Combine residuals (pre) and effects (post)
+            # residuals shape: (Draws, T_pre, Outcomes)
+            # effect_post shape: (Draws, T_post, Outcomes)
+            eff_arr = np.concatenate([
+                stan_vars['residuals_train'], 
+                stan_vars['residuals_val'], 
+                stan_vars['effect_post']
+            ], axis=1)
+            
+            stats_eff_time = np.percentile(eff_arr, [2.5, 50, 97.5], axis=0)
+            stats_eff_time[1] = np.mean(eff_arr, axis=0)
+            
+            # Calculate Period Averages (Pre vs Post)
+            # Pre: indices 0 to timeid_base-1
+            # Post: indices timeid_base to end
+            pre_arr = eff_arr[:, :timeid_base, :] # (Draws, T_pre, Outcomes)
+            post_arr = eff_arr[:, timeid_base:, :] # (Draws, T_post, Outcomes)
+            
+            # Means per draw per period
+            pre_means = np.mean(pre_arr, axis=1) # (Draws, Outcomes)
+            post_means = np.mean(post_arr, axis=1) # (Draws, Outcomes)
+            
+            # Quantiles of the means
+            stats_pre_period = np.array([np.percentile(pre_means, 2.5, axis=0), np.mean(pre_means, axis=0), np.percentile(pre_means, 97.5, axis=0)])
+            stats_post_period = np.array([np.percentile(post_means, 2.5, axis=0), np.mean(post_means, axis=0), np.percentile(post_means, 97.5, axis=0)])
 
-            # Define a function to reconstruct the original 'timeid' from the Stan indices.
-            # This requires knowing the structure of the trainning, validation, and post periods.
-            def get_timeid(row):
-                if row['var_name'] == 'residuals_train' or row['var_name'] == 'y_synth_train_scaled' or row['var_name'] == 'predictive_train':
-                    return row['index_1'] + timeid_inicio - 1
-                elif row['var_name'] == 'residuals_val' or row['var_name'] == 'y_synth_val_scaled' or row['var_name'] == 'predictive_val':
-                    return row['index_1'] + timeid_inicio + N_train - 1
-                elif row['var_name'] == 'effect_post' or row['var_name'] == 'y_synth_post_scaled' or row['var_name'] == 'predictive_post':
-                    return row['index_1'] + timeid_base
-                return -1
-
-            # Apply the function to create a 'timeid' column with the original time labels.
-            chains_effect_df['timeid'] = chains_effect_df.apply(get_timeid, axis=1)
-            chains_effect_df['timeid'] = chains_effect_df['timeid'].apply(lambda x: mapping_timeid[x-1] if x > 0 and pd.notna(x) else -1)
-            chains_effect_df['timeid'] = np.where(chains_effect_df['timeid'] == -1, np.nan, chains_effect_df['timeid'])
-            # Map the second index back to the outcome name.
-            chains_effect_df['outcome'] = chains_effect_df['index_2'].apply(lambda x: outcomes[x-1])
-            chains_effect_df['type'] = np.where((chains_effect_df['var_name'] == 'residuals_train') | (chains_effect_df['var_name'] == 'residuals_val') | (chains_effect_df['var_name'] == 'effect_post'), 'relative',
-                                                np.where((chains_effect_df['var_name'] == 'y_synth_train_scaled') | (chains_effect_df['var_name'] == 'y_synth_val_scaled') | (chains_effect_df['var_name'] == 'y_synth_post_scaled'), 'absolute_structural',
-                                                         np.where((chains_effect_df['var_name'] == 'predictive_train') | (chains_effect_df['var_name'] == 'predictive_val') | (chains_effect_df['var_name'] == 'predictive_post'), 'absolute_predictive', 'error')))
-            # Drop the now redundant columns.
-            chains_effect_df.drop(columns=['variable', 'var_name', 'index_1', 'index_2'], inplace=True)
-
-            # Define a function to create formatted text annotations for the plots.
-            # This text will summarize the average effect for the pre and post periods,
-            # including a 95% credible interval and a significance star.
-            def format_annotation(df, p, period_effect_format):
-                global parallel_trends_violated
-                
-                row = df[df['period'] == p].iloc[0]
-                mean_value = row['mean']
-                lower_value = row['q2_5']
-                upper_value = row['q97_5']
-                # A '*' indicates significance if the 95% credible interval does not contain zero.
-                significative = "" if lower_value < 0.0 < upper_value else "*"
-                
-                if p == "Pre" and significative != "":
-                    parallel_trends_violated = True
-                
-                prefix = "Parallel Trends: " if p == "Pre" else "ATT: "
-                
-                return (f"{prefix}"
-                        f"{period_effect_format.format(mean_value)} "
-                        f"[{period_effect_format.format(lower_value)}, "
-                        f"{period_effect_format.format(upper_value)}]"
-                        f"{significative}")
-
-
-            # Initialize lists to store summary statistics from each outcome's plot.
+            # Container lists
             absolute_structural_timeid_list = []
             absolute_predictive_timeid_list = []
             att_period_list = []
             att_timeid_list = []
 
-            chains_relative_effect_df = chains_effect_df[chains_effect_df['type'] == 'relative']
-            chains_relative_effect_df.drop(['type'], axis=1, inplace=True)
-
-            treated_df['timeid'] = treated_df['timeid'].apply(lambda x: mapping_timeid[x-1] if x > 0 and pd.notna(x) else -1)
-
-            chains_absolute_structural_effect_df = chains_effect_df[chains_effect_df['type'] == 'absolute_structural']
-            chains_absolute_structural_effect_df.drop(['type'], axis=1, inplace=True)
-
-            chains_absolute_predictive_effect_df = chains_effect_df[chains_effect_df['type'] == 'absolute_predictive']
-            chains_absolute_predictive_effect_df.drop(['type'], axis=1, inplace=True)
-
-            # Loop through each outcome to generate and save individual plots.
+            # --- PLOTTING LOOP ---
+            # Now we loop over outcomes, but the heavy math is already done.
+            # We just slice the pre-calculated arrays.
+            
+            # Prepare Treated Data for plotting
+            treated_df['timeid_mapped'] = treated_df['timeid'].apply(lambda x: mapping_timeid.tolist().index(x) + 1 if x in mapping_timeid else -1)
+            
+            # Convert integer timeids back to original string labels for merging
+            # treated_df currently has int codes (1..N). mapping_timeid has the labels.
+            treated_df = treated_df.copy()
+            treated_df['timeid'] = treated_df['timeid'].apply(
+                lambda x: mapping_timeid[x-1] if isinstance(x, (int, np.integer)) and 0 < x <= len(mapping_timeid) else np.nan
+            )
+            
+            # Ensure proper types for merging
+            treated_df['timeid'] = treated_df['timeid'].astype(str)
+            
             for idx, current_indicator in enumerate(outcomes):
-                # Create a directory for the current outcome to save its plots, if it doesn't already exist.
                 os.makedirs(f"{workspace_folder}/{temp_folder}/solution_id_{solution_id}/{current_indicator}", exist_ok=True)
 
-                # Retrieve the mean and standard deviation for the current outcome to un-standardize the results.
+                # Scaling factors
                 indicator_info = std_avg_dt[std_avg_dt['outcome'] == current_indicator]
-                avg_value = indicator_info['avg_value'].iloc[0]
-                std_value = indicator_info['std_value'].iloc[0]
+                avg_val = indicator_info['avg_value'].iloc[0]
+                std_val = indicator_info['std_value'].iloc[0]
 
-                treated_subset = treated_df[treated_df['outcome'] == current_indicator].copy()
-                treated_subset['value'] = treated_subset['value'] * std_value + avg_value
-                treated_subset = treated_subset[['timeid', 'value']]
-                treated_subset.columns = ['timeid', 'treatment']
+                # --- 1. PREPARE DATAFRAMES FOR THIS OUTCOME ---
                 
-                # ABSOLUTE STRUCTURAL
-                # Filter the time series data for the current outcome.
-                absolute_structural_subset = chains_absolute_structural_effect_df[chains_absolute_structural_effect_df['outcome'] == current_indicator].copy()
-                # Create a 'period' column to distinguish between pre- and post-treatment time points.
-                absolute_structural_subset['period'] = np.where(absolute_structural_subset['timeid'].astype(str) > str(mapping_timeid[timeid_base-1]), "Post", "Pre")
-                # Rescale the 'value' (the effect) back to the original units by multiplying by the standard deviation.
-                # The mean is not added back because we are looking at effects (differences), where the mean cancels out.
-                absolute_structural_subset['value'] = absolute_structural_subset['value'] * std_value + avg_value
+                # A. Structural
+                # Slice the numpy array: (3, Total_Time, Outcomes) -> (3, Total_Time)
+                curr_struct = stats_struct[:, :, idx] 
+                # Unscale
+                curr_struct_unscaled = curr_struct * std_val + avg_val
+                
+                df_struct = pd.DataFrame({
+                    'timeid_idx': range(1, curr_struct.shape[1] + 1),
+                    'q2_5': curr_struct_unscaled[0],
+                    'mean': curr_struct_unscaled[1],
+                    'q97_5': curr_struct_unscaled[2]
+                })
+                # Map back to real timeid strings
+                df_struct['timeid'] = df_struct['timeid_idx'].apply(lambda x: mapping_timeid[x-1] if x <= len(mapping_timeid) else np.nan)
+                df_struct['period'] = np.where(df_struct['timeid_idx'] > timeid_base, "Post", "Pre")
+                
+                # Merge observed treated data
+                subset_treated = treated_df[treated_df['outcome'] == current_indicator]
+                # Re-scale treated value to original scale
+                # Note: 'value' in treated_df is currently scaled. 
+                # We need raw value or unscale it. The code previously unscaled it in the loop.
+                subset_treated_plot = subset_treated.copy()
+                subset_treated_plot['treatment'] = subset_treated_plot['value'] * std_val + avg_val
+                
+                df_struct = pd.merge(df_struct, subset_treated_plot[['timeid', 'treatment']], on='timeid', how='left')
+                
+                # B. Predictive
+                curr_pred = stats_pred[:, :, idx]
+                curr_pred_unscaled = curr_pred * std_val + avg_val
+                df_pred = pd.DataFrame({
+                    'timeid_idx': range(1, curr_pred.shape[1] + 1),
+                    'q2_5': curr_pred_unscaled[0],
+                    'mean': curr_pred_unscaled[1],
+                    'q97_5': curr_pred_unscaled[2]
+                })
+                df_pred['timeid'] = df_pred['timeid_idx'].apply(lambda x: mapping_timeid[x-1] if x <= len(mapping_timeid) else np.nan)
+                df_pred['period'] = np.where(df_pred['timeid_idx'] > timeid_base, "Post", "Pre")
+                df_pred = pd.merge(df_pred, subset_treated_plot[['timeid', 'treatment']], on='timeid', how='left')
 
-                absolute_structural_timeid = absolute_structural_subset.groupby(['timeid', 'period'])['value'].agg(
-                    q2_5=lambda x: x.quantile(0.025),
-                    mean='mean',
-                    q97_5=lambda x: x.quantile(0.975)
-                ).reset_index()
+                # C. ATT (Effects) - Relative
+                curr_eff = stats_eff_time[:, :, idx] * std_val # Only multiply std (relative)
+                
+                df_eff = pd.DataFrame({
+                    'timeid_idx': range(1, curr_eff.shape[1] + 1),
+                    'q2_5': curr_eff[0],
+                    'effect': curr_eff[1],
+                    'q97_5': curr_eff[2]
+                })
+                df_eff['timeid'] = df_eff['timeid_idx'].apply(lambda x: mapping_timeid[x-1] if x <= len(mapping_timeid) else np.nan)
+                df_eff['period'] = np.where(df_eff['timeid_idx'] > timeid_base, "Post", "Pre")
 
-                absolute_structural_timeid = pd.merge(absolute_structural_timeid, treated_subset, on=['timeid'], how='left')
+                # D. Period Stats
+                # Pre
+                df_period_pre = pd.DataFrame({
+                    'period': ['Pre'],
+                    'q2_5': [stats_pre_period[0, idx] * std_val],
+                    'mean': [stats_pre_period[1, idx] * std_val],
+                    'q97_5': [stats_pre_period[2, idx] * std_val]
+                })
+                # Post
+                df_period_post = pd.DataFrame({
+                    'period': ['Post'],
+                    'q2_5': [stats_post_period[0, idx] * std_val],
+                    'mean': [stats_post_period[1, idx] * std_val],
+                    'q97_5': [stats_post_period[2, idx] * std_val]
+                })
+                df_period = pd.concat([df_period_pre, df_period_post])
+                
+                # Collect for final CSVs
+                df_struct['outcome'] = current_indicator
+                absolute_structural_timeid_list.append(df_struct)
+                
+                df_pred['outcome'] = current_indicator
+                absolute_predictive_timeid_list.append(df_pred)
+                
+                df_eff['outcome'] = current_indicator
+                att_timeid_list.append(df_eff) # Note: Column name is 'effect' not 'mean' here
+                
+                df_period['outcome'] = current_indicator
+                att_period_list.append(df_period)
 
-                # Determine the tick marks for the time axis to avoid overcrowding.
-                num_unique_timeids = len(chains_absolute_structural_effect_df['timeid'].unique())
+                # --- PLOTTING ---
+                # (Logic remains similar, just using the new DataFrames)
+                
+                # Helper for tick marks
+                num_unique_timeids = len(mapping_timeid)
                 length_desired_breaks = math.ceil(num_unique_timeids / 40.0)
                 time_breaks = mapping_timeid[::length_desired_breaks]
 
+                # 1. Plot Structural
                 p = (
-                    ggplot(data=absolute_structural_timeid) +
+                    ggplot(data=df_struct) +
                     geom_ribbon(aes(x="timeid", ymin="q2_5", ymax="q97_5", group=1, fill="'Uncertainty'"), alpha=0.2) +
                     scale_fill_manual(values={"Uncertainty": "gray"}) +
-                    geom_vline(xintercept=timeid_base, linetype="dashed", color="red") + # Vertical line at the intervention point.
+                    geom_vline(xintercept=timeid_base, linetype="dashed", color="red") + 
                     geom_line(aes(x="timeid", y="mean", group=1, color="'Synthetic Control'")) +
                     geom_line(aes(x="timeid", y="treatment", group=1, color="'Treatment'")) +
                     scale_color_manual(values={"Mean": "black", "Treatment": "blue"}) +
@@ -639,36 +686,14 @@ def estimate(
                     theme(axis_text_x=element_text(angle=45, hjust=1), legend_position="top", legend_title=element_blank(), plot_title=element_text(hjust=0)) +
                     scale_x_discrete(breaks=list(time_breaks), name="timeid")
                 )
-                # Save the plot to a file.
                 p.save(f"{workspace_folder}/{temp_folder}/solution_id_{solution_id}/{current_indicator}/absolute structural view.png", width=14, height=6, dpi=300)
 
-                # ABSOLUTE PREDICTIVE
-                # Filter the time series data for the current outcome.
-                absolute_predictive_subset = chains_absolute_predictive_effect_df[chains_absolute_predictive_effect_df['outcome'] == current_indicator].copy()
-                # Create a 'period' column to distinguish between pre- and post-treatment time points.
-                absolute_predictive_subset['period'] = np.where(absolute_predictive_subset['timeid'].astype(str) > str(mapping_timeid[timeid_base-1]), "Post", "Pre")
-                # Rescale the 'value' (the effect) back to the original units by multiplying by the standard deviation.
-                # The mean is not added back because we are looking at effects (differences), where the mean cancels out.
-                absolute_predictive_subset['value'] = absolute_predictive_subset['value'] * std_value + avg_value
-
-                absolute_predictive_timeid = absolute_predictive_subset.groupby(['timeid', 'period'])['value'].agg(
-                    q2_5=lambda x: x.quantile(0.025),
-                    mean='mean',
-                    q97_5=lambda x: x.quantile(0.975)
-                ).reset_index()
-
-                absolute_predictive_timeid = pd.merge(absolute_predictive_timeid, treated_subset, on=['timeid'], how='left')
-
-                # Determine the tick marks for the time axis to avoid overcrowding.
-                num_unique_timeids = len(chains_absolute_predictive_effect_df['timeid'].unique())
-                length_desired_breaks = math.ceil(num_unique_timeids / 40.0)
-                time_breaks = mapping_timeid[::length_desired_breaks]
-
+                # 2. Plot Predictive
                 p = (
-                    ggplot(data=absolute_predictive_timeid) +
+                    ggplot(data=df_pred) +
                     geom_ribbon(aes(x="timeid", ymin="q2_5", ymax="q97_5", group=1, fill="'Uncertainty'"), alpha=0.2) +
                     scale_fill_manual(values={"Uncertainty": "gray"}) +
-                    geom_vline(xintercept=timeid_base, linetype="dashed", color="red") + # Vertical line at the intervention point.
+                    geom_vline(xintercept=timeid_base, linetype="dashed", color="red") + 
                     geom_line(aes(x="timeid", y="mean", group=1, color="'Synthetic Control'")) +
                     geom_line(aes(x="timeid", y="treatment", group=1, color="'Treatment'")) +
                     scale_color_manual(values={"Mean": "black", "Treatment": "blue"}) +
@@ -678,138 +703,86 @@ def estimate(
                     theme(axis_text_x=element_text(angle=45, hjust=1), legend_position="top", legend_title=element_blank(), plot_title=element_text(hjust=0)) +
                     scale_x_discrete(breaks=list(time_breaks), name="timeid")
                 )
-                # Save the plot to a file.
                 p.save(f"{workspace_folder}/{temp_folder}/solution_id_{solution_id}/{current_indicator}/absolute predictive view.png", width=14, height=6, dpi=300)
 
-                # RELATIVE 
-                # Filter the effects data for the current outcome.
-                effect_subset = chains_relative_effect_df[chains_relative_effect_df['outcome'] == current_indicator].copy()
-                # Create a 'period' column to distinguish between pre- and post-treatment time points.
-                effect_subset['period'] = np.where(effect_subset['timeid'].astype(str) > str(mapping_timeid[timeid_base-1]), "Post", "Pre")
-                # Rescale the 'value' (the effect) back to the original units by multiplying by the standard deviation.
-                # The mean is not added back because we are looking at effects (differences), where the mean cancels out.
-                effect_subset['value'] *= std_value
-                
-                # Calculate the average effect per period for each MCMC iteration.
-                att_chain_period = effect_subset.groupby(['iteration', 'chain', 'period'])['value'].agg(
-                    mean='mean'
-                ).reset_index()
+                # 3. Plot Effect (ATT)
+                # Annotation Logic
+                def format_annotation(df, p_name, fmt):
+                    global parallel_trends_violated
+                    row = df[df['period'] == p_name].iloc[0]
+                    mn, low, upp = row['mean'], row['q2_5'], row['q97_5']
+                    sig = "" if low < 0.0 < upp else "*"
+                    if p_name == "Pre" and sig != "": parallel_trends_violated = True
+                    prefix = "Parallel Trends: " if p_name == "Pre" else "ATT: "
+                    return f"{prefix}{fmt.format(mn)} [{fmt.format(low)}, {fmt.format(upp)}]{sig}"
 
-                # Summarize the posterior distribution of the average period effects to get the mean and 95% credible interval.
-                att_period = att_chain_period.groupby('period')['mean'].agg(
-                    q2_5=lambda x: x.quantile(0.025),
-                    mean='mean',
-                    q97_5=lambda x: x.quantile(0.975)
-                ).reset_index()
-
-                # Summarize the posterior distribution of the effect for each individual time point.
-                att_timeid = effect_subset.groupby(['timeid', 'period'])['value'].agg(
-                    q2_5=lambda x: x.quantile(0.025),
-                    effect='mean',
-                    q97_5=lambda x: x.quantile(0.975)
-                ).reset_index()
-
-                # Determine the tick marks for the time axis to avoid overcrowding.
-                num_unique_timeids = len(chains_relative_effect_df['timeid'].unique())
-                length_desired_breaks = math.ceil(num_unique_timeids / 40.0)
-                time_breaks = mapping_timeid[::length_desired_breaks]
-
-                # Calculate the x-coordinates for placing the summary annotations on the plot.
                 x_pre_annotation = (timeid_base + 1) / 2
-                post_period_start_index = timeid_base + 1
-                post_period_length = len(mapping_timeid) - post_period_start_index
-                x_post_annotation = post_period_start_index + (post_period_length / 2)
-                
-                # Create the main effect plot using the plotnine (ggplot) library.
+                x_post_annotation = (timeid_base + 1) + ((len(mapping_timeid) - (timeid_base + 1)) / 2)
+
                 p = (
-                    ggplot(att_timeid, aes(x='factor(timeid)', y='effect', color='factor(period)')) +
-                    geom_vline(xintercept=timeid_base, linetype="dashed", color="red") + # Vertical line at the intervention point.
-                    geom_hline(yintercept=0.0, linetype="dashed", color="black") + # Horizontal line at zero effect.
-                    geom_point(size=1.5) + # Points for the mean effect at each time point.
-                    geom_errorbar(aes(ymin='q2_5', ymax='q97_5'), width=0.2) + # Error bars for the 95% credible interval.
+                    ggplot(df_eff, aes(x='factor(timeid)', y='effect', color='factor(period)')) +
+                    geom_vline(xintercept=timeid_base, linetype="dashed", color="red") + 
+                    geom_hline(yintercept=0.0, linetype="dashed", color="black") + 
+                    geom_point(size=1.5) + 
+                    geom_errorbar(aes(ymin='q2_5', ymax='q97_5'), width=0.2) + 
                     scale_color_manual(name=None, values={"Pre": "#e87d72", "Post": "#56bcc2"}, breaks=['Pre', 'Post']) +
                     ggtitle(current_indicator) +
                     theme_classic() +
                     scale_x_discrete(breaks=list(time_breaks), name="timeid") +
                     theme(axis_text_x=element_text(angle=45, hjust=1), legend_position="top", legend_title=element_blank(), plot_title=element_text(hjust=0)) +
-                    # Add the summary text annotations to the plot.
-                    annotate("text", x=x_pre_annotation, y=att_timeid['q97_5'].max(),
-                            label=format_annotation(att_period, "Pre", period_effect_format), color="black", size=10, fontweight='bold') +
-                    annotate("text", x=x_post_annotation, y=att_timeid['q97_5'].max(),
-                            label=format_annotation(att_period, "Post", period_effect_format), color="black", size=10, fontweight='bold') +
+                    annotate("text", x=x_pre_annotation, y=df_eff['q97_5'].max(),
+                            label=format_annotation(df_period, "Pre", period_effect_format), color="black", size=10, fontweight='bold') +
+                    annotate("text", x=x_post_annotation, y=df_eff['q97_5'].max(),
+                            label=format_annotation(df_period, "Post", period_effect_format), color="black", size=10, fontweight='bold') +
                     ylab("Effect Magnitude")
                 )
-                # Save the plot to a file.
                 p.save(f"{workspace_folder}/{temp_folder}/solution_id_{solution_id}/{current_indicator}/effect.png", width=14, height=6, dpi=300)
 
-                # Assumption 3' (Strict Parallel Trends)
-                # Generate and save forest plots for the Predictive NRMSE (Normalized Root Mean Square Error) model fit statistics using ArviZ.
-                # These plots help diagnose how well the synthetic control complies with the strict parallel trends assumption.
+                # 4. Forest Plots (ArviZ)
+                # We use the original 'fit' object for this as ArviZ handles it well enough, 
+                # but we constrain coords to just the current index to save rendering time.
+                # Note: plot_forest is somewhat slow. If strict speed is needed, this can be skipped or optimized.
                 az.plot_forest(
                     fit,
                     var_names=["nrmse_train", "nrmse_val_minus_one", "nrmse_terminal"],
                     combined=True,
                     figsize=(25, 10),
                     hdi_prob=0.95,
-                    coords={ # 'coords' is used to select only the NRMSE for the current outcome (indexed by 'idx').
-                        "nrmse_train_dim_0": [idx],
-                        "nrmse_val_minus_one_dim_0": [idx],
-                        "nrmse_terminal_dim_0": [idx]
-                    }
+                    coords={"nrmse_train_dim_0": [idx], "nrmse_val_minus_one_dim_0": [idx], "nrmse_terminal_dim_0": [idx]}
                 )
-                plt.suptitle("Strict Parallel Trends - Predictive RMSE (Normalized Root Mean Square Error)", fontsize=16, y=0.97)
+                plt.suptitle("Strict Parallel Trends - Predictive NRMSE", fontsize=16)
+                plt.tight_layout()
                 plt.savefig(f"{workspace_folder}/{temp_folder}/solution_id_{solution_id}/{current_indicator}/predictive_nrmse.png")
+                plt.close()
 
-                # Assumption 3 (Low-Rank Trends)
-                # Generate and save forest plots for the Structural NRMSE (Normalized Root Mean Square Error) model fit statistics using ArviZ.
-                # These plots help diagnose how well the synthetic control complies with the low-rank trends assumption.
                 az.plot_forest(
                     fit,
                     var_names=["struc_nrmse_train", "struc_nrmse_val_minus_one", "struc_nrmse_terminal"],
                     combined=True,
                     figsize=(25, 10),
                     hdi_prob=0.95,
-                    coords={ # 'coords' is used to select only the NRMSE for the current outcome (indexed by 'idx').
-                        "struc_nrmse_train_dim_0": [idx],
-                        "struc_nrmse_val_minus_one_dim_0": [idx],
-                        "struc_nrmse_terminal_dim_0": [idx]
-                    }
+                    coords={"struc_nrmse_train_dim_0": [idx], "struc_nrmse_val_minus_one_dim_0": [idx], "struc_nrmse_terminal_dim_0": [idx]}
                 )
-                plt.suptitle("Low-Rank Trends - Structural RMSE (Normalized Root Mean Square Error)", fontsize=16, y=0.97)
+                plt.suptitle("Low-Rank Trends - Structural NRMSE", fontsize=16)
+                plt.tight_layout()
                 plt.savefig(f"{workspace_folder}/{temp_folder}/solution_id_{solution_id}/{current_indicator}/structural_nrmse.png")
+                plt.close()
 
-                # Store the summary results for the current outcome in the lists.
-                absolute_structural_timeid['outcome'] = current_indicator
-                absolute_structural_timeid_list.append(absolute_structural_timeid)
-
-                absolute_predictive_timeid['outcome'] = current_indicator
-                absolute_predictive_timeid_list.append(absolute_predictive_timeid)
-
-                att_period['outcome'] = current_indicator
-                att_period_list.append(att_period)
-
-                att_timeid['outcome'] = current_indicator
-                att_timeid_list.append(att_timeid)
-
-            # Combine the summary results from all outcomes into single DataFrames.
+            # --- CONSOLIDATE AND SAVE ---
             absolute_structural_timeid_df = pd.concat(absolute_structural_timeid_list)
-            
             shape_report = classify_structural_uncertainty_shape(absolute_structural_timeid_df)
-
-            # Save the report
             shape_report.to_csv(f"{workspace_folder}/{temp_folder}/solution_id_{solution_id}/structural_uncertainty_shape_report.csv", index=False)                
             
             absolute_predictive_timeid_df = pd.concat(absolute_predictive_timeid_list)
             att_period_df = pd.concat(att_period_list)
             att_timeid_df = pd.concat(att_timeid_list)
-            # Save the summarized results and the full set of MCMC draws to CSV files for further analysis.
+            
             absolute_structural_timeid_df.to_csv(f"{workspace_folder}/{temp_folder}/solution_id_{solution_id}/absolute_structural_timeid_dt.csv", index=False)
             absolute_predictive_timeid_df.to_csv(f"{workspace_folder}/{temp_folder}/solution_id_{solution_id}/absolute_predictive_timeid_dt.csv", index=False)
             att_period_df.to_csv(f"{workspace_folder}/{temp_folder}/solution_id_{solution_id}/att_period_dt.csv", index=False)
             att_timeid_df.to_csv(f"{workspace_folder}/{temp_folder}/solution_id_{solution_id}/att_timeid_dt.csv", index=False)
-            draws_df.to_csv(f"{workspace_folder}/{temp_folder}/solution_id_{solution_id}/chains_all_parameters.csv", index=False)
 
-            # Convert the CmdStanPy fit object to an ArviZ InferenceData object for advanced plotting.
+            # --- ARVIZ PLOTS (Weights) ---
             inference_data = az.from_cmdstanpy(fit)
 
             # --- Create a customized density plot for key parameters ---
@@ -822,7 +795,7 @@ def estimate(
             axes = az.plot_density(
                 [inference_data.sel(chain=[0]), inference_data.sel(chain=[1]),
                 inference_data.sel(chain=[2]), inference_data.sel(chain=[3])],
-                var_names=["w", "sigma", "tau_nrmse", "hhi_weight"],
+                var_names=["sigma", "tau_nrmse", "hhi_weight"],
                 shade=0.0,
                 hdi_prob=0.95,
                 point_estimate="mean",
@@ -840,15 +813,14 @@ def estimate(
             fig.set_constrained_layout(True) 
 
             # Create user-friendly titles for each subplot.
-            plot_titles = [name for name in az.summary(inference_data).index.tolist() if name.startswith(("w", "sigma", "tau_nrmse"))]
-            new_w_names = {f"w[{index}]": f"w[{name}]" for index, name in enumerate(unitids)}
+            plot_titles = [name for name in az.summary(inference_data).index.tolist() if name.startswith(("sigma", "tau_nrmse"))]
             new_s_names = {f"sigma[{index}]": f"sigma[{name}]" for index, name in enumerate(outcomes)}
             new_t_names = {f"tau_nrmse[{index}]": f"tau_nrmse[{name}]" for index, name in enumerate(outcomes)}
-            new_names = new_w_names | new_s_names | new_t_names
+            new_names = new_s_names | new_t_names
             plot_titles = [new_names.get(name, name) for name in plot_titles]
 
             for i, ax in enumerate(axes.flatten()):
-                if i < len(plot_titles):                                
+                if i < len(plot_titles):
                     ax.set_title(plot_titles[i], fontsize=12)
                     ax.tick_params(axis='x', labelsize=12)
 
@@ -865,45 +837,49 @@ def estimate(
                 title_fontsize=12
             )
             plt.savefig(f"{workspace_folder}/{temp_folder}/solution_id_{solution_id}/unitid_weight_individual_distribution_sigma.png")
+            plt.close()
 
-            # --- Create a forest plot for the donor weights (w) ---
-            # This plot shows the posterior distribution (mean and 95% HDI) for each control unit's weight.
-            # It clearly visualizes which control units are most important for constructing the synthetic control.
+            # Forest Plot (Weights)
             az.plot_forest(
-                fit,
-                var_names="w",
-                combined=True,
-                figsize=(14, max(6, N_controls * 0.3)), # Adjust height based on number of controls.
-                hdi_prob=0.95,
-                labeller=az.labels.MapLabeller(coord_map={"w_dim_0": {index: name for index, name in enumerate(unitids)}})
+                fit, var_names="w", combined=True, figsize=(14, max(6, N_controls * 0.3)),
+                hdi_prob=0.95, labeller=az.labels.MapLabeller(coord_map={"w_dim_0": {i: n for i, n in enumerate(unitids)}})
             )
-            plt.suptitle("Posterior Distribution of Control Unit Weights (w)", fontsize=16, y=0.97)
+            plt.suptitle("Posterior Distribution of Control Unit Weights (w)", fontsize=16)
             plt.savefig(f"{workspace_folder}/{temp_folder}/solution_id_{solution_id}/unitid_weight_simultanous_distribution.png")
-            
-            
-            plt.close('all') # Close to free memory
-            
+            plt.close('all')
+
+            # --- FILE RENAMING LOGIC ---
             if solution_has_problem == "":
                 if parallel_trends_violated:
                     os.rename(f"{workspace_folder}/{temp_folder}/solution_id_{solution_id}", f"{workspace_folder}/{temp_folder}/P_solution_id_{solution_id}")
                     unacceptable_solutions.append(solution_id)
                 else:
-                    predictive_reliability_score = -1
-                    for idx, _ in enumerate(outcomes):
-                        predictive_reliability_score_temp = draws_df[f'struc_nrmse_val_minus_one[{idx+1}]'].quantile(0.975) + abs(draws_df[f'struc_nrmse_val_minus_one[{idx+1}]'].quantile(0.975) - draws_df[f'struc_nrmse_train[{idx+1}]'].quantile(0.975))
-                        if predictive_reliability_score_temp > predictive_reliability_score:
-                            predictive_reliability_score = predictive_reliability_score_temp                   
-                    os.rename(f"{workspace_folder}/{temp_folder}/solution_id_{solution_id}", f"{workspace_folder}/{temp_folder}/R{predictive_reliability_score:1.3f}_S{shape_report['relative_width'].max():1.3f}_H{draws_df['hhi_weight'].mean():.2f}_K{max(loo_results.pareto_k.values):.2f}_solution_id_{solution_id}")
+                    # Calculate NRMSE Score (Vectorized)
+                    # Uval + abs(Uval - Utrain)
+                    u_val = np.quantile(stan_vars['struc_nrmse_val_minus_one'], 0.975, axis=0) # shape (N_outcomes,)
+                    u_train = np.quantile(stan_vars['struc_nrmse_train'], 0.975, axis=0)
+                    scores = u_val + np.abs(u_val - u_train)
+                    predictive_reliability_score = np.max(scores)
+                    
+                    hhi_mean = np.mean(stan_vars['hhi_weight'])
+                    
+                    os.rename(f"{workspace_folder}/{temp_folder}/solution_id_{solution_id}", 
+                              f"{workspace_folder}/{temp_folder}/R{predictive_reliability_score:1.3f}_S{shape_report['relative_width'].max():1.3f}_H{hhi_mean:.2f}_K{max(loo_results.pareto_k.values):.2f}_solution_id_{solution_id}")
             else:
-                if parallel_trends_violated:
-                    os.rename(f"{workspace_folder}/{temp_folder}/solution_id_{solution_id}", f"{workspace_folder}/{temp_folder}/{solution_has_problem}P_solution_id_{solution_id}")
-                    unacceptable_solutions.append(solution_id)
-                else:
-                    os.rename(f"{workspace_folder}/{temp_folder}/solution_id_{solution_id}", f"{workspace_folder}/{temp_folder}/{solution_has_problem}_solution_id_{solution_id}")
+                prefix = f"{solution_has_problem}P" if parallel_trends_violated else solution_has_problem
+                os.rename(f"{workspace_folder}/{temp_folder}/solution_id_{solution_id}", 
+                          f"{workspace_folder}/{temp_folder}/{prefix}_solution_id_{solution_id}")
 
-            temp_weight_solutions = chains_w_df.groupby('unitid').agg({
-                'value' : 'mean'
-            }).reset_index()
+            # Collect Weights for final table
+            # Compute mean weights directly from numpy array
+            w_means = np.mean(stan_vars['w'], axis=0) # Shape (N_controls,)
+            temp_weight_solutions = pd.DataFrame({
+                'unitid': unitids,
+                'value': w_means
+            })
+            
+            weights_dict = temp_weight_solutions.set_index('unitid')['value'].to_dict()
+            
             temp_weight_solutions['Unrmse'] = predictive_reliability_score
             temp_weight_solutions['solution_id'] = solution_id
 
@@ -912,7 +888,6 @@ def estimate(
             # 1. Metrics
             nrmse_score = predictive_reliability_score # Calculated previously in your code
             synth_score = shape_report['relative_width'].max()
-            hhi_score = draws_df['hhi_weight'].mean()
 
             # 2. Effects (Formatting helper)
             def format_effect_string(mean, lower, upper):
@@ -964,18 +939,13 @@ def estimate(
                         'Description': f'ATT {spot_check_timeid}', 'Value': "N/A"
                     })
 
-            # 3. Weights
-            # Filter weights for this solution
-            weights_data = chains_w_df.groupby('unitid')['value'].mean().reset_index()
-            weights_dict = weights_data.set_index('unitid')['value'].to_dict()
-
             # Store everything
             summary_data_collection.append({
                 'solution_id': solution_id,
                 'metrics': {
                     'NRMSE': nrmse_score,
                     'Synth': synth_score,
-                    'HHI': hhi_score
+                    'HHI': hhi_mean
                 },
                 'effects': effect_rows,
                 'weights': weights_dict

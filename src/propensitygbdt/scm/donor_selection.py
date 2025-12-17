@@ -57,6 +57,7 @@ import random
 from scipy.optimize import minimize
 from scipy.linalg import qr
 from scipy.linalg import svd
+from scipy.ndimage import median_filter
 import sys
 from typing import Literal, get_args
 import xgboost as xgb
@@ -145,37 +146,79 @@ r_hat : int
 """
 def estimate_rank_robust(X, n_outcomes, kmax=None):
     T, total_cols = X.shape
-    if total_cols % n_outcomes != 0:
-        raise ValueError(f"Total columns in X ({total_cols}) must be divisible by n_outcomes ({n_outcomes}).")
+    J = total_cols // n_outcomes
+    if total_cols != J * n_outcomes:
+        raise ValueError("Columns must match J * n_outcomes.")
     
-    # Standardize each series: mean 0, std 1
     X_std = np.zeros_like(X)
-    for col in range(total_cols):
-        series = X[:, col]
-        mean = np.mean(series)
-        std = np.std(series)
-        if std == 0:
-            std = 1.0
-        X_std[:, col] = (series - mean) / std
+    for k in range(n_outcomes):
+        start = k * J
+        end = (k + 1) * J
+        sub_X = X[:, start:end]
+        global_mean = np.mean(sub_X)
+        global_std = np.std(sub_X) if np.std(sub_X) > 0 else 1.0
+        sub_X = (sub_X - global_mean) / global_std  # Group scale
+        # Optional column standardize
+        for col in range(J):
+            series = sub_X[:, col]
+            mean = np.mean(series)
+            std = np.std(series) if np.std(series) > 0 else 1.0
+            sub_X[:, col] = (series - mean) / std
+        X_std[:, start:end] = sub_X
     
-    # SVD for singular values (decreasing order)
-    _, S, _ = svd(X_std, full_matrices=False)
-    
+    # Proceed with SVD and ER as in original
+    _, S, _ = np.linalg.svd(X_std, full_matrices=False)
     m = len(S)
     if kmax is None:
         kmax = m // 2
     kmax = min(kmax, m - 1)
-    
     if kmax < 1:
         return 0
-    
-    # Compute eigenvalue ratios (using squared singular values as eigenvalues of cov)
     ratios = (S[:kmax]**2) / (S[1:kmax+1]**2)
+    return np.argmax(ratios) + 1
+
+"""
+Estimates a robust coefficient of variation (CV) for the treated unit's pre-treatment time series,
+handling multiple outcomes. This measure quantifies the relative variability (noise level) in the
+data using a robust approach to inform adaptive buffers in donor selection.
+
+The function detrends each outcome series using a median filter to remove low-frequency trends,
+computes residuals, and then calculates a robust CV as the scaled Median Absolute Deviation (MAD)
+normalized by the median absolute residual. The scaling factor 1.4826 ensures consistency with the
+standard deviation under Gaussian assumptions. Results are averaged across outcomes for a single
+scalar estimate.
+
+Parameters:
+treatment_ts : array-like, shape (T_pre, n_outcomes). Pre-treatment time series for the treated
+    unit (one column per outcome).
+n_outcomes : int. Number of outcomes (must match the second dimension of treatment_ts).
+window_fraction : float, optional. Fraction of T_pre to determine the adaptive median filter window
+    size (default: 0.1). The window is clamped to [3, 101] for stability.
+
+Returns:
+robust_cv : float. The average robust CV across all outcomes, used as a noise proxy (e.g.,
+    in max_donors calculation to add buffers for high-noise data).
+"""
+def estimate_robust_cv(treatment_ts, n_outcomes, window_fraction=0.1):
+    # Handle treatment_ts: ensure 2D
+    treatment_ts = np.atleast_2d(treatment_ts)  # (T_pre, n_outcomes) or (1, T_pre) if 1D
+    T_pre, M = treatment_ts.shape
+    if M != n_outcomes:
+        raise ValueError(f"treatment_ts shape {treatment_ts.shape} incompatible with n_outcomes={n_outcomes}.")
     
-    # Estimated r is argmax of ratios + 1 (1-based)
-    r_hat = np.argmax(ratios) + 1
+    # Estimate robust_cv: per outcome, then average
+    robust_cvs = []
+    window = max(3, min(101, 2 * int(window_fraction * T_pre) + 1))  # Adaptive odd window
+    for m in range(n_outcomes):
+        ts = treatment_ts[:, m]
+        trend = median_filter(ts, size=window)
+        residuals = ts - trend
+        mad = np.median(np.abs(residuals - np.median(residuals)))
+        median_abs = np.median(np.abs(residuals))
+        rcv = 1.4826 * (mad / median_abs) if median_abs > 0 else 0
+        robust_cvs.append(rcv)
     
-    return r_hat
+    return np.mean(robust_cvs)
 
 """
 Builds a low-condition-number donor set via greedy forward selection (scale-invariant robust version).
@@ -204,11 +247,18 @@ selected_indices : list of int
 final_max_cond : float
     Max Gram cond of the final set.
 """
-def build_low_cond_set_greedy_robust(X, n_outcomes, gram_threshold=100.0, max_donors=None, seed=None):
+def build_low_cond_set_greedy_robust(treatment_ts, X, n_outcomes, gram_threshold=100.0, max_donors=None, seed=None):
     if seed is not None:
         np.random.seed(seed)
     if max_donors is None:
-        max_donors = estimate_rank_robust(X, n_outcomes)
+        # max_donors = 2 * estimate_rank_robust(X, n_outcomes) + 1
+        robust_cv = estimate_robust_cv(treatment_ts, n_outcomes)
+        estimated_rank = estimate_rank_robust(X, n_outcomes)
+        base_need = estimated_rank + 1
+        noise_buffer = (robust_cv ** 2) * estimated_rank
+        max_capacity = np.clip(np.sqrt(len(treatment_ts)) * max(1.0, 1.5 / np.log(base_need)), a_min=2 * estimated_rank + 1, a_max=50)  # Damps if high rank
+        max_donors = np.clip(base_need + noise_buffer, a_min=base_need, a_max=max_capacity)
+    
     T, total_cols = X.shape
     if total_cols % n_outcomes != 0:
         raise ValueError(f"Total columns in X ({total_cols}) must be divisible by n_outcomes ({n_outcomes}).")
@@ -542,7 +592,7 @@ def search(
     seed: int = 111,
     maximum_ratio_var_treated_var_donor: int = 10.0,
     maximum_num_units_on_attipw_support: int = 50,
-    maximum_gram_cond_train: float = 500.0,
+    maximum_gram_cond_train: float = 100.0,
     minimum_donor_selection: int = 3,
     maximum_control_unit_weight_train: float = 0.5,
     synthetic_control_bias_removal_period: type_synthetic_control_bias_removal_period = 'pre_intervention',
@@ -1042,9 +1092,12 @@ def search(
                 (error_valid, error_pre_intervention, impact_score) = estimated_solutions[combination_tuple]
             else:
                 data2 = datat[datat['unitid'].isin([treatment_unitid] + list(donor_unitids))].copy()
+                treatment_df = data2[(data2['treatment'] == 1) & (data2['timeid'].isin(self.timeid_train))]
+                pivot_treatment = treatment_df.pivot(index='timeid', columns=['outcome'], values='value')
                 donor_df = data2[(data2['treatment'] == 0) & (data2['timeid'].isin(self.timeid_train))].copy()
                 pivot_donor = donor_df.pivot(index='timeid', columns=['unitid', 'outcome'], values='value')
                 selected_donors, gram_cond_train = build_low_cond_set_greedy_robust(
+                    treatment_ts=pivot_treatment.values,
                     X=pivot_donor.values,
                     n_outcomes=len(outcomes),
                     gram_threshold=maximum_gram_cond_train,

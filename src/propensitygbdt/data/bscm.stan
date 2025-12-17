@@ -227,8 +227,8 @@ model {
 
     // 2. Calculate diagnostic correlations and nrmse
     real nrmse_train = sqrt(mean(square(residuals_train / amplitude[k])));
-    real nrmse_val_minus_one = sqrt(mean(square(residuals_val[1:(N_val-1)] / amplitude[k])));
-	real nrmse_terminal = abs(residuals_val[N_val] / amplitude[k]);
+    real nrmse_val_minus_one = sqrt(mean(square(residuals_val[1:(N_val-2)] / amplitude[k])));
+	real nrmse_terminal = abs(residuals_val[N_val-1] / amplitude[k]);
 	
     // 3. Add soft constraints by specifying tight priors on these nrmse
     nrmse_train ~ normal(0, tau_nrmse[k]) T[0,];
@@ -292,13 +292,13 @@ generated quantities {
     }
 
     nrmse_train[k] = sqrt(mean(square(residuals_train[, k] / amplitude[k])));
-    nrmse_val_minus_one[k] = sqrt(mean(square(residuals_val[1:(N_val-1), k] / amplitude[k])));
-	nrmse_terminal[k] = abs(residuals_val[N_val, k]) / amplitude[k];
+    nrmse_val_minus_one[k] = sqrt(mean(square(residuals_val[1:(N_val-2), k] / amplitude[k])));
+	nrmse_terminal[k] = abs(residuals_val[N_val-1, k]) / amplitude[k];
     nrmse_post[k] = sqrt(mean(square(effect_post[, k] / amplitude[k])));
 
     struc_nrmse_train[k] = sqrt(mean(square(struc_residuals_train[, k] / amplitude[k])));
-    struc_nrmse_val_minus_one[k] = sqrt(mean(square(struc_residuals_val[1:(N_val-1), k] / amplitude[k])));
-    struc_nrmse_terminal[k] = abs(struc_residuals_val[N_val, k]) / amplitude[k];
+    struc_nrmse_val_minus_one[k] = sqrt(mean(square(struc_residuals_val[1:(N_val-2), k] / amplitude[k])));
+    struc_nrmse_terminal[k] = abs(struc_residuals_val[N_val-1, k]) / amplitude[k];
 	struc_nrmse_post[k] = sqrt(mean(square(struc_effect_post[, k] / amplitude[k])));
   }
 }
