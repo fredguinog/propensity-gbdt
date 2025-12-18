@@ -1170,7 +1170,7 @@ def search(
                         (error_valid, error_pre_intervention, impact_score) = estimated_solutions[combination_tuple3]
                     else:                    
                         weight_mapping = dict(zip(control_unit_ids, optimal_weights))
-                        filtered_weights = {unit: weight for unit, weight in weight_mapping.items() if weight > 0.01}
+                        filtered_weights = {unit: weight for unit, weight in weight_mapping.items() if weight > 0.1}
                         current_combination_tuple = tuple(sorted(filtered_weights.keys()))
                         data2['weight'] = data2['unitid'].map(filtered_weights)
                         data2['weight'] = np.where(data2['treatment'] == 1, 1, data2['weight'])
