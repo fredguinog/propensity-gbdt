@@ -125,57 +125,131 @@ def calculate_gram_cond_by_shape(df: pd.DataFrame) -> float:
     return pd.DataFrame(results)['gram_cond'].max()
 
 """
-Estimates the latent rank r of the donor matrix via the Eigenvalue Ratio (ER) method,
-robust to noise. Standardizes each series to mean 0, variance 1 before estimation to
-focus on correlations. The ER method detects the largest gap in sorted singular values,
-identifying the point where signal drops to noise level.
+Noise-robust latent rank estimator for donor matrices.
+
+This function estimates the effective low-rank dimension of the
+pre-treatment donor matrix using a denoised singular spectrum.
+It is designed for small-T, noisy SCM panels.
+
+Steps:
+------
+1. Outcome-wise (group) standardization to equalize scale across outcomes
+    while preserving cross-donor factor structure.
+2. Singular value decomposition.
+3. Noise floor estimation (Gavish–Donoho optimal hard threshold).
+4. Rank selection using cumulative explained variance of the *denoised*
+    spectrum.
+5. Explicit handling of "no low-rank signal" regimes.
 
 Parameters:
 -----------
-X : array-like, shape (T, K*M)
-    Donor time series matrix (pre-intervention).
+X : ndarray, shape (T, J * M)
+    Pre-treatment donor matrix.
 n_outcomes : int
-    Number of outcomes (M) per donor.
+    Number of outcomes (M).
 kmax : int, optional
-    Maximum rank to consider (default: min(T, total_cols) // 2).
+    Maximum rank allowed. Defaults to min(T, total_cols) // 2.
+thresh : float, optional
+    Explained variance threshold on denoised spectrum (default 0.85).
+noise_method : str
+    Currently supports "gavish_donoho".
 
 Returns:
 --------
 r_hat : int
-    Estimated rank r.
+    Estimated effective rank (0 means no detectable low-rank structure).
+diagnostics : dict
+    Useful diagnostic information for simulations and debugging.
 """
-def estimate_rank_robust(X, n_outcomes, kmax=None):
+def estimate_rank_robust(
+    X,
+    n_outcomes,
+    kmax=None,
+    thresh=0.85,
+    noise_method="gavish_donoho"
+):
+    # -----------------------------
+    # 0. Shape checks
+    # -----------------------------
     T, total_cols = X.shape
     J = total_cols // n_outcomes
     if total_cols != J * n_outcomes:
-        raise ValueError("Columns must match J * n_outcomes.")
-    
-    X_std = np.zeros_like(X)
-    for k in range(n_outcomes):
-        start = k * J
-        end = (k + 1) * J
-        sub_X = X[:, start:end]
-        global_mean = np.mean(sub_X)
-        global_std = np.std(sub_X) if np.std(sub_X) > 0 else 1.0
-        sub_X = (sub_X - global_mean) / global_std  # Group scale
-        # Optional column standardize
-        for col in range(J):
-            series = sub_X[:, col]
-            mean = np.mean(series)
-            std = np.std(series) if np.std(series) > 0 else 1.0
-            sub_X[:, col] = (series - mean) / std
-        X_std[:, start:end] = sub_X
-    
-    # Proceed with SVD and ER as in original
-    _, S, _ = np.linalg.svd(X_std, full_matrices=False)
-    m = len(S)
+        raise ValueError("X columns must equal J * n_outcomes.")
+
     if kmax is None:
-        kmax = m // 2
-    kmax = min(kmax, m - 1)
-    if kmax < 1:
-        return 0
-    ratios = (S[:kmax]**2) / (S[1:kmax+1]**2)
-    return np.argmax(ratios) + 1
+        kmax = min(T, total_cols) // 2
+
+    # -----------------------------
+    # 1. Outcome-wise standardization
+    # -----------------------------
+    X_std = np.zeros_like(X, dtype=float)
+
+    for m in range(n_outcomes):
+        start = m * J
+        end = (m + 1) * J
+        block = X[:, start:end]
+
+        mean = np.mean(block)
+        std = np.std(block)
+        std = std if std > 0 else 1.0
+
+        X_std[:, start:end] = (block - mean) / std
+
+    # -----------------------------
+    # 2. SVD
+    # -----------------------------
+    U, S, Vt = np.linalg.svd(X_std, full_matrices=False)
+    m_sing = len(S)
+
+    # -----------------------------
+    # 3. Noise floor estimation
+    # -----------------------------
+    if noise_method == "gavish_donoho":
+        # Robust noise estimate
+        sigma_hat = np.median(S) / 0.6745
+        tau = 2.858 * sigma_hat
+        signal_mask = S > tau
+    else:
+        raise ValueError("Unsupported noise method.")
+
+    S_signal = S[signal_mask]
+
+    # -----------------------------
+    # 4. No-signal regime
+    # -----------------------------
+    if len(S_signal) == 0:
+        return 0, {
+            "reason": "no_detectable_low_rank_structure",
+            "num_signal_components": 0,
+            "singular_values": S
+        }
+
+    # -----------------------------
+    # 5. Rank via denoised explained variance
+    # -----------------------------
+    S2 = S_signal ** 2
+    cum_var = np.cumsum(S2) / np.sum(S2)
+
+    r_hat = np.searchsorted(cum_var, thresh) + 1
+    r_hat = min(r_hat, kmax, len(S_signal))
+
+    # -----------------------------
+    # 6. Diagnostics
+    # -----------------------------
+    diagnostics = {
+        "num_signal_components": len(S_signal),
+        "raw_rank": len(S),
+        "kmax": kmax,
+        "selected_rank": r_hat,
+        "threshold": thresh,
+        "noise_sigma_hat": sigma_hat,
+        "noise_threshold_tau": tau,
+        "explained_variance_at_r": cum_var[r_hat - 1],
+        "singular_values": S,
+        "signal_singular_values": S_signal
+    }
+
+    return r_hat, diagnostics
 
 """
 Estimates a robust coefficient of variation (CV) for the treated unit's pre-treatment time series,
@@ -240,7 +314,7 @@ def estimate_robust_cv(treatment_ts, n_outcomes, window_fraction=0.1):
         else:
             robust_cvs.append(np.inf)
     
-    return np.mean(robust_cvs)
+    return np.max(robust_cvs)
 
 """
 Builds a low-condition-number donor set via greedy forward selection (scale-invariant robust version).
@@ -274,11 +348,11 @@ def build_low_cond_set_greedy_robust(treatment_ts, X, n_outcomes, gram_threshold
         np.random.seed(seed)
     if max_donors is None:
         robust_cv = estimate_robust_cv(treatment_ts, n_outcomes)
-        estimated_rank = estimate_rank_robust(X, n_outcomes)
+        estimated_rank, _ = estimate_rank_robust(X, n_outcomes)
         base_need = estimated_rank + 1
         noise_buffer = (robust_cv ** 2) * estimated_rank
         max_capacity = np.clip(np.sqrt(len(treatment_ts)) * max(1.0, 1.5 / np.log(base_need)), a_min=2 * estimated_rank + 1, a_max=50)  # Damps if high rank
-        max_donors = np.clip(base_need + noise_buffer, a_min=base_need, a_max=max_capacity)
+        max_donors = np.clip(np.ceil(base_need + noise_buffer), a_min=base_need, a_max=max_capacity)
     
     T, total_cols = X.shape
     if total_cols % n_outcomes != 0:
