@@ -125,52 +125,38 @@ def calculate_gram_cond_by_shape(df: pd.DataFrame) -> float:
     return pd.DataFrame(results)['gram_cond'].max()
 
 """
-Noise-robust latent rank estimator for donor matrices.
+Noise estimation uses Marchenko-Pastur scaling as a heuristic.
+This assumes approximate IID structure after standardization.
+"explained_variance": Soft threshold via variance explained (recommended)
 
-This function estimates the effective low-rank dimension of the
-pre-treatment donor matrix using a denoised singular spectrum.
-It is designed for small-T, noisy SCM panels.
+Limitations:
+- Not exact for temporally/cross-sectionally correlated data
+- Finite-sample approximation (T < 100)
+- Circular: uses tail SVs to estimate noise in tail
 
-Steps:
-------
-1. Outcome-wise (group) standardization to equalize scale across outcomes
-    while preserving cross-donor factor structure.
-2. Singular value decomposition.
-3. Noise floor estimation (Gavish–Donoho optimal hard threshold).
-4. Rank selection using cumulative explained variance of the *denoised*
-    spectrum.
-5. Explicit handling of "no low-rank signal" regimes.
+For formal rank selection in factor models, consider:
+- Bai & Ng (2002) IC1, IC2, IC3 criteria
+- Onatski (2010) edge distribution test
+- Ahn & Horenstein (2013) eigenvalue ratio tests
+
+This function prioritizes speed and simplicity for simulation studies.
 
 Parameters:
 -----------
-X : ndarray, shape (T, J * M)
-    Pre-treatment donor matrix.
-n_outcomes : int
-    Number of outcomes (M).
-kmax : int, optional
-    Maximum rank allowed. Defaults to min(T, total_cols) // 2.
-thresh : float, optional
-    Explained variance threshold on denoised spectrum (default 0.85).
-noise_method : str
-    Currently supports "gavish_donoho".
-
-Returns:
---------
-r_hat : int
-    Estimated effective rank (0 means no detectable low-rank structure).
-diagnostics : dict
-    Useful diagnostic information for simulations and debugging.
+thresh : float
+    Variance threshold (0.85 = explain 85% of denoised variance)
+    Lower values (0.7-0.8) recommended for very noisy/small-T settings
+adaptive_thresh : bool
+    If True, automatically lower threshold in high-beta regimes
 """
 def estimate_rank_robust(
     X,
     n_outcomes,
     kmax=None,
     thresh=0.85,
-    noise_method="gavish_donoho"
+    adaptive_thresh=True  # auto-adjust threshold based on regime
 ):
-    # -----------------------------
-    # 0. Shape checks
-    # -----------------------------
+    # Shape checks
     T, total_cols = X.shape
     J = total_cols // n_outcomes
     if total_cols != J * n_outcomes:
@@ -179,75 +165,93 @@ def estimate_rank_robust(
     if kmax is None:
         kmax = min(T, total_cols) // 2
 
-    # -----------------------------
-    # 1. Outcome-wise standardization
-    # -----------------------------
+    # Outcome-wise standardization
     X_std = np.zeros_like(X, dtype=float)
-
     for m in range(n_outcomes):
         start = m * J
         end = (m + 1) * J
         block = X[:, start:end]
-
         mean = np.mean(block)
         std = np.std(block)
         std = std if std > 0 else 1.0
-
         X_std[:, start:end] = (block - mean) / std
 
-    # -----------------------------
-    # 2. SVD
-    # -----------------------------
+    # SVD
     U, S, Vt = np.linalg.svd(X_std, full_matrices=False)
-    m_sing = len(S)
+    
+    # Aspect ratio for Gavish-Donoho
+    n, m = T, min(T, total_cols)
+    beta = m / n if n >= m else n / m
+    
+    # Adaptive threshold adjustment for high-noise regimes
+    thresh_adjusted = thresh
+    if adaptive_thresh and beta > 0.7:
+        # High aspect ratio → likely high noise → be more conservative
+        thresh_adjusted = max(0.70, thresh - 0.10)
+    elif adaptive_thresh and T < 15:
+        # Very small T → harder to distinguish signal
+        thresh_adjusted = max(0.75, thresh - 0.05)
 
-    # -----------------------------
-    # 3. Noise floor estimation
-    # -----------------------------
-    if noise_method == "gavish_donoho":
-        # Robust noise estimate
-        sigma_hat = np.median(S) / 0.6745
-        tau = 2.858 * sigma_hat
-        signal_mask = S > tau
-    else:
-        raise ValueError("Unsupported noise method.")
-
-    S_signal = S[signal_mask]
-
-    # -----------------------------
-    # 4. No-signal regime
-    # -----------------------------
-    if len(S_signal) == 0:
+    # ========================================
+    # Method: Explained Variance (RECOMMENDED for small T)
+    # ========================================
+    # IMPROVED: Use beta-informed noise estimation
+    # Marchenko-Pastur: noise SVs concentrate near sigma*sqrt(n)*sqrt(beta)
+    
+    # Conservative tail: use larger fraction in high-noise regimes
+    # Heuristic: if beta > 0.5, likely few signal components
+    tail_frac = 0.5 if beta > 0.5 else 0.25
+    n_tail = max(2, int(len(S) * tail_frac))
+    noise_sv = S[-n_tail:]
+    
+    # Estimate sigma from tail using Marchenko-Pastur scaling
+    # Expected noise SV ≈ sigma * sqrt(n) * sqrt(beta)
+    scale_factor = np.sqrt(n) * np.sqrt(beta) if beta > 0 else 1.0
+    sigma_hat = np.median(noise_sv) / scale_factor if scale_factor > 0 else np.median(noise_sv)
+    sigma_noise_sq = sigma_hat**2
+    
+    # Denoise: subtract expected noise contribution per SV
+    # For n×m matrix: E[s_i^2] ≈ sigma^2 * n for noise components
+    noise_contribution = sigma_noise_sq * n
+    S2_denoised = np.maximum(S**2 - noise_contribution, 0)
+    
+    if np.sum(S2_denoised) == 0:
         return 0, {
-            "reason": "no_detectable_low_rank_structure",
-            "num_signal_components": 0,
+            "reason": "all_variance_attributed_to_noise",
+            "noise_var_estimate": sigma_noise_sq,
+            "tail_fraction_used": tail_frac,
             "singular_values": S
         }
-
-    # -----------------------------
-    # 5. Rank via denoised explained variance
-    # -----------------------------
-    S2 = S_signal ** 2
-    cum_var = np.cumsum(S2) / np.sum(S2)
-
-    r_hat = np.searchsorted(cum_var, thresh) + 1
-    r_hat = min(r_hat, kmax, len(S_signal))
-
-    # -----------------------------
-    # 6. Diagnostics
-    # -----------------------------
+    
+    # Cumulative explained variance on denoised spectrum
+    cum_var = np.cumsum(S2_denoised) / np.sum(S2_denoised)
+    
+    r_hat = np.searchsorted(cum_var, thresh_adjusted) + 1
+    r_hat = min(r_hat, kmax, len(S))
+    
+    sigma_noise_sq_est = sigma_noise_sq
+    # ========================================
+    # Diagnostics
+    # ========================================
+    S2 = S**2
     diagnostics = {
-        "num_signal_components": len(S_signal),
-        "raw_rank": len(S),
-        "kmax": kmax,
         "selected_rank": r_hat,
-        "threshold": thresh,
-        "noise_sigma_hat": sigma_hat,
-        "noise_threshold_tau": tau,
-        "explained_variance_at_r": cum_var[r_hat - 1],
+        "kmax": kmax,
+        "aspect_ratio_beta": beta,
+        "threshold_requested": thresh,
+        "threshold_used": thresh_adjusted,
         "singular_values": S,
-        "signal_singular_values": S_signal
+        "explained_variance_raw": np.cumsum(S2) / np.sum(S2),
+        "T": T,
+        "total_cols": total_cols,
+        "n_outcomes": n_outcomes
     }
+    
+    diagnostics["noise_variance_estimate"] = sigma_noise_sq_est
+    diagnostics["noise_sigma_hat"] = np.sqrt(sigma_noise_sq_est)
+    diagnostics["tail_fraction_used"] = tail_frac
+    diagnostics["denoised_singular_values"] = np.sqrt(S2_denoised)
+    diagnostics["marchenko_pastur_scale"] = scale_factor
 
     return r_hat, diagnostics
 
@@ -351,7 +355,7 @@ def build_low_cond_set_greedy_robust(treatment_ts, X, n_outcomes, gram_threshold
         estimated_rank, _ = estimate_rank_robust(X, n_outcomes)
         base_need = estimated_rank + 1
         noise_buffer = (robust_cv ** 2) * estimated_rank
-        max_capacity = np.clip(np.sqrt(len(treatment_ts)) * max(1.0, 1.5 / np.log(base_need)), a_min=2 * estimated_rank + 1, a_max=50)  # Damps if high rank
+        max_capacity = 6 # np.clip(np.sqrt(len(treatment_ts)) * max(1.0, 1.5 / np.log(base_need)), a_min=2 * estimated_rank + 1, a_max=50)  # Damps if high rank
         max_donors = np.clip(np.ceil(base_need + noise_buffer), a_min=base_need, a_max=max_capacity)
     
     T, total_cols = X.shape
@@ -494,99 +498,140 @@ def fast_synthetic_control_fitting(treated_pre_intervention, control_pre_interve
     return result.x
 
 """
-Calculates a single "Impact Score" to identify models with no effect.
-The score combines the p-value with a penalty for how far the
-observed ratio deviates from the ideal of 1.0.
+Finite-sample robust power estimator for smooth mean-shift
+treatment effects in SCM.
 
-Calculates the p-value across multiple outcomes by comparing the
-post-intervention to pre-intervention RMSPE ratio using a block bootstrap.
+Statistic:
+    T = mean(post gaps) / (sd(pre gaps) / sqrt(T_post))
 
-The p-value represents the probability that the observed increase in RMSPE
-could have occurred by chance if the underlying process had not changed.
-
-Args:
-    data_pre (pd.DataFrame): DataFrame with pre-intervention data.
-                                Must contain 'outcome', 'timeid', and 'value' columns.
-    data_post (pd.DataFrame): DataFrame with post-intervention data.
-                                Must contain 'outcome', 'timeid', and 'value' columns.
-    n_bootstraps (int): The number of bootstrap samples to generate.
-    alpha (float): A tuning parameter controlling the severity of the
-                                penalty for ratios not equal to 1. Higher alpha
-                                means a stricter penalty.
+Inference:
+    Pre-period-only circular block bootstrap.
 
 Returns:
-    float: A score between 0 and 1. Higher is better (stronger
-                                evidence of no effect).
+    power_by_outcome, aggregate_power
+
+Interpretation:
+
+🔴 0-10% — Effect statistically invisible
+Detection is extremely unlikely.
+Effect is too small, post period too short, or statistic is misaligned.
+Common for RMSPE-ratio under smooth, stable effects.
+Honest but uninformative.
+
+🟠 10-30% — Weak detectability
+Effect exists but rarely distinguishable from noise.
+High sensitivity to sample path and serial correlation.
+Typical for variance-based tests in well-behaved SCMs.
+
+🟡 30-50% — Borderline informativeness
+Detection roughly a coin flip.
+Small perturbations flip inference.
+Dangerous regime if over-interpreted.
+→ Consider: longer post-period, multiple outcomes, 
+   or treat as exploratory rather than confirmatory.
+
+🟢 50-70% — Moderate, honest power (Ideal DGP sweet spot)
+
+Effect detected more often than not.
+SCM extrapolates smoothly; uncertainty remains.
+Indicates realistic, finite-sample causal inference.
+Signals methodological maturity.
+
+🟢🟢 70-85% — Strong detectability
+Effect reliably detected.
+Requires sizable effect, longer post period, or aligned statistic.
+Convincing but still credible.
+
+🔵 85-95% — Near-deterministic detection
+Effect almost always detected.
+Triggers scrutiny: check conditioning and null construction.
+Must be carefully justified.
+→ Verify: No post-period leakage? Donor pool large enough?
+   Pre-trends genuinely parallel? Effect isn't mechanical?
+
+🚨 95-100% — Suspicious
+Inference behaves like classification, not statistics.
+Often indicates leakage, misspecified null, or overfitting.
+Red flag in SCM simulations.
 """
-def block_bootstrap_rmspe_ratio_vectorized(data_pre, data_post, n_bootstraps=1000, alpha=2.0):
-    all_observed_ratio = []
-    all_p_values = []
-    unique_outcomes = data_pre['outcome'].unique()
+def estimate_scm_power_mean_shift(
+    data_pre,
+    data_post,
+    effect_sizes_sd_per_outcome,          # standardized effects (Cohen's d per outcome)
+    n_sim=1000,
+    sig_level=0.05,
+    min_block_length=3,
+    aggregate="min"
+):
+    rng = np.random.default_rng()
+    outcomes = data_pre["outcome"].unique()
 
-    for outcome in unique_outcomes:
-        pre_values = data_pre[data_pre['outcome'] == outcome]['value'].to_numpy()
-        post_values = data_post[data_post['outcome'] == outcome]['value'].to_numpy()
+    if len(effect_sizes_sd_per_outcome) != len(outcomes):
+        raise ValueError("effect_sizes must match number of outcomes.")
 
-        if len(pre_values) == 0: continue
+    power_by_outcome = {}
+
+    for i, outcome in enumerate(outcomes):
+        # Extract data
+        pre = data_pre.loc[data_pre["outcome"] == outcome, "value"].to_numpy()
+        post = data_post.loc[data_post["outcome"] == outcome, "value"].to_numpy()
+
+        T_pre, T_post = len(pre), len(post)
+
+        if T_pre < 5 or T_post < 2:
+            power_by_outcome[outcome] = 0.0
+            continue
+
+        # Standardize using pre-period
+        mu = pre.mean()
+        sd = pre.std()
+        if sd == 0:
+            power_by_outcome[outcome] = 0.0
+            continue
+
+        pre_std = (pre - mu) / sd
+
+        # Vectorized circular block bootstrap (KEEP THIS - it's correct and fast)
+        block_len = max(min_block_length, int(math.ceil(T_pre ** (1 / 3))))
+        n_blocks = int(math.ceil(T_post / block_len))
+
+        starts = rng.integers(0, T_pre, size=(n_sim, n_blocks))
+        offsets = np.arange(block_len)
+        indices = (starts[:, :, None] + offsets) % T_pre
+        boot_paths = pre_std[indices].reshape(n_sim, -1)[:, :T_post]
+
+        # H0: No effect
+        mean_h0 = boot_paths.mean(axis=1)
         
-        # 1. Calculate the single observed RMSPE ratio (same as before)
-        observed_pre_rmspe = np.sqrt(np.mean(pre_values**2))
-        observed_post_rmspe = np.sqrt(np.mean(post_values**2))
-        observed_ratio = observed_post_rmspe / observed_pre_rmspe if observed_pre_rmspe != 0 else np.inf
-
-        # 2. Setup for vectorization
-        combined_values = np.concatenate([pre_values, post_values])
-        n_combined = len(combined_values)
-        n_pre = len(pre_values)
-
-        block_length = math.ceil(n_combined**(1/3))
-        if block_length < 1: block_length = 1
-        elif len(post_values) < 3: block_length = 1
+        # FIX: Correct test statistic with proper denominator
+        # Since pre_std has unit variance, sd = 1.0
+        stat_h0 = mean_h0 / (1.0 / np.sqrt(T_post))
         
-        num_blocks_to_draw = math.ceil(n_combined / block_length)
+        # Critical value
+        crit = np.quantile(stat_h0, 1 - sig_level)
 
-        # 3. Generate ALL random starting indices for ALL bootstraps at once
-        # This creates a 2D array of shape: (n_bootstraps, num_blocks_to_draw)
-        start_indices = np.random.randint(
-            0, n_combined - block_length + 1, 
-            size=(n_bootstraps, num_blocks_to_draw)
-        )
+        # H1: Effect present (standardized)
+        delta = effect_sizes_sd_per_outcome[i]
+        boot_paths_h1 = boot_paths + delta
+        mean_h1 = boot_paths_h1.mean(axis=1)
+        stat_h1 = mean_h1 / (1.0 / np.sqrt(T_post))
 
-        # 4. Create ALL bootstrapped series at once using advanced indexing
-        # This is the most complex step, but it's extremely fast.
-        # It builds a giant index matrix to pull values from the original series.
-        block_offsets = np.arange(block_length)
-        # Broadcasting creates a 3D index matrix: (n_bootstraps, num_blocks, block_length)
-        indices_3d = start_indices[:, :, np.newaxis] + block_offsets
-        # Flatten the blocks and grab the values
-        bootstrapped_series_full = combined_values[indices_3d].reshape(n_bootstraps, -1)
-        # Trim to the correct length
-        bootstrapped_series = bootstrapped_series_full[:, :n_combined]
+        # Power = P(reject H0 | H1 true)
+        power_by_outcome[outcome] = np.mean(stat_h1 >= crit)
 
-        # 5. Calculate RMSPE ratios for ALL bootstraps in a vectorized way
-        boot_pre_matrix = bootstrapped_series[:, :n_pre]
-        boot_post_matrix = bootstrapped_series[:, n_pre:]
-
-        boot_pre_rmspes = np.sqrt(np.mean(boot_pre_matrix**2, axis=1))
-        boot_post_rmspes = np.sqrt(np.mean(boot_post_matrix**2, axis=1))
-        
-        # Handle division by zero for all bootstraps at once
-        bootstrap_ratios = np.full(n_bootstraps, np.inf)
-        valid_mask = boot_pre_rmspes != 0
-        bootstrap_ratios[valid_mask] = boot_post_rmspes[valid_mask] / boot_pre_rmspes[valid_mask]
-        
-        # 6. Calculate the p-value
-        p_value = np.mean(bootstrap_ratios >= observed_ratio)
-        all_observed_ratio.append(observed_ratio)
-        all_p_values.append(p_value)
-
-    # The core of the penalty is the absolute distance from the ideal ratio of 1.0
-    ratio_penalty = np.exp(-alpha * abs(np.min(all_observed_ratio) - 1))
+    # Aggregation
+    vals = np.array(list(power_by_outcome.values()))
     
-    # The final score is one minus the p-value modulated by the ratio penalty
-    score = 1 - np.min(all_p_values) * ratio_penalty
+    if aggregate == "mean":
+        agg = vals.mean()
+    elif aggregate == "min":
+        agg = vals.min()
+    elif aggregate == "max":
+        agg = vals.max()
+    else:
+        agg = None
 
-    return score
+    return power_by_outcome, agg
 
 """
 
@@ -695,6 +740,7 @@ def search(
     save_solution_period_error: type_save_solution_period_error = 'pre_intervention',
     save_solution_maximum_error: float = None,
     maximum_gram_cond_pre: float = 100.0,
+    effect_sizes_sd_per_outcome: list = None,
     alpha_exponential_decay: float = 0.00,
     optuna_optimization_target: type_optuna_optimization_target = 'pre_intervention',
     optuna_number_trials: int = 1000,
@@ -795,7 +841,7 @@ def search(
         
     if not isinstance(maximum_gram_cond_pre, float) or maximum_gram_cond_pre <= 0:
         raise ValueError(f"maximum_gram_cond_pre must be a positive real, got {maximum_gram_cond_pre}")
-        
+
     if not isinstance(alpha_exponential_decay, float) or alpha_exponential_decay < 0:
         raise ValueError(f"alpha_exponential_decay must be zero or a positive real, got {alpha_exponential_decay}")
 
@@ -863,6 +909,12 @@ def search(
 
     treatment_unitid = all_units[all_units['treatment'] == 1]['unitid'].iloc[0]
     outcomes = all_units['outcome'].sort_values().unique().tolist()
+
+    if effect_sizes_sd_per_outcome  is None:
+        effect_sizes_sd_per_outcome = np.repeat(0.4, len(outcomes)).tolist() # Moderate effect sd
+    elif effect_sizes_sd_per_outcome is not None and not isinstance(effect_sizes_sd_per_outcome, list) and len(effect_sizes_sd_per_outcome) != len(outcomes):
+        raise ValueError(f"effect_sizes_sd_per_outcome must be a positive real, got {effect_sizes_sd_per_outcome}")
+    
     # timeids = all_units['timeid'].sort_values().unique().tolist()
     timeid_pre_intervention = all_units[all_units['pre_intervention'] == 1]['timeid'].sort_values().unique().tolist()
     timeid_post_intervention = all_units[all_units['pre_intervention'] == 0]['timeid'].sort_values().unique().tolist()
@@ -991,7 +1043,7 @@ def search(
     scm_donor_selection_candidate_units_data['error_valid'] = None
     scm_donor_selection_candidate_units_data['error_pre_intervention'] = None
     scm_donor_selection_candidate_units_data['error_post_intervention'] = None
-    scm_donor_selection_candidate_units_data['impact_score'] = None
+    scm_donor_selection_candidate_units_data['stat_power'] = None
     scm_donor_selection_candidate_units_data['gram_cond_pre'] = None
     scm_donor_selection_candidate_units_data.to_csv(scm_donor_selection_candidate_units_data_file_path, mode='w', header=True, index=False)
 
@@ -1110,22 +1162,24 @@ def search(
 
             if (save_solution_period_error == "pre_intervention" and error_pre_intervention < save_solution_maximum_error):
                 np.random.seed(attempt + seed) 
-                impact_score = block_bootstrap_rmspe_ratio_vectorized(
+                _, stat_power = estimate_scm_power_mean_shift(
                     aggregated3_diff_normalized_pre,
                     aggregated3_diff_normalized_post,
-                    n_bootstraps=1000
+                    effect_sizes_sd_per_outcome=effect_sizes_sd_per_outcome,
+                    n_sim=1000
                 )
             elif (save_solution_period_error == "validation_folder" and error_valid < save_solution_maximum_error):
                 np.random.seed(attempt + seed) 
-                impact_score = block_bootstrap_rmspe_ratio_vectorized(
+                _, stat_power = estimate_scm_power_mean_shift(
                     aggregated3_diff_normalized_valid,
                     aggregated3_diff_normalized_post,
-                    n_bootstraps=1000
+                    effect_sizes_sd_per_outcome=effect_sizes_sd_per_outcome,
+                    n_sim=1000
                 )
             else:
-                impact_score = float('inf')
+                stat_power = float('inf')
 
-            return error_train, error_valid, error_pre_intervention, error_post_intervention, impact_score
+            return error_train, error_valid, error_pre_intervention, error_post_intervention, stat_power
 
         def eval_metric_ipw(self, preds):
             """
@@ -1137,8 +1191,8 @@ def search(
             if any(p == 1 for p in preds):
                 error_valid = float('inf')
                 error_pre_intervention = float('inf')
-                impact_score = float('inf')
-                return error_valid, error_pre_intervention, impact_score
+                stat_power = float('inf')
+                return error_valid, error_pre_intervention, stat_power
             
             # Calculate Inverse Probability Weights (IPW). The formula ps / (1 - ps) is used to rank control units.
             ipw = pd.DataFrame({
@@ -1161,8 +1215,8 @@ def search(
             if num_units_bigger_min_weight > maximum_num_units_on_attipw_support or num_units_bigger_min_weight == 0:
                 error_valid = float('inf')
                 error_pre_intervention = float('inf')
-                impact_score = float('inf')
-                return error_valid, error_pre_intervention, impact_score
+                stat_power = float('inf')
+                return error_valid, error_pre_intervention, stat_power
             
             ipw = pd.concat([ipw[ipw['treatment'] != 0], ipw[ipw['treatment'] == 0].sort_values(['weight', 'id'], ascending=[False, True])[0:num_units_bigger_min_weight]], ignore_index=True)
 
@@ -1178,13 +1232,13 @@ def search(
             if len(donor_unitids) < minimum_donor_selection:
                 error_valid = float('inf')
                 error_pre_intervention = float('inf')
-                impact_score = float('inf')
-                return error_valid, error_pre_intervention, impact_score
+                stat_power = float('inf')
+                return error_valid, error_pre_intervention, stat_power
 
             # Uses cache to speed up the process
             combination_tuple = tuple(sorted(donor_unitids))
             if combination_tuple in estimated_solutions:
-                (error_valid, error_pre_intervention, impact_score) = estimated_solutions[combination_tuple]
+                (error_valid, error_pre_intervention, stat_power) = estimated_solutions[combination_tuple]
             else:
                 data2 = datat[datat['unitid'].isin([treatment_unitid] + list(donor_unitids))].copy()
                 treatment_df = data2[(data2['treatment'] == 1) & (data2['timeid'].isin(self.timeid_train))]
@@ -1202,13 +1256,13 @@ def search(
                 if len(selected_donors) < minimum_donor_selection:
                     error_valid = float('inf')
                     error_pre_intervention = float('inf')
-                    impact_score = float('inf')
-                    return error_valid, error_pre_intervention, impact_score
+                    stat_power = float('inf')
+                    return error_valid, error_pre_intervention, stat_power
                 
                 # Uses cache to speed up the process
                 combination_tuple2 = tuple(sorted(donor_unitids[selected_donors]))
                 if combination_tuple2 in estimated_solutions:
-                    (error_valid, error_pre_intervention, impact_score) = estimated_solutions[combination_tuple2]
+                    (error_valid, error_pre_intervention, stat_power) = estimated_solutions[combination_tuple2]
                 else:
                     data2 = data2[(data2['treatment'] != 0) | (data2['unitid'].isin(donor_unitids[selected_donors]))]
 
@@ -1241,7 +1295,7 @@ def search(
                     # Uses cache to speed up the process
                     combination_tuple3 = tuple(sorted(control_unit_ids))
                     if combination_tuple3 in estimated_solutions:
-                        (error_valid, error_pre_intervention, impact_score) = estimated_solutions[combination_tuple3]
+                        (error_valid, error_pre_intervention, stat_power) = estimated_solutions[combination_tuple3]
                     else:                    
                         weight_mapping = dict(zip(control_unit_ids, optimal_weights))
                         filtered_weights = {unit: weight for unit, weight in weight_mapping.items() if weight > 0.1}
@@ -1261,7 +1315,7 @@ def search(
 
                         # Evaluate the performance of this candidate donor pool.
                         data = pre_intervention_scaling(data=data2, train_period=self.timeid_train, valid_period=self.timeid_valid)
-                        error_train, error_valid, error_pre_intervention, error_post_intervention, impact_score = self.evaluate_outcomes_metric(data=data)
+                        error_train, error_valid, error_pre_intervention, error_post_intervention, stat_power = self.evaluate_outcomes_metric(data=data)
                         
                         gram_cond_max = calculate_gram_cond_by_shape(df = data[(data['treatment'] == 0) & (data['timeid'].isin(self.timeid_train + self.timeid_valid))])
                         if gram_cond_max == float('inf'):
@@ -1287,20 +1341,20 @@ def search(
                             data['error_valid'] = round(error_valid, 3)
                             data['error_pre_intervention'] = round(error_pre_intervention, 3)
                             data['error_post_intervention'] = round(error_post_intervention, 3)
-                            data['impact_score'] = round(impact_score, 4)
+                            data['stat_power'] = round(stat_power, 4)
                             data['gram_cond_pre'] = round(gram_cond_max, 1)
-                            columns = ['outcome', 'timeid', 'value', 'treatment', 'weight', 'unitid', 'valor_m_weight', 'id', 'cycle', 'trial', 'solution_id', 'num_units_on_attipw_support_train', 'gram_cond_train', 'max_weight_train', 'error_train', 'error_valid', 'error_pre_intervention', 'error_post_intervention', 'impact_score', 'gram_cond_pre']
+                            columns = ['outcome', 'timeid', 'value', 'treatment', 'weight', 'unitid', 'valor_m_weight', 'id', 'cycle', 'trial', 'solution_id', 'num_units_on_attipw_support_train', 'gram_cond_train', 'max_weight_train', 'error_train', 'error_valid', 'error_pre_intervention', 'error_post_intervention', 'stat_power', 'gram_cond_pre']
                             data[columns].to_csv(scm_donor_selection_candidate_units_data_file_path, mode='a', header=False, index=False)
 
                             solution_id = solution_id + 1
 
                         # Save in cache the current found solution and its simplified version
                         if current_combination_tuple and current_combination_tuple not in estimated_solutions:
-                            estimated_solutions[current_combination_tuple] = (error_valid, error_pre_intervention, impact_score)
+                            estimated_solutions[current_combination_tuple] = (error_valid, error_pre_intervention, stat_power)
 
             attempt = attempt + 1
 
-            return error_valid, error_pre_intervention, impact_score
+            return error_valid, error_pre_intervention, stat_power
 
     # MAIN TRAINING LOOP
     # This outer loop performs Cross-Temporal Validation.
@@ -1346,24 +1400,24 @@ def search(
             It calculates the "Causal Fitness" score and updates the best scores found so far.
             dtrain is not used. The incapsulation is violated to make it performant.
             """
-            global current_error_valid, current_error_pre_intervention, current_impact_score
+            global current_error_valid, current_error_pre_intervention, current_stat_power
 
-            error_valid, error_pre_intervention, impact_score = dataset.eval_metric_ipw(preds)
+            error_valid, error_pre_intervention, stat_power = dataset.eval_metric_ipw(preds)
 
             if current_error_valid > error_valid:
                 current_error_valid = error_valid
                 current_error_pre_intervention = error_pre_intervention
-                current_impact_score = impact_score
+                current_stat_power = stat_power
 
             return 'causal_fitness', error_valid
 
         class training_callback(xgb.callback.TrainingCallback):
             """A callback to reset the error at the beginning of each training run."""
             def before_training(self, model):
-                global current_error_valid, current_error_pre_intervention, current_impact_score
+                global current_error_valid, current_error_pre_intervention, current_stat_power
                 current_error_valid = float('inf')
                 current_error_pre_intervention = float('inf')
-                current_impact_score = float('inf')
+                current_stat_power = float('inf')
 
                 return model
 
