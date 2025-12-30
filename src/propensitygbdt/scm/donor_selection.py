@@ -812,7 +812,7 @@ def search(
     if not isinstance(maximum_num_units_on_attipw_support, int) or maximum_num_units_on_attipw_support <= 0:
         raise ValueError(f"maximum_num_units_on_attipw_support must be a positive integer, got {maximum_num_units_on_attipw_support}")
 
-    if maximum_gram_cond_per_outcome_train is not None and (not isinstance(maximum_gram_cond_per_outcome_train, float) or maximum_gram_cond_per_outcome_train <= 0):
+    if maximum_gram_cond_per_outcome_train is not None and any(not isinstance(x, float) or x <= 0 for x in maximum_gram_cond_per_outcome_train):
         raise ValueError(f"maximum_gram_cond_per_outcome_train must be a positive real, got {maximum_gram_cond_per_outcome_train}")
 
     if not isinstance(minimum_donor_selection, int) or minimum_donor_selection <= 0:
@@ -832,10 +832,10 @@ def search(
     if save_solution_period_error not in valid_options:
         raise ValueError(f"Invalid mode: '{save_solution_period_error}'. Expected one of: {valid_options}")
 
-    if save_solution_maximum_error is not None and not isinstance(save_solution_maximum_error, float) and save_solution_maximum_error <= 0:
+    if save_solution_maximum_error is not None and any(not isinstance(x, float) or x <= 0 for x in save_solution_maximum_error):
         raise ValueError(f"save_solution_maximum_error must be a positive real, got {save_solution_maximum_error}")
 
-    if maximum_gram_cond_per_outcome_pre is not None and (not isinstance(maximum_gram_cond_per_outcome_pre, float) or maximum_gram_cond_per_outcome_pre <= 0):
+    if maximum_gram_cond_per_outcome_pre is not None and any(not isinstance(x, float) or x <= 0 for x in maximum_gram_cond_per_outcome_pre):
         raise ValueError(f"maximum_gram_cond_per_outcome_pre must be a positive real, got {maximum_gram_cond_per_outcome_pre}")
 
     if not isinstance(alpha_exponential_decay, float) or alpha_exponential_decay < 0:
@@ -986,25 +986,27 @@ def search(
             self.full_data = data.copy()
             self.full_data.drop('weight', axis=1, inplace=True)
             self.full_data2 = data.copy()
-           
+                      
+            treatment_df_pre = data[(data['treatment'] == 1) & (data['timeid'].isin(timeid_train + timeid_valid))]
+            pivot_treatment_pre = treatment_df_pre.pivot(index='timeid', columns=['outcome'], values='value')
+            treatment_ts_pre = pivot_treatment_pre.values
+            self.snr_pre = estimate_snr_per_outcome(treatment_ts_pre)
+            self.ts_pre_length = len(treatment_ts_pre)
+            
             if maximum_gram_cond_per_outcome_pre is None:
-                treatment_df_pre = data[(data['treatment'] == 1) & (data['timeid'].isin(timeid_train + timeid_valid))]
-                pivot_treatment_pre = treatment_df_pre.pivot(index='timeid', columns=['outcome'], values='value')
-                treatment_ts_pre = pivot_treatment_pre.values
-                self.snr_pre = estimate_snr_per_outcome(treatment_ts_pre)
-                self.ts_pre_length = len(treatment_ts_pre)
                 self.gram_thresholds_per_outcome_pre = np.array([
                     gram_cond_threshold(self.ts_pre_length, self.snr_pre[m]) for m in range(len(outcomes))
                 ])
             else:
                 self.gram_thresholds_per_outcome_pre = maximum_gram_cond_per_outcome_pre
 
+            treatment_df_train = data[(data['treatment'] == 1) & (data['timeid'].isin(timeid_train + timeid_valid))]
+            pivot_treatment_train = treatment_df_train.pivot(index='timeid', columns=['outcome'], values='value')
+            treatment_ts_train = pivot_treatment_train.values
+            self.snr_train = estimate_snr_per_outcome(treatment_ts_train)
+            self.ts_train_length = len(treatment_ts_train)
+
             if maximum_gram_cond_per_outcome_train is None:
-                treatment_df_train = data[(data['treatment'] == 1) & (data['timeid'].isin(timeid_train + timeid_valid))]
-                pivot_treatment_train = treatment_df_train.pivot(index='timeid', columns=['outcome'], values='value')
-                treatment_ts_train = pivot_treatment_train.values
-                self.snr_train = estimate_snr_per_outcome(treatment_ts_train)
-                self.ts_train_length = len(treatment_ts_train)
                 self.gram_thresholds_per_outcome_train = np.array([
                     gram_cond_threshold(self.ts_train_length, self.snr_train[m]) for m in range(len(outcomes))
                 ])
