@@ -36,24 +36,7 @@
 // for each outcome is standardized and rescaled using the statistics of the
 // corresponding treated unit's pre-treatment series before the likelihood is evaluated.
 // -----------------------------------------------------------------------------
-functions {
-  // Optimized vectorized Normalized Gini coefficient (0 to 1 scale)
-  real normalized_gini_simplex(vector y) {
-    int n = num_elements(y);
-    vector[n] y_sorted;
-    vector[n] idx;
-    
-    if (n == 0) reject("Gini requires n > 0");
-    if (n == 1) return 0.0; // A single unit has 100% weight, but variance is 0. Conventionally 0 or 1, but 0 is safer for penalty logic.
-    
-    y_sorted = sort_asc(y);
-    for (i in 1:n) idx[i] = i;
-    
-    real sum_iy = dot_product(idx, y_sorted);
-    
-    return (2 * sum_iy - (n + 1.0)) / (n - 1.0);
-  }
-  
+functions {  
   // Normalized Herfindahl-Hirschman Index (HHI)
   // Scale: 0.0 (Perfectly Diversified) to 1.0 (Single Unit Concentration)
   real normalized_hhi_simplex(vector w) {
@@ -227,12 +210,20 @@ model {
 
     // 2. Calculate diagnostic correlations and nrmse
     real nrmse_train = sqrt(mean(square(residuals_train / amplitude[k])));
-    real nrmse_val_minus_one = sqrt(mean(square(residuals_val[1:(N_val-2)] / amplitude[k])));
-	real nrmse_terminal = abs(residuals_val[N_val-1] / amplitude[k]);
+	
+	real nrmse_val_minus_two;
+	real nrmse_terminal;
+	if (N_val > 4) {
+		nrmse_val_minus_two = sqrt(mean(square(residuals_val[1:(N_val-2)] / amplitude[k])));
+		nrmse_terminal = sqrt(mean(square(residuals_val[(N_val-1):N_val] / amplitude[k])));	
+	} else {
+		nrmse_val_minus_two = sqrt(mean(square(residuals_val[1:N_val] / amplitude[k])));
+		nrmse_terminal = sqrt(mean(square(residuals_val[1:N_val] / amplitude[k])));	
+	}
 	
     // 3. Add soft constraints by specifying tight priors on these nrmse
     nrmse_train ~ normal(0, tau_nrmse[k]) T[0,];
-    nrmse_val_minus_one ~ normal(0, tau_nrmse[k]) T[0,];
+    nrmse_val_minus_two ~ normal(0, tau_nrmse[k]) T[0,];
 	nrmse_terminal ~ normal(0, tau_nrmse[k]) T[0,];
   }
 }
@@ -254,10 +245,9 @@ generated quantities {
   matrix[N_val, N_outcomes] residuals_val;
   matrix[N_post, N_outcomes] effect_post;
   vector[N_outcomes] nrmse_train;
-  vector[N_outcomes] nrmse_val_minus_one;
+  vector[N_outcomes] nrmse_val_minus_two;
   vector[N_outcomes] nrmse_terminal;
   vector[N_outcomes] nrmse_post;
-  real gini_weight = normalized_gini_simplex(w);
   real hhi_weight = normalized_hhi_simplex(w);
   
   // Structural for raw trends
@@ -265,7 +255,7 @@ generated quantities {
   matrix[N_val, N_outcomes] struc_residuals_val;
   matrix[N_post, N_outcomes] struc_effect_post;
   vector[N_outcomes] struc_nrmse_train;
-  vector[N_outcomes] struc_nrmse_val_minus_one;
+  vector[N_outcomes] struc_nrmse_val_minus_two;
   vector[N_outcomes] struc_nrmse_terminal;
   vector[N_outcomes] struc_nrmse_post;
   
@@ -292,13 +282,23 @@ generated quantities {
     }
 
     nrmse_train[k] = sqrt(mean(square(residuals_train[, k] / amplitude[k])));
-    nrmse_val_minus_one[k] = sqrt(mean(square(residuals_val[1:(N_val-2), k] / amplitude[k])));
-	nrmse_terminal[k] = abs(residuals_val[N_val-1, k]) / amplitude[k];
     nrmse_post[k] = sqrt(mean(square(effect_post[, k] / amplitude[k])));
 
     struc_nrmse_train[k] = sqrt(mean(square(struc_residuals_train[, k] / amplitude[k])));
-    struc_nrmse_val_minus_one[k] = sqrt(mean(square(struc_residuals_val[1:(N_val-2), k] / amplitude[k])));
-    struc_nrmse_terminal[k] = abs(struc_residuals_val[N_val-1, k]) / amplitude[k];
 	struc_nrmse_post[k] = sqrt(mean(square(struc_effect_post[, k] / amplitude[k])));
+	
+	if (N_val > 4) {
+		nrmse_val_minus_two[k] = sqrt(mean(square(residuals_val[1:(N_val-2), k] / amplitude[k])));
+		nrmse_terminal[k] = sqrt(mean(square(residuals_val[(N_val-1):N_val, k] / amplitude[k])));
+
+		struc_nrmse_val_minus_two[k] = sqrt(mean(square(struc_residuals_val[1:(N_val-2), k] / amplitude[k])));
+		struc_nrmse_terminal[k] = sqrt(mean(square(struc_residuals_val[(N_val-1):N_val, k] / amplitude[k])));
+	} else {
+		nrmse_val_minus_two[k] = sqrt(mean(square(residuals_val[1:N_val, k] / amplitude[k])));
+		nrmse_terminal[k] = sqrt(mean(square(residuals_val[1:N_val, k] / amplitude[k])));
+
+		struc_nrmse_val_minus_two[k] = sqrt(mean(square(struc_residuals_val[1:N_val, k] / amplitude[k])));
+		struc_nrmse_terminal[k] = sqrt(mean(square(struc_residuals_val[1:N_val, k] / amplitude[k])));
+	}
   }
 }

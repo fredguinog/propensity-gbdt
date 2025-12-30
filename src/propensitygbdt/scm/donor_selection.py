@@ -53,12 +53,8 @@ import shutil
 import numpy as np
 import pandas as pd
 import math
-import random
 from scipy.optimize import minimize
 from scipy.linalg import qr
-from scipy.linalg import svd
-from scipy.signal import medfilt
-import sys
 from typing import Literal, get_args
 import xgboost as xgb
 xgb.set_config(verbosity=0)
@@ -86,7 +82,7 @@ Args:
 Returns:
     A pandas DataFrame with the Gram condition number for each outcome.
 """
-def calculate_gram_cond_by_shape(df: pd.DataFrame) -> float:
+def calculate_gram_cond_by_shape(df: pd.DataFrame) -> np.ndarray:
     # Ensure the DataFrame is sorted for differencing
     df = df.sort_values(by=['outcome', 'unitid', 'timeid']).reset_index(drop=True)
     # Isolate control units
@@ -121,305 +117,191 @@ def calculate_gram_cond_by_shape(df: pd.DataFrame) -> float:
                 cond_number = cond_r ** 2
             else:
                 cond_number = 1.0
+            if cond_number == float('inf'):
+                cond_number = 9999999.0
             results.append({'outcome': outcome, 'gram_cond': cond_number})
-    return pd.DataFrame(results)['gram_cond'].max()
+    return pd.DataFrame(results)['gram_cond'].to_numpy()
 
 """
-Noise estimation uses Marchenko-Pastur scaling as a heuristic.
-This assumes approximate IID structure after standardization.
-"explained_variance": Soft threshold via variance explained (recommended)
+Robust per-outcome SNR estimator using differenced noise.
 
-Limitations:
-- Not exact for temporally/cross-sectionally correlated data
-- Finite-sample approximation (T < 100)
-- Circular: uses tail SVs to estimate noise in tail
+Signal: median absolute level
+Noise: MAD of first differences (scaled)
 
-For formal rank selection in factor models, consider:
-- Bai & Ng (2002) IC1, IC2, IC3 criteria
-- Onatski (2010) edge distribution test
-- Ahn & Horenstein (2013) eigenvalue ratio tests
+Parameters
+----------
+y_treated : array-like, shape (T, M)
+    Pre-treatment treated outcomes.
+eps : float
+    Numerical floor to prevent division by zero.
 
-This function prioritizes speed and simplicity for simulation studies.
-
-Parameters:
------------
-thresh : float
-    Variance threshold (0.85 = explain 85% of denoised variance)
-    Lower values (0.7-0.8) recommended for very noisy/small-T settings
-adaptive_thresh : bool
-    If True, automatically lower threshold in high-beta regimes
+Returns
+-------
+snr : np.ndarray, shape (M,)
+    Estimated SNR per outcome.
 """
-def estimate_rank_robust(
-    X,
-    n_outcomes,
-    kmax=None,
-    thresh=0.85,
-    adaptive_thresh=True  # auto-adjust threshold based on regime
-):
-    # Shape checks
-    T, total_cols = X.shape
-    J = total_cols // n_outcomes
-    if total_cols != J * n_outcomes:
-        raise ValueError("X columns must equal J * n_outcomes.")
+def estimate_snr_per_outcome(
+    y_treated: np.ndarray,
+    eps: float = 1e-8
+) -> np.ndarray:
+    Y = np.atleast_2d(y_treated)
+    T, M = Y.shape
 
-    if kmax is None:
-        kmax = min(T, total_cols) // 2
+    if T < 3:
+        raise ValueError("Need at least 3 pre-periods for SNR estimation.")
 
-    # Outcome-wise standardization
-    X_std = np.zeros_like(X, dtype=float)
-    for m in range(n_outcomes):
-        start = m * J
-        end = (m + 1) * J
-        block = X[:, start:end]
-        mean = np.mean(block)
-        std = np.std(block)
-        std = std if std > 0 else 1.0
-        X_std[:, start:end] = (block - mean) / std
+    snr = np.zeros(M)
 
-    # SVD
-    U, S, Vt = np.linalg.svd(X_std, full_matrices=False)
-    
-    # Aspect ratio for Gavish-Donoho
-    n, m = T, min(T, total_cols)
-    beta = m / n if n >= m else n / m
-    
-    # Adaptive threshold adjustment for high-noise regimes
-    thresh_adjusted = thresh
-    if adaptive_thresh and beta > 0.7:
-        # High aspect ratio → likely high noise → be more conservative
-        thresh_adjusted = max(0.70, thresh - 0.10)
-    elif adaptive_thresh and T < 15:
-        # Very small T → harder to distinguish signal
-        thresh_adjusted = max(0.75, thresh - 0.05)
+    for m in range(M):
+        ts = Y[:, m]
 
-    # ========================================
-    # Method: Explained Variance (RECOMMENDED for small T)
-    # ========================================
-    # IMPROVED: Use beta-informed noise estimation
-    # Marchenko-Pastur: noise SVs concentrate near sigma*sqrt(n)*sqrt(beta)
-    
-    # Conservative tail: use larger fraction in high-noise regimes
-    # Heuristic: if beta > 0.5, likely few signal components
-    tail_frac = 0.5 if beta > 0.5 else 0.25
-    n_tail = max(2, int(len(S) * tail_frac))
-    noise_sv = S[-n_tail:]
-    
-    # Estimate sigma from tail using Marchenko-Pastur scaling
-    # Expected noise SV ≈ sigma * sqrt(n) * sqrt(beta)
-    scale_factor = np.sqrt(n) * np.sqrt(beta) if beta > 0 else 1.0
-    sigma_hat = np.median(noise_sv) / scale_factor if scale_factor > 0 else np.median(noise_sv)
-    sigma_noise_sq = sigma_hat**2
-    
-    # Denoise: subtract expected noise contribution per SV
-    # For n×m matrix: E[s_i^2] ≈ sigma^2 * n for noise components
-    noise_contribution = sigma_noise_sq * n
-    S2_denoised = np.maximum(S**2 - noise_contribution, 0)
-    
-    if np.sum(S2_denoised) == 0:
-        return 0, {
-            "reason": "all_variance_attributed_to_noise",
-            "noise_var_estimate": sigma_noise_sq,
-            "tail_fraction_used": tail_frac,
-            "singular_values": S
-        }
-    
-    # Cumulative explained variance on denoised spectrum
-    cum_var = np.cumsum(S2_denoised) / np.sum(S2_denoised)
-    
-    r_hat = np.searchsorted(cum_var, thresh_adjusted) + 1
-    r_hat = min(r_hat, kmax, len(S))
-    
-    sigma_noise_sq_est = sigma_noise_sq
-    # ========================================
-    # Diagnostics
-    # ========================================
-    S2 = S**2
-    diagnostics = {
-        "selected_rank": r_hat,
-        "kmax": kmax,
-        "aspect_ratio_beta": beta,
-        "threshold_requested": thresh,
-        "threshold_used": thresh_adjusted,
-        "singular_values": S,
-        "explained_variance_raw": np.cumsum(S2) / np.sum(S2),
-        "T": T,
-        "total_cols": total_cols,
-        "n_outcomes": n_outcomes
-    }
-    
-    diagnostics["noise_variance_estimate"] = sigma_noise_sq_est
-    diagnostics["noise_sigma_hat"] = np.sqrt(sigma_noise_sq_est)
-    diagnostics["tail_fraction_used"] = tail_frac
-    diagnostics["denoised_singular_values"] = np.sqrt(S2_denoised)
-    diagnostics["marchenko_pastur_scale"] = scale_factor
+        # --- Signal: robust scale of levels ---
+        signal = np.median(np.abs(ts))
 
-    return r_hat, diagnostics
+        # --- Noise: robust scale of increments ---
+        diffs = np.diff(ts)
+        mad_diff = np.median(np.abs(diffs - np.median(diffs)))
 
-"""
-Estimates a robust coefficient of variation (CV) for the treated unit's pre-treatment time series,
-handling multiple outcomes. This measure quantifies the relative variability (noise level) in the
-data using a robust approach to inform adaptive buffers in donor selection.
+        # Gaussian-consistent sigma of noise increments
+        sigma_noise = 1.4826 * mad_diff / np.sqrt(2)
 
-The function detrends each outcome series using a median filter to remove low-frequency trends,
-computes residuals, and then calculates a robust CV as the scaled Median Absolute Deviation (MAD)
-normalized by the median absolute residual. The scaling factor 1.4826 ensures consistency with the
-standard deviation under Gaussian assumptions. Results are averaged across outcomes for a single
-scalar estimate.
-
-Fixed: Calculates Noise / Signal.
-Signal = Median of the Trend.
-Noise = MAD of the Residuals.
-
-Parameters:
-treatment_ts : array-like, shape (T_pre, n_outcomes). Pre-treatment time series for the treated
-    unit (one column per outcome).
-n_outcomes : int. Number of outcomes (must match the second dimension of treatment_ts).
-window_fraction : float, optional. Fraction of T_pre to determine the adaptive median filter window
-    size (default: 0.1). The window is clamped to [3, 101] for stability.
-
-Returns:
-robust_cv : float. The average robust CV across all outcomes, used as a noise proxy (e.g.,
-    in max_donors calculation to add buffers for high-noise data).
-"""
-def estimate_robust_cv(treatment_ts, n_outcomes, window_fraction=0.1):
-    """
-
-    """
-    treatment_ts = np.atleast_2d(treatment_ts)
-    T_pre, M = treatment_ts.shape
-    
-    robust_cvs = []
-    # Ensure window is odd and at least 3
-    window = int(window_fraction * T_pre)
-    if window % 2 == 0: window += 1
-    window = max(3, window)
-    
-    for m in range(n_outcomes):
-        ts = treatment_ts[:, m]
-        
-        # 1. Extract Trend (Signal)
-        trend = medfilt(ts, kernel_size=window)
-        
-        # 2. Extract Noise
-        residuals = ts - trend
-        
-        # 3. Calculate Robust Sigma (Noise Level)
-        # 1.4826 converts MAD to Sigma for Gaussian distribution
-        median_resid = np.median(residuals)
-        mad = np.median(np.abs(residuals - median_resid))
-        sigma_robust = 1.4826 * mad
-        
-        # 4. Calculate Signal Magnitude
-        # Use median of absolute TREND, not residuals
-        signal_mag = np.median(np.abs(trend))
-        
-        if signal_mag > 1e-9:
-            robust_cvs.append(sigma_robust / signal_mag)
+        if sigma_noise > eps:
+            snr[m] = (signal / sigma_noise) ** 2
         else:
-            robust_cvs.append(np.inf)
-    
-    return np.max(robust_cvs)
+            snr[m] = (eps / eps) ** 2
+
+    return snr
 
 """
-Builds a low-condition-number donor set via greedy forward selection (scale-invariant robust version).
-Iteratively adds the donor minimizing the prospective max Gram cond (across outcomes)
-on normalized differenced series, using QR orthogonalization for stable cond estimation.
-Differencing removes levels; per-donor standardization of differences removes scales, focusing purely on shape.
-Stops if threshold exceeded or no improvement.
+Adaptive Gram condition number threshold.
 
-Parameters:
------------
-X : array-like, shape (T, K*M)
-    Donor time series matrix (pre-intervention).
-n_outcomes : int
-    Number of outcomes (M) per donor.
-gram_threshold : float, default=100.0
-    Stop if max Gram cond >= this.
+Parameters
+----------
+tpre : int
+    Number of pre-treatment periods.
+snr : float
+    Estimated SNR for the outcome.
+
+Returns
+-------
+threshold : float
+    Maximum admissible Gram condition number.
+"""
+def gram_cond_threshold(
+    tpre: int,
+    snr: float
+) -> float:
+    if tpre <= 0 or snr <= 0:
+        raise ValueError("Invalid inputs.")
+
+    precision = np.sqrt(tpre * snr)
+    trust = precision / (1.0 + precision)
+
+    return float(100.0 * np.exp(1.0 / trust))
+
+"""
+Greedy donor selection with per-outcome Gram condition enforcement.
+
+- Outcome-specific Gram thresholds are computed internally.
+- Stoppage occurs when ANY outcome violates its threshold.
+- No outcome averaging, no geometry leakage, no redundant parameters.
+
+Parameters
+----------
+X : array, shape (T_pre, K * M)
+    Donor pre-treatment series.
+y_treated : array, shape (T_pre, M)
+    Treated unit pre-treatment outcomes.
 max_donors : int, optional
-    Cap on selected donors.
+    Hard cap on number of selected donors.
 seed : int, optional
-    Seed for reproducible shuffling of initial donor order. If None, use natural order.
+    Random seed for reproducibility.
 
-Returns:
---------
-selected_indices : list of int
-    Sorted donor indices.
+Returns
+-------
+selected_indices : list[int]
+    Selected donor indices.
 final_max_cond : float
-    Max Gram cond of the final set.
+    Worst-outcome Gram condition of final donor set.
 """
-def build_low_cond_set_greedy_robust(treatment_ts, X, n_outcomes, gram_threshold=100.0, max_donors=None, seed=None):
+def build_low_cond_set_greedy_robust(
+    X: np.ndarray,
+    gram_thresholds: np.ndarray,
+    M: int,
+    max_donors: int | None = None,
+    seed: int | None = None
+):
     if seed is not None:
         np.random.seed(seed)
-    if max_donors is None:
-        robust_cv = estimate_robust_cv(treatment_ts, n_outcomes)
-        estimated_rank, _ = estimate_rank_robust(X, n_outcomes)
-        base_need = estimated_rank + 1
-        noise_buffer = (robust_cv ** 2) * estimated_rank
-        max_capacity = 6 # np.clip(np.sqrt(len(treatment_ts)) * max(1.0, 1.5 / np.log(base_need)), a_min=2 * estimated_rank + 1, a_max=50)  # Damps if high rank
-        max_donors = np.clip(np.ceil(base_need + noise_buffer), a_min=base_need, a_max=max_capacity)
-    
+
     T, total_cols = X.shape
-    if total_cols % n_outcomes != 0:
-        raise ValueError(f"Total columns in X ({total_cols}) must be divisible by n_outcomes ({n_outcomes}).")
-    K = total_cols // n_outcomes
+
     if T < 2:
-        raise ValueError(f"Insufficient time periods (T={T} < 2) for differencing.")
-   
-    selected_indices = set()
-    available_indices = set(range(K))
-    # Seeded shuffle for reproducibility (if seed provided)
+        raise ValueError("Need at least two pre-periods for differencing.")
+    if total_cols % M != 0:
+        raise ValueError("X columns incompatible with number of outcomes.")
+
+    K = total_cols // M
+
+    selected = set()
+    available = list(range(K))
     if seed is not None:
-        available_list = list(available_indices)
-        np.random.shuffle(available_list)
-        available_indices = set(available_list)
+        np.random.shuffle(available)
+
     final_max_cond = 0.0
-   
-    while available_indices:
+
+    while available:
         best_idx = None
-        best_cond = float('inf')
-       
-        for idx in list(available_indices):
-            temp_selected = selected_indices | {idx}
-            max_gram_cond = 0.0
-            for m in range(n_outcomes):
-                # Extract columns for this outcome from temp donors
-                donor_cols_m = [X[:, j * n_outcomes + m] for j in sorted(temp_selected)]
-                if not donor_cols_m:
+        best_worst_cond = np.inf
+
+        for idx in available:
+            temp = sorted(selected | {idx})
+            worst_cond = 0.0
+            violated = False
+
+            # ---- per-outcome geometry (fail-fast) ----
+            for m in range(M):
+                cols_m = [X[:, j * M + m] for j in temp]
+                Xm = np.column_stack(cols_m)      # (T, |temp|)
+                dXm = np.diff(Xm, axis=0)         # (T-1, |temp|)
+
+                if dXm.shape[1] == 0:
                     continue
-                outcome_X = np.column_stack(donor_cols_m)  # (T, |temp|)
-                diff_outcome = np.diff(outcome_X, axis=0)  # (T-1, |temp|): removes levels, focuses on changes
-                if diff_outcome.shape[1] > 0 and diff_outcome.shape[0] > 0:
-                    # Standardize differences per donor: remove scales, focus purely on shape
-                    # (mean of diffs is already ~0; divide by std for unit variance)
-                    stds = np.std(diff_outcome, axis=0)
-                    # Handle zero std (constant series after diff)
-                    stds[stds == 0] = 1.0  # Treat as unit variance to avoid div-by-zero
-                    diff_normalized = diff_outcome / stds[None, :]  # (T-1, |temp|)
-                    
-                    # Robust cond via QR orthogonalization
-                    _, R, _ = qr(diff_normalized, mode='economic', pivoting=True)
-                    if R.size > 0:
-                        cond_r = np.linalg.cond(R)
-                        cond_m = cond_r ** 2
-                    else:
-                        cond_m = 1.0
-                    max_gram_cond = max(max_gram_cond, cond_m)
-           
-            if max_gram_cond < best_cond:
-                best_cond = max_gram_cond
+
+                stds = np.std(dXm, axis=0)
+                stds[stds == 0.0] = 1.0
+                dXm /= stds[None, :]
+
+                _, R, _ = qr(dXm, mode="economic", pivoting=True)
+                cond_m = np.linalg.cond(R) ** 2 if R.size else 1.0
+
+                # ---- strict per-outcome stoppage ----
+                if cond_m >= gram_thresholds[m]:
+                    violated = True
+                    break
+
+                if cond_m > worst_cond:
+                    worst_cond = cond_m
+
+            if violated:
+                continue
+
+            if worst_cond < best_worst_cond:
+                best_worst_cond = worst_cond
                 best_idx = idx
-       
-        if best_idx is None or best_cond >= gram_threshold:
+
+        # ---- global stoppage ----
+        if best_idx is None:
             break
-       
-        selected_indices.add(best_idx)
-        available_indices.remove(best_idx)
-        final_max_cond = best_cond  # Update to current best
-       
-        if max_donors and len(selected_indices) >= max_donors:
+
+        selected.add(best_idx)
+        available.remove(best_idx)
+        final_max_cond = best_worst_cond
+
+        if max_donors is not None and len(selected) >= max_donors:
             break
-   
-    return sorted(list(selected_indices)), final_max_cond
+
+    return sorted(selected), final_max_cond
 
 """
 Calculates a single set of optimal weights for a synthetic control group
@@ -498,6 +380,96 @@ def fast_synthetic_control_fitting(treated_pre_intervention, control_pre_interve
     return result.x
 
 """
+Theoretical upper bound for admissible pre-period NRMSE.
+
+Parameters
+----------
+snr : float
+    Estimated SNR for the outcome.
+tpre : int
+    Number of pre-treatment periods.
+k_controls : int
+    Number of selected control units.
+
+Returns
+-------
+bound : float
+    Maximum admissible NRMSE.
+"""
+def nrmse_upper_bound(
+    snr: float,
+    tpre: int,
+    k_controls: int,
+    resolution_floor: float = 0.15
+) -> float:
+    if snr < 0 or tpre <= 0 or k_controls >= tpre:
+        raise ValueError("Invalid inputs.")
+
+    noise_bound = (1.0 / np.sqrt(snr + 1.0)) * np.sqrt(1.0 - k_controls / tpre)
+    concentration_bound = 1.0 / np.sqrt(tpre)
+
+    identifiability_floor = max(concentration_bound, noise_bound)
+
+    return max(resolution_floor, identifiability_floor)
+
+"""
+Adaptive lower bound on weights to enforce DGP separation.
+
+Parameters
+----------
+tpre : int
+snr : float
+k_controls : int
+gram_cond : float
+    Current Gram condition number.
+
+Returns
+-------
+w_min : float
+"""
+def w_min_bound(
+    tpre: int,
+    snr: float,
+    k_controls: int,
+    w_min_low: float = 0.01,
+    w_min_high: float = 0.1
+) -> float:
+    if tpre <= 0 or snr <= 0 or k_controls <= 0:
+        raise ValueError("Invalid inputs.")
+
+    precision = np.sqrt(tpre * snr)
+    info = precision / (1.0 + precision)
+
+    w_min_ideal = w_min_low + (w_min_high - w_min_low) * info
+
+    return float(np.clip(w_min_low + w_min_ideal, w_min_low, w_min_high))
+
+"""
+Adaptive upper bound on weights to prevent dominance.
+
+Parameters
+----------
+tpre : int
+k_controls : int
+
+Returns
+-------
+w_max : float
+"""
+def w_max_bound(
+    tpre: int,
+    k_controls: int,
+    min_bound: float = 0.4
+) -> float:
+    if tpre <= 0 or k_controls <= 0:
+        raise ValueError("Invalid inputs.")
+    if min_bound < 0 or min_bound > 1:
+        raise ValueError("min_bound must be between 0 and 1.")
+
+    adaptive_bound = np.sqrt(tpre / k_controls)
+    return float(max(min_bound, min(1.0, adaptive_bound)))
+
+"""
 Finite-sample robust power estimator for smooth mean-shift
 treatment effects in SCM.
 
@@ -560,8 +532,7 @@ def estimate_scm_power_mean_shift(
     effect_sizes_sd_per_outcome,          # standardized effects (Cohen's d per outcome)
     n_sim=1000,
     sig_level=0.05,
-    min_block_length=3,
-    aggregate="min"
+    min_block_length=3
 ):
     rng = np.random.default_rng()
     outcomes = data_pre["outcome"].unique()
@@ -619,19 +590,46 @@ def estimate_scm_power_mean_shift(
         # Power = P(reject H0 | H1 true)
         power_by_outcome[outcome] = np.mean(stat_h1 >= crit)
 
-    # Aggregation
-    vals = np.array(list(power_by_outcome.values()))
-    
-    if aggregate == "mean":
-        agg = vals.mean()
-    elif aggregate == "min":
-        agg = vals.min()
-    elif aggregate == "max":
-        agg = vals.max()
-    else:
-        agg = None
+    return np.array(list(power_by_outcome.values()))
 
-    return power_by_outcome, agg
+"""
+Compare observed per-outcome values against per-outcome adaptive limits.
+
+Stops on any violation.
+
+Parameters
+----------
+observed : array-like, shape (M,)
+    Observed statistics per outcome (e.g., NRMSE, RMSPE, Gram cond).
+limits : array-like, shape (M,)
+    Adaptive admissible limits per outcome.
+strict : bool, default=True
+    If True: violation occurs when observed > limit.
+    If False: allows equality (observed <= limit).
+
+Returns
+-------
+bool
+    True if all outcomes satisfy their limits, False otherwise.
+"""
+def check_per_outcome_limits(
+    observed: np.ndarray,
+    limits: np.ndarray,
+    strict: bool = True
+) -> bool:
+    observed = np.asarray(observed, dtype=float)
+    limits = np.asarray(limits, dtype=float)
+
+    if observed.shape != limits.shape:
+        raise ValueError("observed and limits must have the same shape.")
+
+    if np.any(limits <= 0):
+        raise ValueError("All limits must be positive.")
+
+    if strict:
+        return bool(np.all(observed < limits))
+    else:
+        return bool(np.all(observed <= limits))
 
 """
 
@@ -683,28 +681,28 @@ maximum_ratio_var_treated_var_donor : int, default=10.0
     The max ratio (Var_Treated / Var_Donor) allowed.
 maximum_num_units_on_attipw_support : int, default=50
     Maximum number of control units to select based on IPW ranking before Gram condition selection then fitting SCM.
-maximum_gram_cond_train : float, default=100.0
+maximum_gram_cond_per_outcome_train : float, default=100.0
     Maximum allowable condition number for the Gram matrix of selected donors to ensure 
     linear independence (mitigates multicollinearity).
 minimum_donor_selection : int, default=3
     Minimum number of donor units required to form a valid synthetic control.
-maximum_control_unit_weight_train : float, default=0.5
-    Constraint to ensure no single donor dominates the synthetic control (max weight < 0.5).
+maximum_control_unit_weight_train : float, default=None
+    Constraint to ensure no single donor dominates the synthetic control. None makes the value adaptative.
+minimum_control_unit_weight_train : float, default=None
+    Constraint to ensure no single donor is meaningless. None makes the value adaptative.
 synthetic_control_bias_removal_period : Literal, default='pre_intervention'
     Strategy for centering/scaling control units relative to the treated unit (e.g., based on the full pre-period).
-function_aggregate_outcomes_error : Literal, default='mean'
-    Metric to aggregate errors across multiple outcomes ('mean' or 'max').
 save_solution_period_error : Literal, default='pre_intervention'
     Determines which period's error is checked against `save_solution_maximum_error` to decide if a solution is saved.
 save_solution_maximum_error : float, default=None
     The maximum allowable RMSPE (normalized) for a candidate solution to be saved to disk.
-maximum_gram_cond_pre : float, Defaults to 100.0. The maximum allowable value for the Gram matrix condition number.
+maximum_gram_cond_per_outcome_pre : float, Defaults to 100.0. The maximum allowable value for the Gram matrix condition number.
     This is used as a threshold to detect multicollinearity among control units; solutions exceeding it are flagged.
 alpha_exponential_decay : float, default=0.00
     Decay factor for time-relevance weights; higher values give more weight to recent time periods.
 optuna_optimization_target : Literal, default='pre_intervention'
     The error metric Optuna attempts to minimize ('pre_intervention' or 'validation_folder').
-optuna_number_trials : int, default=1000
+optuna_number_trials : int, default=100
     Number of hyperparameter optimization trials to run per temporal split.
 optuna_timeout_cycle : int, default=900
     Time limit (in seconds) for the Optuna optimization cycle.
@@ -716,7 +714,6 @@ None
     to 'scm_donor_selection_candidate_units_data.csv' within the `workspace_folder`.
 """
 type_synthetic_control_bias_removal_period = Literal['pre_intervention', 'validation_folder', 'last_pre_period_timeid']
-type_function_aggregate_outcomes_error = Literal['mean', 'max']
 type_save_solution_period_error = Literal['pre_intervention', 'validation_folder']
 type_optuna_optimization_target = Literal['pre_intervention', 'validation_folder']
 def search(
@@ -732,18 +729,18 @@ def search(
     seed: int = 111,
     maximum_ratio_var_treated_var_donor: int = 10.0,
     maximum_num_units_on_attipw_support: int = 50,
-    maximum_gram_cond_train: float = 100.0,
-    minimum_donor_selection: int = 3,
-    maximum_control_unit_weight_train: float = 0.5,
+    maximum_gram_cond_per_outcome_train: float = None,
+    minimum_donor_selection: int = 2,
+    maximum_control_unit_weight_train: float = None,
+    minimum_control_unit_weight_train: float = None,
     synthetic_control_bias_removal_period: type_synthetic_control_bias_removal_period = 'pre_intervention',
-    function_aggregate_outcomes_error: type_function_aggregate_outcomes_error = 'mean',
     save_solution_period_error: type_save_solution_period_error = 'pre_intervention',
     save_solution_maximum_error: float = None,
-    maximum_gram_cond_pre: float = 100.0,
+    maximum_gram_cond_per_outcome_pre: float = None,
     effect_sizes_sd_per_outcome: list = None,
     alpha_exponential_decay: float = 0.00,
     optuna_optimization_target: type_optuna_optimization_target = 'pre_intervention',
-    optuna_number_trials: int = 1000,
+    optuna_number_trials: int = 100,
     optuna_timeout_cycle: int = 900
 ):
     # RENAME AND INFORM ERRORS
@@ -815,32 +812,31 @@ def search(
     if not isinstance(maximum_num_units_on_attipw_support, int) or maximum_num_units_on_attipw_support <= 0:
         raise ValueError(f"maximum_num_units_on_attipw_support must be a positive integer, got {maximum_num_units_on_attipw_support}")
 
-    if not isinstance(maximum_gram_cond_train, float) or maximum_gram_cond_train <= 0:
-        raise ValueError(f"maximum_gram_cond_train must be a positive real, got {maximum_gram_cond_train}")
+    if maximum_gram_cond_per_outcome_train is not None and (not isinstance(maximum_gram_cond_per_outcome_train, float) or maximum_gram_cond_per_outcome_train <= 0):
+        raise ValueError(f"maximum_gram_cond_per_outcome_train must be a positive real, got {maximum_gram_cond_per_outcome_train}")
 
     if not isinstance(minimum_donor_selection, int) or minimum_donor_selection <= 0:
         raise ValueError(f"minimum_donor_selection must be a positive integer, got {minimum_donor_selection}")
 
-    if not isinstance(maximum_control_unit_weight_train, float) or maximum_control_unit_weight_train <= 0:
+    if maximum_control_unit_weight_train is not None and (not isinstance(maximum_control_unit_weight_train, float) or maximum_control_unit_weight_train <= 0):
         raise ValueError(f"maximum_control_unit_weight_train must be a positive real, got {maximum_control_unit_weight_train}")
-    
+        
+    if minimum_control_unit_weight_train is not None and (not isinstance(minimum_control_unit_weight_train, float) or minimum_control_unit_weight_train <= 0):
+        raise ValueError(f"minimum_control_unit_weight_train must be a positive real, got {minimum_control_unit_weight_train}")
+
     valid_options = get_args(type_synthetic_control_bias_removal_period)
     if synthetic_control_bias_removal_period not in valid_options:
         raise ValueError(f"Invalid mode: '{synthetic_control_bias_removal_period}'. Expected one of: {valid_options}")
-        
-    valid_options = get_args(type_function_aggregate_outcomes_error)
-    if function_aggregate_outcomes_error not in valid_options:
-        raise ValueError(f"Invalid mode: '{function_aggregate_outcomes_error}'. Expected one of: {valid_options}")
 
     valid_options = get_args(type_save_solution_period_error)
     if save_solution_period_error not in valid_options:
         raise ValueError(f"Invalid mode: '{save_solution_period_error}'. Expected one of: {valid_options}")
-    
+
     if save_solution_maximum_error is not None and not isinstance(save_solution_maximum_error, float) and save_solution_maximum_error <= 0:
         raise ValueError(f"save_solution_maximum_error must be a positive real, got {save_solution_maximum_error}")
-        
-    if not isinstance(maximum_gram_cond_pre, float) or maximum_gram_cond_pre <= 0:
-        raise ValueError(f"maximum_gram_cond_pre must be a positive real, got {maximum_gram_cond_pre}")
+
+    if maximum_gram_cond_per_outcome_pre is not None and (not isinstance(maximum_gram_cond_per_outcome_pre, float) or maximum_gram_cond_per_outcome_pre <= 0):
+        raise ValueError(f"maximum_gram_cond_per_outcome_pre must be a positive real, got {maximum_gram_cond_per_outcome_pre}")
 
     if not isinstance(alpha_exponential_decay, float) or alpha_exponential_decay < 0:
         raise ValueError(f"alpha_exponential_decay must be zero or a positive real, got {alpha_exponential_decay}")
@@ -851,7 +847,7 @@ def search(
 
     if not isinstance(optuna_number_trials, int) or optuna_number_trials <= 0:
         raise ValueError(f"optuna_number_trials must be a positive integer, got {optuna_number_trials}")
-        
+
     if not isinstance(optuna_timeout_cycle, int) or optuna_timeout_cycle <= 0:
         raise ValueError(f"optuna_timeout_cycle must be a positive integer, got {optuna_timeout_cycle}")
 
@@ -864,7 +860,7 @@ def search(
         print("Please ensure the package is correctly installed.")
 
     all_units = all_units[['timeid', 'pre_intervention', 'unitid', 'treatment', 'outcome', 'value']]
-    
+
     all_units_std = all_units.groupby(['unitid', 'treatment', 'outcome']).agg({'value': 'var'}).reset_index()
     control_units_std = pd.merge(all_units_std[all_units_std['treatment'] == 1], all_units_std[all_units_std['treatment'] == 0], how='left', on='outcome')
     control_units_std['acceptable_ratio_var_treated_var_donor'] = np.where(
@@ -877,7 +873,7 @@ def search(
     # MAKE THE PANEL DATA BALANCED BY REMOVING ALL UNITS WHICH HAVE NOT THE SAME NUMBER OF timeids PER outcome EQUAL TO THEN TREATMENT UNIT
     print(all_units.shape)
     all_units = all_units[all_units['value'].notna()]
-    
+
     check_timeid_all_outcome = all_units.groupby(['timeid', 'outcome']).size().unstack(fill_value=0)
     valid_timeids = check_timeid_all_outcome[(check_timeid_all_outcome != 0).all(axis=1)].index.tolist()
     all_units = all_units[all_units['timeid'].isin(valid_timeids)]
@@ -901,7 +897,7 @@ def search(
     print(all_units.groupby(['timeid', 'outcome']).size().unstack(fill_value=0))
     print(all_units.head())
     print(all_units.info())
-    
+
     all_units['timeid_relevance'] = pd.Categorical(all_units['timeid'])
     mapping_timeid = all_units['timeid_relevance'].cat.categories
     all_units['timeid_relevance'] = all_units['timeid_relevance'].cat.codes
@@ -914,7 +910,7 @@ def search(
         effect_sizes_sd_per_outcome = np.repeat(0.4, len(outcomes)).tolist() # Moderate effect sd
     elif effect_sizes_sd_per_outcome is not None and not isinstance(effect_sizes_sd_per_outcome, list) and len(effect_sizes_sd_per_outcome) != len(outcomes):
         raise ValueError(f"effect_sizes_sd_per_outcome must be a positive real, got {effect_sizes_sd_per_outcome}")
-    
+
     # timeids = all_units['timeid'].sort_values().unique().tolist()
     timeid_pre_intervention = all_units[all_units['pre_intervention'] == 1]['timeid'].sort_values().unique().tolist()
     timeid_post_intervention = all_units[all_units['pre_intervention'] == 0]['timeid'].sort_values().unique().tolist()
@@ -932,99 +928,7 @@ def search(
         })
     ).reset_index()
 
-    # ==============================================================================
-    # START CHANGE: Noise-Adaptive NRMSE Threshold (Proposal 1)
-    # ==============================================================================
-    # 1. Estimate Intrinsic Noise (Sigma_Hat) using MAD of first differences
-    #    Formula: median(|diff - median(diff)|) * 1.4826 (Robust estimator of sigma)
-    def calculate_robust_noise(x):
-        vals = x.values
-        if len(vals) < 2: return 0.0
-        diff = np.diff(vals)
-        mad = np.median(np.abs(diff - np.median(diff)))
-        return mad * 1.4826
-
-    if save_solution_maximum_error is None:
-        noise_estimates = all_units[
-            (all_units['treatment'] == 1) & 
-            (all_units['pre_intervention'] == 1)
-        ].groupby('outcome')['value'].apply(calculate_robust_noise).reset_index(name='sigma_hat')
-
-        # 2. Merge with amplitude to calculate the Noise Ratio (eta)
-        adaptive_df = pd.merge(amplitude, noise_estimates, on='outcome')
-        
-        # 3. Calculate Adaptive Threshold (tau) per outcome
-        #    Formula: tau = sqrt(0.10^2 + (2 * eta)^2)
-        #    This allows a base error of 0.10 plus a tolerance for 2x the intrinsic noise.
-        adaptive_df['eta'] = adaptive_df['sigma_hat'] / adaptive_df['amplitude']
-        adaptive_df['tau'] = np.sqrt(0.10**2 + (2 * adaptive_df['eta'])**2)
-
-        # 4. Aggregate to a single scalar threshold based on the user's config
-        if function_aggregate_outcomes_error == 'mean':
-            adaptive_threshold = adaptive_df['tau'].mean()
-        elif function_aggregate_outcomes_error == 'max':
-            adaptive_threshold = adaptive_df['tau'].max()
-        else:
-            adaptive_threshold = adaptive_df['tau'].mean() # Default fallback
-
-        print("\n--- Adaptive NRMSE Threshold Calculation ---")
-        print(adaptive_df[['outcome', 'amplitude', 'sigma_hat', 'eta', 'tau']])
-        print(f"User Configured Threshold: {save_solution_maximum_error}")
-        print(f"Calculated Adaptive Threshold: {adaptive_threshold}")
-        print("--------------------------------------------\n")
-
-        # 5. Overwrite the threshold variable used in the optimization loop
-        save_solution_maximum_error = adaptive_threshold
-
     all_units.drop('pre_intervention', axis=1, inplace=True)
-
-    def pre_intervention_scaling(data, train_period, valid_period):
-        """
-        APPLY TRANSFORMATIONS TO THE CONTROL TIME SERIE TO GUARRANTEE EXCLUSIVE SHAPE COMPARISON TO THE TREATMENT ONE
-        This function transforms the aggregated control group data using the mean and standard 
-        deviation of the treatment group from the pre-intervation period defined by the parameter period.
-        By handling this scaling and re-centering step explicitly, we simplify the model's task.
-        Instead of having to learn weights that adjust for shape, level and scale, the model can focus
-        solely on identifying control units with similar temporal shape to the treatment unit.
-        """
-        data = data[data['weight'].notna()]
-        # Generate the times series created by the weighted average of the units in the dataframe in the defined period 
-        aggregated = data.groupby(['outcome', 'timeid', 'treatment'], dropna=False).apply(
-            lambda x : pd.Series({
-                'value' : np.ma.filled(np.ma.average(np.ma.masked_invalid(x['value']), weights=x['weight']), fill_value=np.nan)
-            })
-        ).reset_index()
-
-        # Calculate the average and standard deviation of the time series in the given period
-        if synthetic_control_bias_removal_period == 'pre_intervention':
-            standardization = aggregated[aggregated['timeid'].isin(train_period + valid_period)].sort_values(['timeid'], ascending=True).groupby(['outcome', 'treatment'], dropna=False).agg(
-                avg = ('value', lambda x: np.mean(x)),
-                std = ('value', lambda x: np.std(x, ddof=1))
-            ).reset_index()
-        elif synthetic_control_bias_removal_period == 'validation_folder':
-            standardization = aggregated[aggregated['timeid'].isin(train_period + valid_period)].sort_values(['timeid'], ascending=True).groupby(['outcome', 'treatment'], dropna=False).agg(
-                avg = ('value', lambda x: np.mean(x[-len(valid_period):] if len(x) >= len(valid_period) else x)),
-                std = ('value', lambda x: np.std(x, ddof=1))
-            ).reset_index()
-        elif synthetic_control_bias_removal_period == 'last_pre_period_timeid':
-            standardization = aggregated[aggregated['timeid'].isin(train_period + valid_period)].sort_values(['timeid'], ascending=True).groupby(['outcome', 'treatment'], dropna=False).agg(
-                avg = ('value', lambda x: np.mean(x[-1:])),
-                std = ('value', lambda x: np.std(x, ddof=1))
-            ).reset_index()
-        standardization['std'] = np.where((standardization['std'].isna()) | (standardization['std'] == 0.0), 1.0, standardization['std'])
-
-        # Standardize the control times series created by the weighted average of the control unit in the dataframe in the defined period
-        data = pd.merge(data, standardization, on=['outcome', 'treatment'], how='left')
-        data['value'] = np.where(data['treatment'] == 0, (data['value'] - data['avg']) / data['std'], data['value'])
-        data.drop(['avg', 'std'], axis=1, inplace=True)
-
-        # Apply the treatment's time series mean and standard deviation to the standardized control units.
-        # Positioning them in level and amplitude guaranteeing the only difference between them is the time series' shape.
-        data = pd.merge(data, standardization[standardization['treatment'] == 1][['outcome', 'avg', 'std']], on=['outcome'], how='left')
-        data['value'] = np.where(data['treatment'] == 0, (data['value'] * data['std']) + data['avg'], data['value'])
-        data.drop(['avg', 'std'], axis=1, inplace=True)
-
-        return data
 
     treatment = all_units[all_units['treatment'] == 1]
     treatment.loc[:, 'unitid'] = treatment_unitid
@@ -1053,10 +957,14 @@ def search(
         It's responsible for creating the training set, evaluating the IPW-based metric,
         and calculating the outcome metrics for the synthetic control.
         """
-        def __init__(self, data, timeid_train, timeid_valid, timeid_post_intervention):
+        def __init__(self, data, timeid_train, timeid_valid, timeid_post_intervention, state_context, config_context):
             self.timeid_train = timeid_train
             self.timeid_valid = timeid_valid
             self.timeid_post_intervention = timeid_post_intervention
+            
+            # Store contexts for state (counters) and config (hyperparameters)
+            self.state = state_context
+            self.config = config_context
 
             # The article explains that the data is transposed so that units are rows and time periods are features.
             # This is the ideal format for machine learning models like XGBoost.
@@ -1078,8 +986,80 @@ def search(
             self.full_data = data.copy()
             self.full_data.drop('weight', axis=1, inplace=True)
             self.full_data2 = data.copy()
+           
+            if maximum_gram_cond_per_outcome_pre is None:
+                treatment_df_pre = data[(data['treatment'] == 1) & (data['timeid'].isin(timeid_train + timeid_valid))]
+                pivot_treatment_pre = treatment_df_pre.pivot(index='timeid', columns=['outcome'], values='value')
+                treatment_ts_pre = pivot_treatment_pre.values
+                self.snr_pre = estimate_snr_per_outcome(treatment_ts_pre)
+                self.ts_pre_length = len(treatment_ts_pre)
+                self.gram_thresholds_per_outcome_pre = np.array([
+                    gram_cond_threshold(self.ts_pre_length, self.snr_pre[m]) for m in range(len(outcomes))
+                ])
+            else:
+                self.gram_thresholds_per_outcome_pre = maximum_gram_cond_per_outcome_pre
 
-        def evaluate_outcomes_metric(self, data):
+            if maximum_gram_cond_per_outcome_train is None:
+                treatment_df_train = data[(data['treatment'] == 1) & (data['timeid'].isin(timeid_train + timeid_valid))]
+                pivot_treatment_train = treatment_df_train.pivot(index='timeid', columns=['outcome'], values='value')
+                treatment_ts_train = pivot_treatment_train.values
+                self.snr_train = estimate_snr_per_outcome(treatment_ts_train)
+                self.ts_train_length = len(treatment_ts_train)
+                self.gram_thresholds_per_outcome_train = np.array([
+                    gram_cond_threshold(self.ts_train_length, self.snr_train[m]) for m in range(len(outcomes))
+                ])
+            else:
+                self.gram_thresholds_per_outcome_train = maximum_gram_cond_per_outcome_train
+
+        def pre_intervention_scaling(self, data, train_period, valid_period):
+            """
+            APPLY TRANSFORMATIONS TO THE CONTROL TIME SERIE TO GUARRANTEE EXCLUSIVE SHAPE COMPARISON TO THE TREATMENT ONE
+            This function transforms the aggregated control group data using the mean and standard 
+            deviation of the treatment group from the pre-intervation period defined by the parameter period.
+            By handling this scaling and re-centering step explicitly, we simplify the model's task.
+            Instead of having to learn weights that adjust for shape, level and scale, the model can focus
+            solely on identifying control units with similar temporal shape to the treatment unit.
+            """
+            data = data[data['weight'].notna()]
+            # Generate the times series created by the weighted average of the units in the dataframe in the defined period 
+            aggregated = data.groupby(['outcome', 'timeid', 'treatment'], dropna=False).apply(
+                lambda x : pd.Series({
+                    'value' : np.ma.filled(np.ma.average(np.ma.masked_invalid(x['value']), weights=x['weight']), fill_value=np.nan)
+                })
+            ).reset_index()
+
+            # Calculate the average and standard deviation of the time series in the given period
+            if synthetic_control_bias_removal_period == 'pre_intervention':
+                standardization = aggregated[aggregated['timeid'].isin(train_period + valid_period)].sort_values(['timeid'], ascending=True).groupby(['outcome', 'treatment'], dropna=False).agg(
+                    avg = ('value', lambda x: np.mean(x)),
+                    std = ('value', lambda x: np.std(x, ddof=1))
+                ).reset_index()
+            elif synthetic_control_bias_removal_period == 'validation_folder':
+                standardization = aggregated[aggregated['timeid'].isin(train_period + valid_period)].sort_values(['timeid'], ascending=True).groupby(['outcome', 'treatment'], dropna=False).agg(
+                    avg = ('value', lambda x: np.mean(x[-len(valid_period):] if len(x) >= len(valid_period) else x)),
+                    std = ('value', lambda x: np.std(x, ddof=1))
+                ).reset_index()
+            elif synthetic_control_bias_removal_period == 'last_pre_period_timeid':
+                standardization = aggregated[aggregated['timeid'].isin(train_period + valid_period)].sort_values(['timeid'], ascending=True).groupby(['outcome', 'treatment'], dropna=False).agg(
+                    avg = ('value', lambda x: np.mean(x[-1:])),
+                    std = ('value', lambda x: np.std(x, ddof=1))
+                ).reset_index()
+            standardization['std'] = np.where((standardization['std'].isna()) | (standardization['std'] == 0.0), 1.0, standardization['std'])
+
+            # Standardize the control times series created by the weighted average of the control unit in the dataframe in the defined period
+            data = pd.merge(data, standardization, on=['outcome', 'treatment'], how='left')
+            data['value'] = np.where(data['treatment'] == 0, (data['value'] - data['avg']) / data['std'], data['value'])
+            data.drop(['avg', 'std'], axis=1, inplace=True)
+
+            # Apply the treatment's time series mean and standard deviation to the standardized control units.
+            # Positioning them in level and amplitude guaranteeing the only difference between them is the time series' shape.
+            data = pd.merge(data, standardization[standardization['treatment'] == 1][['outcome', 'avg', 'std']], on=['outcome'], how='left')
+            data['value'] = np.where(data['treatment'] == 0, (data['value'] * data['std']) + data['avg'], data['value'])
+            data.drop(['avg', 'std'], axis=1, inplace=True)
+
+            return data
+
+        def evaluate_outcomes_metric(self, data, max_error):
             """
             Evaluates the performance of the synthetic control based on the provided weights.
             The article describes this as evaluating "Causal Fitness", which includes pre-intervention
@@ -1103,11 +1083,7 @@ def search(
             aggregated3_mean_outcome = aggregated3_diff_normalized.groupby(['outcome'], dropna=False).agg({
                 'value' : lambda x: ((x ** 2).mean()) ** 0.5
             }).reset_index()
-            
-            if function_aggregate_outcomes_error == "mean":
-                error_train = aggregated3_mean_outcome['value'].mean()
-            elif function_aggregate_outcomes_error == "max":
-                error_train = aggregated3_mean_outcome['value'].max()
+            error_train = aggregated3_mean_outcome['value'].to_numpy()
 
             # Calculate error on the validation set. This is crucial for early stopping and preventing overfitting.
             aggregated3_diff = aggregated3[aggregated3['timeid'].isin(self.timeid_valid)].sort_values(['outcome', 'timeid', 'treatment'], ascending=True).groupby(['outcome', 'timeid']).agg({
@@ -1120,11 +1096,7 @@ def search(
             aggregated3_mean_outcome = aggregated3_diff_normalized_valid.groupby(['outcome'], dropna=False).agg({
                 'value' : lambda x: ((x ** 2).mean()) ** 0.5
             }).reset_index()
-            
-            if function_aggregate_outcomes_error == "mean":
-                error_valid = aggregated3_mean_outcome['value'].mean()
-            elif function_aggregate_outcomes_error == "max":
-                error_valid = aggregated3_mean_outcome['value'].max()
+            error_valid = aggregated3_mean_outcome['value'].to_numpy()
 
             # Calculate error for the entire pre-treatment period.
             aggregated3_diff = aggregated3[aggregated3['timeid'].isin(self.timeid_train + self.timeid_valid)].sort_values(['outcome', 'timeid', 'treatment'], ascending=True).groupby(['outcome', 'timeid']).agg({
@@ -1137,11 +1109,7 @@ def search(
             aggregated3_mean_outcome = aggregated3_diff_normalized_pre.groupby(['outcome'], dropna=False).agg({
                 'value' : lambda x: ((x ** 2).mean()) ** 0.5
             }).reset_index()
-            
-            if function_aggregate_outcomes_error == "mean":
-                error_pre_intervention = aggregated3_mean_outcome['value'].mean()
-            elif function_aggregate_outcomes_error == "max":
-                error_pre_intervention = aggregated3_mean_outcome['value'].max()
+            error_pre_intervention = aggregated3_mean_outcome['value'].to_numpy()
 
             # Calculate error for the entire post-treatment period.
             aggregated3_diff = aggregated3[aggregated3['timeid'].isin(self.timeid_post_intervention)].sort_values(['outcome', 'timeid', 'treatment'], ascending=True).groupby(['outcome', 'timeid']).agg({
@@ -1154,30 +1122,26 @@ def search(
             aggregated3_mean_outcome = aggregated3_diff_normalized_post.groupby(['outcome'], dropna=False).agg({
                 'value' : lambda x: ((x ** 2).mean()) ** 0.5
             }).reset_index()
-            
-            if function_aggregate_outcomes_error == "mean":
-                error_post_intervention = aggregated3_mean_outcome['value'].mean()
-            elif function_aggregate_outcomes_error == "max":
-                error_post_intervention = aggregated3_mean_outcome['value'].max()
+            error_post_intervention = aggregated3_mean_outcome['value'].to_numpy()
 
-            if (save_solution_period_error == "pre_intervention" and error_pre_intervention < save_solution_maximum_error):
-                np.random.seed(attempt + seed) 
-                _, stat_power = estimate_scm_power_mean_shift(
+            if (self.config['save_solution_period_error'] == "pre_intervention" and check_per_outcome_limits(error_pre_intervention, max_error)):
+                np.random.seed(self.state['attempt'] + seed) 
+                stat_power = estimate_scm_power_mean_shift(
                     aggregated3_diff_normalized_pre,
                     aggregated3_diff_normalized_post,
                     effect_sizes_sd_per_outcome=effect_sizes_sd_per_outcome,
                     n_sim=1000
                 )
-            elif (save_solution_period_error == "validation_folder" and error_valid < save_solution_maximum_error):
-                np.random.seed(attempt + seed) 
-                _, stat_power = estimate_scm_power_mean_shift(
+            elif (self.config['save_solution_period_error'] == "validation_folder" and check_per_outcome_limits(error_valid, max_error)):
+                np.random.seed(self.state['attempt'] + seed) 
+                stat_power = estimate_scm_power_mean_shift(
                     aggregated3_diff_normalized_valid,
                     aggregated3_diff_normalized_post,
                     effect_sizes_sd_per_outcome=effect_sizes_sd_per_outcome,
                     n_sim=1000
                 )
             else:
-                stat_power = float('inf')
+                stat_power = np.full(len(outcomes), float('inf'))
 
             return error_train, error_valid, error_pre_intervention, error_post_intervention, stat_power
 
@@ -1185,13 +1149,11 @@ def search(
             """
             This function implements the ATT/IPW-based ranking.
             It converts the XGBoost predictions (propensity scores) into weights and then selects N donors.
-            """
-            global attempt, solution_id, estimated_solutions
-            
+            """            
             if any(p == 1 for p in preds):
-                error_valid = float('inf')
-                error_pre_intervention = float('inf')
-                stat_power = float('inf')
+                error_valid = np.full(len(outcomes), float('inf'))
+                error_pre_intervention = np.full(len(outcomes), float('inf'))
+                stat_power = np.full(len(outcomes), float('inf'))
                 return error_valid, error_pre_intervention, stat_power
             
             # Calculate Inverse Probability Weights (IPW). The formula ps / (1 - ps) is used to rank control units.
@@ -1213,9 +1175,9 @@ def search(
             num_units_bigger_min_weight = min_weight_observations.shape[0]
 
             if num_units_bigger_min_weight > maximum_num_units_on_attipw_support or num_units_bigger_min_weight == 0:
-                error_valid = float('inf')
-                error_pre_intervention = float('inf')
-                stat_power = float('inf')
+                error_valid = np.full(len(outcomes), float('inf'))
+                error_pre_intervention = np.full(len(outcomes), float('inf'))
+                stat_power = np.full(len(outcomes), float('inf'))
                 return error_valid, error_pre_intervention, stat_power
             
             ipw = pd.concat([ipw[ipw['treatment'] != 0], ipw[ipw['treatment'] == 0].sort_values(['weight', 'id'], ascending=[False, True])[0:num_units_bigger_min_weight]], ignore_index=True)
@@ -1230,39 +1192,52 @@ def search(
             donor_unitids = datat[datat['treatment'] == 0]['unitid'].unique()
             
             if len(donor_unitids) < minimum_donor_selection:
-                error_valid = float('inf')
-                error_pre_intervention = float('inf')
-                stat_power = float('inf')
+                error_valid = np.full(len(outcomes), float('inf'))
+                error_pre_intervention = np.full(len(outcomes), float('inf'))
+                stat_power = np.full(len(outcomes), float('inf'))
                 return error_valid, error_pre_intervention, stat_power
 
             # Uses cache to speed up the process
             combination_tuple = tuple(sorted(donor_unitids))
-            if combination_tuple in estimated_solutions:
-                (error_valid, error_pre_intervention, stat_power) = estimated_solutions[combination_tuple]
+            if combination_tuple in self.state['estimated_solutions']:
+                (error_valid, error_pre_intervention, stat_power) = self.state['estimated_solutions'][combination_tuple]
             else:
                 data2 = datat[datat['unitid'].isin([treatment_unitid] + list(donor_unitids))].copy()
-                treatment_df = data2[(data2['treatment'] == 1) & (data2['timeid'].isin(self.timeid_train))]
-                pivot_treatment = treatment_df.pivot(index='timeid', columns=['outcome'], values='value')
                 donor_df = data2[(data2['treatment'] == 0) & (data2['timeid'].isin(self.timeid_train))].copy()
                 pivot_donor = donor_df.pivot(index='timeid', columns=['unitid', 'outcome'], values='value')
                 selected_donors, gram_cond_train = build_low_cond_set_greedy_robust(
-                    treatment_ts=pivot_treatment.values,
-                    X=pivot_donor.values,
-                    n_outcomes=len(outcomes),
-                    gram_threshold=maximum_gram_cond_train,
-                    seed=attempt+seed
+                    X=pivot_donor.values,                
+                    gram_thresholds=self.gram_thresholds_per_outcome_train,
+                    M=len(outcomes),
+                    seed=self.state['attempt']+seed
                 )
                 
                 if len(selected_donors) < minimum_donor_selection:
-                    error_valid = float('inf')
-                    error_pre_intervention = float('inf')
-                    stat_power = float('inf')
+                    error_valid = np.full(len(outcomes), float('inf'))
+                    error_pre_intervention = np.full(len(outcomes), float('inf'))
+                    stat_power = np.full(len(outcomes), float('inf'))
                     return error_valid, error_pre_intervention, stat_power
+                
+                current_limit_max_weight = self.config['maximum_control_unit_weight_train']
+                if current_limit_max_weight is None:
+                    current_limit_max_weight = w_max_bound(
+                        tpre=self.ts_pre_length,
+                        k_controls=len(selected_donors)
+                    )
+                
+                current_limit_min_weight = self.config['minimum_control_unit_weight_train']
+                if current_limit_min_weight is None:
+                    snr_effective = np.min(self.snr_train)  # worst-case outcome SNR
+                    current_limit_min_weight = w_min_bound(
+                        tpre=self.ts_train_length,
+                        snr=snr_effective,
+                        k_controls=len(selected_donors)
+                    )
                 
                 # Uses cache to speed up the process
                 combination_tuple2 = tuple(sorted(donor_unitids[selected_donors]))
-                if combination_tuple2 in estimated_solutions:
-                    (error_valid, error_pre_intervention, stat_power) = estimated_solutions[combination_tuple2]
+                if combination_tuple2 in self.state['estimated_solutions']:
+                    (error_valid, error_pre_intervention, stat_power) = self.state['estimated_solutions'][combination_tuple2]
                 else:
                     data2 = data2[(data2['treatment'] != 0) | (data2['unitid'].isin(donor_unitids[selected_donors]))]
 
@@ -1294,11 +1269,12 @@ def search(
                     
                     # Uses cache to speed up the process
                     combination_tuple3 = tuple(sorted(control_unit_ids))
-                    if combination_tuple3 in estimated_solutions:
-                        (error_valid, error_pre_intervention, stat_power) = estimated_solutions[combination_tuple3]
+                    if combination_tuple3 in self.state['estimated_solutions']:
+                        (error_valid, error_pre_intervention, stat_power) = self.state['estimated_solutions'][combination_tuple3]
                     else:                    
                         weight_mapping = dict(zip(control_unit_ids, optimal_weights))
-                        filtered_weights = {unit: weight for unit, weight in weight_mapping.items() if weight > 0.1}
+                        filtered_weights = {unit: weight for unit, weight in weight_mapping.items() if weight > current_limit_min_weight}
+                        k_controls = len(filtered_weights.keys())
                         current_combination_tuple = tuple(sorted(filtered_weights.keys()))
                         data2['weight'] = data2['unitid'].map(filtered_weights)
                         data2['weight'] = np.where(data2['treatment'] == 1, 1, data2['weight'])
@@ -1313,57 +1289,70 @@ def search(
                         data2['weight'] = np.where(data2['treatment'] == 0, data2['weight'] / sum_weight_tratamento_0, data2['weight'])
                         current_maximum_control_unit_weight_train = data2[data2['treatment'] == 0]['weight'].max()
 
+                        current_save_solution_error = self.config['save_solution_maximum_error']
+                        if current_save_solution_error is None:
+                            current_save_solution_error = [nrmse_upper_bound(snr=self.snr_pre[m],tpre=self.ts_pre_length,k_controls=k_controls) for m in range(len(outcomes))]
+
                         # Evaluate the performance of this candidate donor pool.
-                        data = pre_intervention_scaling(data=data2, train_period=self.timeid_train, valid_period=self.timeid_valid)
-                        error_train, error_valid, error_pre_intervention, error_post_intervention, stat_power = self.evaluate_outcomes_metric(data=data)
-                        
-                        gram_cond_max = calculate_gram_cond_by_shape(df = data[(data['treatment'] == 0) & (data['timeid'].isin(self.timeid_train + self.timeid_valid))])
-                        if gram_cond_max == float('inf'):
-                            gram_cond_max = 9999999.0
-                            
+                        data = self.pre_intervention_scaling(data=data2, train_period=self.timeid_train, valid_period=self.timeid_valid)
+                        error_train, error_valid, error_pre_intervention, error_post_intervention, stat_power = self.evaluate_outcomes_metric(data=data, max_error=current_save_solution_error)
+
+                        gram_cond_per_outcome_pre = calculate_gram_cond_by_shape(df = data[(data['treatment'] == 0) & (data['timeid'].isin(self.timeid_train + self.timeid_valid))])
+
                         if (current_combination_tuple and len(current_combination_tuple) >= minimum_donor_selection and
-                            current_maximum_control_unit_weight_train < maximum_control_unit_weight_train and
-                            gram_cond_max < maximum_gram_cond_pre and
-                            ((save_solution_period_error == "pre_intervention" and error_pre_intervention < save_solution_maximum_error) or
-                            (save_solution_period_error == "validation_folder" and error_valid < save_solution_maximum_error)) and
-                            current_combination_tuple not in estimated_solutions):
+                            current_maximum_control_unit_weight_train < current_limit_max_weight and
+                            check_per_outcome_limits(gram_cond_per_outcome_pre, self.gram_thresholds_per_outcome_pre) and
+                            ((save_solution_period_error == "pre_intervention" and check_per_outcome_limits(error_pre_intervention, current_save_solution_error)) or
+                            (save_solution_period_error == "validation_folder" and check_per_outcome_limits(error_valid, current_save_solution_error))) and
+                            current_combination_tuple not in self.state['estimated_solutions']):
 
                             # Save the donor units, weights and performance metrics of this viable solution.
                             data = data[data['treatment'] == 0]
                             data['valor_m_weight'] = data['value'] * data['weight']
                             data['cycle'] = cycle
-                            data['trial'] = pruning_trial.number
-                            data['solution_id'] = solution_id
+                            data['trial'] = self.state['current_trial'].number
+                            data['solution_id'] = self.state['solution_id']
                             data['num_units_on_attipw_support_train'] = num_units_bigger_min_weight
                             data['gram_cond_train'] = round(gram_cond_train, 1)
                             data['max_weight_train'] = round(current_maximum_control_unit_weight_train, 2)
-                            data['error_train'] = round(error_train, 3)
-                            data['error_valid'] = round(error_valid, 3)
-                            data['error_pre_intervention'] = round(error_pre_intervention, 3)
-                            data['error_post_intervention'] = round(error_post_intervention, 3)
-                            data['stat_power'] = round(stat_power, 4)
-                            data['gram_cond_pre'] = round(gram_cond_max, 1)
+                            data['error_train'] = round(np.max(error_train), 3)
+                            data['error_valid'] = round(np.max(error_valid), 3)
+                            data['error_pre_intervention'] = round(np.max(error_pre_intervention), 3)
+                            data['error_post_intervention'] = round(np.max(error_post_intervention), 3)
+                            data['stat_power'] = round(np.min(stat_power), 4)
+                            data['gram_cond_pre'] = round(np.max(gram_cond_per_outcome_pre), 1)
                             columns = ['outcome', 'timeid', 'value', 'treatment', 'weight', 'unitid', 'valor_m_weight', 'id', 'cycle', 'trial', 'solution_id', 'num_units_on_attipw_support_train', 'gram_cond_train', 'max_weight_train', 'error_train', 'error_valid', 'error_pre_intervention', 'error_post_intervention', 'stat_power', 'gram_cond_pre']
                             data[columns].to_csv(scm_donor_selection_candidate_units_data_file_path, mode='a', header=False, index=False)
 
-                            solution_id = solution_id + 1
+                            self.state['solution_id'] += 1
 
                         # Save in cache the current found solution and its simplified version
-                        if current_combination_tuple and current_combination_tuple not in estimated_solutions:
-                            estimated_solutions[current_combination_tuple] = (error_valid, error_pre_intervention, stat_power)
+                        if current_combination_tuple and current_combination_tuple not in self.state['estimated_solutions']:
+                            self.state['estimated_solutions'][current_combination_tuple] = (error_valid, error_pre_intervention, stat_power)
 
-            attempt = attempt + 1
+            self.state['attempt'] += 1
 
             return error_valid, error_pre_intervention, stat_power
 
     # MAIN TRAINING LOOP
     # This outer loop performs Cross-Temporal Validation.
-    cycle = 0
-    global attempt, solution_id, estimated_solutions
-    attempt = 0
-    solution_id = 0
-    # EXECUTION CACHE
-    estimated_solutions = dict()
+    cycle = 0    
+    
+    # Init Mutable State Context
+    state_context = {
+        'attempt': 0,
+        'solution_id': 0,
+        'estimated_solutions': dict(),
+        'current_trial': None
+    }
+    
+    # Init Configuration Context
+    config_context = {
+        'maximum_control_unit_weight_train': maximum_control_unit_weight_train,
+        'minimum_control_unit_weight_train': minimum_control_unit_weight_train,
+        'save_solution_maximum_error': save_solution_maximum_error,
+        'save_solution_period_error': save_solution_period_error
+    }
 
     timeid_train_indexes = [timeid_pre_intervention.index(x) + 1 for x in temporal_cross_search_splits]
     for timeid_train_index in timeid_train_indexes:
@@ -1380,7 +1369,9 @@ def search(
             data = all_units,
             timeid_train = timeid_pre_intervention[0:timeid_train_index],
             timeid_valid = timeid_pre_intervention[(timeid_train_index):len(timeid_pre_intervention)],
-            timeid_post_intervention = timeid_post_intervention
+            timeid_post_intervention = timeid_post_intervention,
+            state_context = state_context,
+            config_context = config_context
         )
         
         # Calculate scale_pos_weight to handle class imbalance (one treated unit vs. many controls).
@@ -1403,21 +1394,21 @@ def search(
             global current_error_valid, current_error_pre_intervention, current_stat_power
 
             error_valid, error_pre_intervention, stat_power = dataset.eval_metric_ipw(preds)
-
-            if current_error_valid > error_valid:
+            unique_error = np.max(error_valid)
+            if np.max(current_error_valid) > unique_error:
                 current_error_valid = error_valid
                 current_error_pre_intervention = error_pre_intervention
                 current_stat_power = stat_power
 
-            return 'causal_fitness', error_valid
+            return 'causal_fitness', unique_error
 
         class training_callback(xgb.callback.TrainingCallback):
             """A callback to reset the error at the beginning of each training run."""
             def before_training(self, model):
                 global current_error_valid, current_error_pre_intervention, current_stat_power
-                current_error_valid = float('inf')
-                current_error_pre_intervention = float('inf')
-                current_stat_power = float('inf')
+                current_error_valid = np.full(len(outcomes), float('inf'))
+                current_error_pre_intervention = np.full(len(outcomes), float('inf'))
+                current_stat_power = np.full(len(outcomes), float('inf'))
 
                 return model
 
@@ -1427,12 +1418,11 @@ def search(
             The objective function for Optuna. It defines the search space for hyperparameters
             and runs the XGBoost training with the custom metric and early stopping.
             """
-            global pruning_trial
-            pruning_trial = trial
+            state_context['current_trial'] = trial
 
             # Define the hyperparameter search space for Optuna.
             params = {
-                'seed': attempt + seed,
+                'seed': state_context['attempt'] + seed,
                 'tree_method': 'hist',
                 'objective': 'binary:logistic',
                 'disable_default_eval_metric': True,
@@ -1490,11 +1480,11 @@ def search(
                 return float('inf')
 
             if (optuna_optimization_target == "pre_intervention"):
-                return current_error_pre_intervention
+                return np.max(current_error_pre_intervention)
             elif(optuna_optimization_target == "validation_folder"):
-                return current_error_valid
+                return np.max(current_error_valid)
 
-            return -1.0
+            return float('inf')
 
         # --- 4. Run the Optuna Study ---
         directions=['minimize']

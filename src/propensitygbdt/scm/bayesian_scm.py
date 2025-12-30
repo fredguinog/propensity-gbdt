@@ -193,7 +193,7 @@ def estimate(
     solution_id: int = None,
     period_effect_format: str = '{:.2f}',
     seed: int = 222,
-    nrmse_terminal_over_train: float = 2.0,
+    nrmse_terminal_over_train: float = 2.5,
     length_post_intervention_period: int = None
 ):
     # Set the random seed for NumPy to ensure reproducibility of its random operations.
@@ -744,11 +744,11 @@ def estimate(
                 # Note: plot_forest is somewhat slow. If strict speed is needed, this can be skipped or optimized.
                 az.plot_forest(
                     fit,
-                    var_names=["nrmse_train", "nrmse_val_minus_one", "nrmse_terminal"],
+                    var_names=["nrmse_train", "nrmse_val_minus_two", "nrmse_terminal"],
                     combined=True,
                     figsize=(25, 10),
                     hdi_prob=0.95,
-                    coords={"nrmse_train_dim_0": [idx], "nrmse_val_minus_one_dim_0": [idx], "nrmse_terminal_dim_0": [idx]}
+                    coords={"nrmse_train_dim_0": [idx], "nrmse_val_minus_two_dim_0": [idx], "nrmse_terminal_dim_0": [idx]}
                 )
                 plt.suptitle("Strict Parallel Trends - Predictive NRMSE", fontsize=16)
                 plt.tight_layout()
@@ -757,11 +757,11 @@ def estimate(
 
                 az.plot_forest(
                     fit,
-                    var_names=["struc_nrmse_train", "struc_nrmse_val_minus_one", "struc_nrmse_terminal"],
+                    var_names=["struc_nrmse_train", "struc_nrmse_val_minus_two", "struc_nrmse_terminal"],
                     combined=True,
                     figsize=(25, 10),
                     hdi_prob=0.95,
-                    coords={"struc_nrmse_train_dim_0": [idx], "struc_nrmse_val_minus_one_dim_0": [idx], "struc_nrmse_terminal_dim_0": [idx]}
+                    coords={"struc_nrmse_train_dim_0": [idx], "struc_nrmse_val_minus_two_dim_0": [idx], "struc_nrmse_terminal_dim_0": [idx]}
                 )
                 plt.suptitle("Low-Rank Trends - Structural NRMSE", fontsize=16)
                 plt.tight_layout()
@@ -856,7 +856,7 @@ def estimate(
                 else:
                     # Calculate NRMSE Score (Vectorized)
                     # Uval + abs(Uval - Utrain)
-                    u_val = np.quantile(stan_vars['struc_nrmse_val_minus_one'], 0.975, axis=0) # shape (N_outcomes,)
+                    u_val = np.quantile(stan_vars['struc_nrmse_val_minus_two'], 0.975, axis=0) # shape (N_outcomes,)
                     u_train = np.quantile(stan_vars['struc_nrmse_train'], 0.975, axis=0)
                     scores = u_val + np.abs(u_val - u_train)
                     predictive_reliability_score = np.max(scores)
