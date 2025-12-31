@@ -197,7 +197,7 @@ def gram_cond_threshold(
     precision = np.sqrt(tpre * snr)
     trust = precision / (1.0 + precision)
 
-    return float(100.0 * np.exp(1.0 / trust))
+    return float(500.0 * np.exp(1.0 / trust))
 
 """
 Greedy donor selection with per-outcome Gram condition enforcement.
@@ -445,31 +445,6 @@ def w_min_bound(
     return float(np.clip(w_min_low + w_min_ideal, w_min_low, w_min_high))
 
 """
-Adaptive upper bound on weights to prevent dominance.
-
-Parameters
-----------
-tpre : int
-k_controls : int
-
-Returns
--------
-w_max : float
-"""
-def w_max_bound(
-    tpre: int,
-    k_controls: int,
-    min_bound: float = 0.4
-) -> float:
-    if tpre <= 0 or k_controls <= 0:
-        raise ValueError("Invalid inputs.")
-    if min_bound < 0 or min_bound > 1:
-        raise ValueError("min_bound must be between 0 and 1.")
-
-    adaptive_bound = np.sqrt(tpre / k_controls)
-    return float(max(min_bound, min(1.0, adaptive_bound)))
-
-"""
 Finite-sample robust power estimator for smooth mean-shift
 treatment effects in SCM.
 
@@ -686,8 +661,6 @@ maximum_gram_cond_per_outcome_train : float, default=100.0
     linear independence (mitigates multicollinearity).
 minimum_donor_selection : int, default=3
     Minimum number of donor units required to form a valid synthetic control.
-maximum_control_unit_weight_train : float, default=None
-    Constraint to ensure no single donor dominates the synthetic control. None makes the value adaptative.
 minimum_control_unit_weight_train : float, default=None
     Constraint to ensure no single donor is meaningless. None makes the value adaptative.
 synthetic_control_bias_removal_period : Literal, default='pre_intervention'
@@ -731,7 +704,6 @@ def search(
     maximum_num_units_on_attipw_support: int = 50,
     maximum_gram_cond_per_outcome_train: float = None,
     minimum_donor_selection: int = 2,
-    maximum_control_unit_weight_train: float = None,
     minimum_control_unit_weight_train: float = None,
     synthetic_control_bias_removal_period: type_synthetic_control_bias_removal_period = 'pre_intervention',
     save_solution_period_error: type_save_solution_period_error = 'pre_intervention',
@@ -817,9 +789,6 @@ def search(
 
     if not isinstance(minimum_donor_selection, int) or minimum_donor_selection <= 0:
         raise ValueError(f"minimum_donor_selection must be a positive integer, got {minimum_donor_selection}")
-
-    if maximum_control_unit_weight_train is not None and (not isinstance(maximum_control_unit_weight_train, float) or maximum_control_unit_weight_train <= 0):
-        raise ValueError(f"maximum_control_unit_weight_train must be a positive real, got {maximum_control_unit_weight_train}")
         
     if minimum_control_unit_weight_train is not None and (not isinstance(minimum_control_unit_weight_train, float) or minimum_control_unit_weight_train <= 0):
         raise ValueError(f"minimum_control_unit_weight_train must be a positive real, got {minimum_control_unit_weight_train}")
@@ -1220,13 +1189,6 @@ def search(
                     stat_power = np.full(len(outcomes), float('inf'))
                     return error_valid, error_pre_intervention, stat_power
                 
-                current_limit_max_weight = self.config['maximum_control_unit_weight_train']
-                if current_limit_max_weight is None:
-                    current_limit_max_weight = w_max_bound(
-                        tpre=self.ts_pre_length,
-                        k_controls=len(selected_donors)
-                    )
-                
                 current_limit_min_weight = self.config['minimum_control_unit_weight_train']
                 if current_limit_min_weight is None:
                     snr_effective = np.min(self.snr_train)  # worst-case outcome SNR
@@ -1302,7 +1264,6 @@ def search(
                         gram_cond_per_outcome_pre = calculate_gram_cond_by_shape(df = data[(data['treatment'] == 0) & (data['timeid'].isin(self.timeid_train + self.timeid_valid))])
 
                         if (current_combination_tuple and len(current_combination_tuple) >= minimum_donor_selection and
-                            current_maximum_control_unit_weight_train < current_limit_max_weight and
                             check_per_outcome_limits(gram_cond_per_outcome_pre, self.gram_thresholds_per_outcome_pre) and
                             ((save_solution_period_error == "pre_intervention" and check_per_outcome_limits(error_pre_intervention, current_save_solution_error)) or
                             (save_solution_period_error == "validation_folder" and check_per_outcome_limits(error_valid, current_save_solution_error))) and
@@ -1350,7 +1311,6 @@ def search(
     
     # Init Configuration Context
     config_context = {
-        'maximum_control_unit_weight_train': maximum_control_unit_weight_train,
         'minimum_control_unit_weight_train': minimum_control_unit_weight_train,
         'save_solution_maximum_error': save_solution_maximum_error,
         'save_solution_period_error': save_solution_period_error
